@@ -137,8 +137,8 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
 # ---------------------------
 
 def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns):
-    if args.tls:
-        conf = f"tcps::addr={args.host}:9009;username={args.user};password={args.password};tls_verify=unsafe_off;"
+    if args.token:
+        conf = f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;"
     else:
         conf = f"tcp::addr={args.host}:9009;"
 
@@ -176,7 +176,10 @@ def main():
     parser.add_argument("--pg_port", default="8812")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
-    parser.add_argument("--tls", action="store_true", help="Enable TLS for ILP ingestion")
+    parser.add_argument("--ilp_user", default="admin", help="ILP username for tcps connection")
+    parser.add_argument("--token", default=None, help="ILP token to enable tcps connection")
+    parser.add_argument("--token_x", default=None, help="Optional token_x for tcps connection")
+    parser.add_argument("--token_y", default=None, help="Optional token_y for tcps connection")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1000)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
