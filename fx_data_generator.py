@@ -137,8 +137,8 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
 # ---------------------------
 
 def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns):
-    if args.token:
-        conf = f"tcps::addr={args.host}:9009;token={args.token};"
+    if args.tls:
+        conf = f"tcps::addr={args.host}:9009;username={args.user};password={args.password};tls_verify=unsafe_off;"
     else:
         conf = f"tcp::addr={args.host}:9009;"
 
@@ -176,7 +176,7 @@ def main():
     parser.add_argument("--pg_port", default="8812")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
-    parser.add_argument("--token", default=None, help="ILP token for secured tcps connections")
+    parser.add_argument("--tls", action="store_true", help="Enable TLS for ILP ingestion")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1000)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
