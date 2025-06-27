@@ -136,7 +136,7 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
 # Ingestion Worker
 # ---------------------------
 
-def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns):
+def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns):
     if args.token:
         conf = f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;"
     else:
@@ -149,6 +149,9 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
         market_data_sent = 0
 
         for market_total_rows, core_total in per_second_plan:
+            if end_timestamp_ns and simulated_time_ns >= end_timestamp_ns:
+                break
+
             market_event_count = market_total_rows // 2
             per_worker_market = market_event_count // args.processes
             per_worker_core = core_total // args.processes
@@ -187,6 +190,7 @@ def main():
     parser.add_argument("--core_max_eps", type=int, default=1100)
     parser.add_argument("--total_market_data_events", type=int, default=1000000)
     parser.add_argument("--start_ts", type=str, default=None, help="Start timestamp in ISO UTC format, e.g. 2025-06-27T00:00:00")
+    parser.add_argument("--end_ts", type=str, default=None, help="Exclusive end timestamp for faster-than-life mode in ISO UTC format")
     parser.add_argument("--processes", type=int, default=4)
 
     args = parser.parse_args()
@@ -199,6 +203,13 @@ def main():
         start_ts_ns = int(dt.timestamp() * 1e9)
     else:
         start_ts_ns = int(time.time() * 1e9)
+
+    end_ts_ns = None
+    if args.end_ts:
+        dt = datetime.datetime.fromisoformat(args.end_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        end_ts_ns = int(dt.timestamp() * 1e9)
 
     per_second_plan = []
     estimated_seconds = args.total_market_data_events // (args.market_data_min_eps)
@@ -213,7 +224,7 @@ def main():
     for _ in range(args.processes):
         p = mp.Process(
             target=ingest_worker,
-            args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns)
+            args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns)
         )
         p.start()
         pool.append(p)
