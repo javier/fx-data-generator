@@ -40,9 +40,13 @@ FX_PAIRS = [
     ("CADJPY", 110.0, 115.0, 3, 0.01)
 ]
 
+VOLUME_LADDER = [1_000_000, 10_000_000, 30_000_000, 50_000_000, 100_000_000, 150_000_000, 200_000_000, 300_000_000, 500_000_000, 1_000_000_000]
+
+def get_volume(level):
+    return VOLUME_LADDER[min(level, len(VOLUME_LADDER)) - 1]
+
 def ensure_table_exists(args):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
-
     market_data_ddl = """
     CREATE TABLE IF NOT EXISTS market_data (
         timestamp TIMESTAMP,
@@ -51,7 +55,6 @@ def ensure_table_exists(args):
         asks DOUBLE[][]
     ) timestamp(timestamp) PARTITION BY HOUR;
     """
-
     core_price_ddl = """
     CREATE TABLE IF NOT EXISTS core_price (
         timestamp TIMESTAMP,
@@ -66,7 +69,6 @@ def ensure_table_exists(args):
         indicator2 DOUBLE
     ) timestamp(timestamp) PARTITION BY HOUR;
     """
-
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(market_data_ddl)
         conn.execute(core_price_ddl)
@@ -77,49 +79,46 @@ def evolve_indicator(value, drift=0.01, shock_prob=0.01):
         value += random.uniform(-0.2, 0.2)
     return max(0.0, min(1.0, value))
 
-def generate_events_for_second(start_ns, market_event_count, core_count, state, sender, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
+def generate_events_for_second(start_ns, market_event_count, core_count, state, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
     offsets_market = sorted([random.randint(0, 999_999_999) for _ in range(market_event_count)])
     offsets_core = sorted([random.randint(0, 999_999_999) for _ in range(core_count)])
 
     for offset in offsets_market:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
-        levels = random.randint(1, max_levels)
+        levels = random.randint(min_levels, max_levels)
         bids = prebuilt_bid_arrays[levels - 1]
         asks = prebuilt_ask_arrays[levels - 1]
-
         mid_price = random.uniform(low, high)
         spread = round(random.uniform(0.0001, 0.0005), precision)
-
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
 
         for i in range(levels):
+            volume = get_volume(i)
             bids[i][0] = float(round(best_bid - i * pip, precision))
-            bids[i][1] = float(random.randint(500_000, 10_000_000))
+            bids[i][1] = float(volume)
             asks[i][0] = float(round(best_ask + i * pip, precision))
-            asks[i][1] = float(random.randint(500_000, 10_000_000))
+            asks[i][1] = float(volume)
 
         ts = start_ns + offset
-
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
 
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
-        levels = random.randint(1, max_levels)
+        levels = random.randint(min_levels, max_levels)
         bids = prebuilt_bid_arrays[levels - 1]
         asks = prebuilt_ask_arrays[levels - 1]
-
         mid_price = random.uniform(low, high)
         spread = round(random.uniform(0.0001, 0.0005), precision)
-
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
 
         for i in range(levels):
+            volume = get_volume(i)
             bids[i][0] = float(round(best_bid - i * pip, precision))
-            bids[i][1] = float(random.randint(500_000, 10_000_000))
+            bids[i][1] = float(volume)
             asks[i][0] = float(round(best_ask + i * pip, precision))
-            asks[i][1] = float(random.randint(500_000, 10_000_000))
+            asks[i][1] = float(volume)
 
         indicators = state[symbol]
         indicators["indicator1"] = evolve_indicator(indicators["indicator1"])
@@ -133,9 +132,9 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
             symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
             columns={
                 "bid_price": float(best_bid),
-                "bid_volume": random.randint(500_000, 10_000_000),
+                "bid_volume": get_volume(0),
                 "ask_price": float(best_ask),
-                "ask_volume": random.randint(500_000, 10_000_000),
+                "ask_volume": get_volume(0),
                 "indicator1": float(round(indicators["indicator1"], 3)),
                 "indicator2": float(round(indicators["indicator2"], 3))
             },
@@ -164,7 +163,6 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
         prebuilt_ask_arrays.append(asks)
 
     with Sender.from_conf(conf) as sender:
-
         state = {symbol: {"indicator1": 0.2, "indicator2": 0.5} for symbol, _, _, _, _ in FX_PAIRS}
         simulated_time_ns = start_timestamp_ns
         market_data_sent = 0
@@ -177,7 +175,7 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
             per_worker_market = market_event_count // args.processes
             per_worker_core = core_total // args.processes
 
-            generate_events_for_second(simulated_time_ns, per_worker_market, per_worker_core, state, sender, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays)
+            generate_events_for_second(simulated_time_ns, per_worker_market, per_worker_core, state, sender, args.min_levels, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays)
 
             market_data_sent += per_worker_market
             simulated_time_ns += int(1e9)
@@ -210,6 +208,7 @@ def main():
     parser.add_argument("--start_ts", type=str, default=None, help="Start timestamp in ISO UTC format, e.g. 2025-06-27T00:00:00")
     parser.add_argument("--end_ts", type=str, default=None, help="Exclusive end timestamp for faster-than-life mode in ISO UTC format")
     parser.add_argument("--processes", type=int, default=4)
+    parser.add_argument("--min_levels", type=int, default=5, help="Minimum number of bid/ask levels per snapshot")
     parser.add_argument("--max_levels", type=int, default=5, help="Maximum number of bid/ask levels per snapshot")
 
     args = parser.parse_args()
@@ -239,10 +238,7 @@ def main():
 
     pool = []
     for _ in range(args.processes):
-        p = mp.Process(
-            target=ingest_worker,
-            args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns)
-        )
+        p = mp.Process(target=ingest_worker, args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns))
         p.start()
         pool.append(p)
 
