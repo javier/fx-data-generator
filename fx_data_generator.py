@@ -7,14 +7,43 @@ import datetime
 from questdb.ingress import Sender, TimestampNanos
 import psycopg as pg
 
-# ---------------------------
-# Table Creation
-# ---------------------------
+FX_PAIRS = [
+    ("EURUSD", 1.05, 1.10, 5, 0.0001),
+    ("GBPUSD", 1.25, 1.30, 5, 0.0001),
+    ("USDJPY", 150.0, 155.0, 3, 0.01),
+    ("USDCHF", 0.90, 0.95, 4, 0.0001),
+    ("AUDUSD", 0.65, 0.70, 5, 0.0001),
+    ("NZDUSD", 0.60, 0.65, 5, 0.0001),
+    ("USDCAD", 1.35, 1.40, 5, 0.0001),
+    ("EURGBP", 0.85, 0.88, 5, 0.0001),
+    ("EURJPY", 160.0, 165.0, 3, 0.01),
+    ("GBPJPY", 180.0, 185.0, 3, 0.01),
+    ("EURCHF", 0.95, 1.00, 4, 0.0001),
+    ("EURAUD", 1.55, 1.60, 5, 0.0001),
+    ("GBPCHF", 1.10, 1.15, 4, 0.0001),
+    ("AUDJPY", 100.0, 105.0, 3, 0.01),
+    ("NZDJPY", 95.0, 100.0, 3, 0.01),
+    ("USDSEK", 10.0, 11.0, 4, 0.0001),
+    ("USDNOK", 10.0, 11.0, 4, 0.0001),
+    ("USDMXN", 17.0, 18.0, 4, 0.0001),
+    ("USDSGD", 1.35, 1.40, 5, 0.0001),
+    ("USDHKD", 7.75, 7.85, 4, 0.0001),
+    ("USDZAR", 18.0, 19.0, 4, 0.0001),
+    ("USDTRY", 27.0, 28.0, 4, 0.0001),
+    ("EURCAD", 1.45, 1.50, 5, 0.0001),
+    ("EURNZD", 1.70, 1.75, 5, 0.0001),
+    ("GBPAUD", 1.85, 1.90, 5, 0.0001),
+    ("GBPNZD", 2.00, 2.05, 5, 0.0001),
+    ("AUDCAD", 0.85, 0.90, 5, 0.0001),
+    ("AUDNZD", 1.05, 1.10, 5, 0.0001),
+    ("NZDCAD", 0.80, 0.85, 5, 0.0001),
+    ("CADJPY", 110.0, 115.0, 3, 0.01)
+]
 
 def ensure_table_exists(args):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
 
-    market_data_ddl = f"""
+    market_data_ddl = """
     CREATE TABLE IF NOT EXISTS market_data (
         timestamp TIMESTAMP,
         symbol SYMBOL CAPACITY 15000,
@@ -23,17 +52,15 @@ def ensure_table_exists(args):
     ) timestamp(timestamp) PARTITION BY HOUR;
     """
 
-    core_price_ddl = f"""
+    core_price_ddl = """
     CREATE TABLE IF NOT EXISTS core_price (
         timestamp TIMESTAMP,
         symbol SYMBOL CAPACITY 15000,
         ecn SYMBOL,
-        mid_price DOUBLE,
-        spread DOUBLE,
         bid_price DOUBLE,
-        bid_volume DOUBLE,
+        bid_volume LONG,
         ask_price DOUBLE,
-        ask_volume DOUBLE,
+        ask_volume LONG,
         reason SYMBOL,
         indicator1 DOUBLE,
         indicator2 DOUBLE
@@ -43,43 +70,6 @@ def ensure_table_exists(args):
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(market_data_ddl)
         conn.execute(core_price_ddl)
-
-# ---------------------------
-# FX Data Generator Functions
-# ---------------------------
-
-FX_PAIRS = [
-    ("EUR/USD", 1.05, 1.10),
-    ("GBP/USD", 1.25, 1.30),
-    ("USD/JPY", 150.0, 155.0),
-    ("USD/CHF", 0.90, 0.95),
-    ("AUD/USD", 0.65, 0.70),
-    ("NZD/USD", 0.60, 0.65),
-    ("USD/CAD", 1.35, 1.40),
-    ("EUR/GBP", 0.85, 0.88),
-    ("EUR/JPY", 160.0, 165.0),
-    ("GBP/JPY", 180.0, 185.0),
-    ("EUR/CHF", 0.95, 1.00),
-    ("EUR/AUD", 1.55, 1.60),
-    ("GBP/CHF", 1.10, 1.15),
-    ("AUD/JPY", 100.0, 105.0),
-    ("NZD/JPY", 95.0, 100.0),
-    ("USD/SEK", 10.0, 11.0),
-    ("USD/NOK", 10.0, 11.0),
-    ("USD/MXN", 17.0, 18.0),
-    ("USD/SGD", 1.35, 1.40),
-    ("USD/HKD", 7.75, 7.85),
-    ("USD/ZAR", 18.0, 19.0),
-    ("USD/TRY", 27.0, 28.0),
-    ("EUR/CAD", 1.45, 1.50),
-    ("EUR/NZD", 1.70, 1.75),
-    ("GBP/AUD", 1.85, 1.90),
-    ("GBP/NZD", 2.00, 2.05),
-    ("AUD/CAD", 0.85, 0.90),
-    ("AUD/NZD", 1.05, 1.10),
-    ("NZD/CAD", 0.80, 0.85),
-    ("CAD/JPY", 110.0, 115.0)
-]
 
 def evolve_indicator(value, drift=0.01, shock_prob=0.01):
     value += random.uniform(-drift, drift)
@@ -92,49 +82,48 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
     offsets_core = sorted([random.randint(0, 999_999_999) for _ in range(core_count)])
 
     for offset in offsets_market:
-        symbol, low, high = random.choice(FX_PAIRS)
+        symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(1, max_levels)
         bids = prebuilt_bid_arrays[levels - 1]
         asks = prebuilt_ask_arrays[levels - 1]
 
         mid_price = random.uniform(low, high)
-        spread = round(random.uniform(0.0001, 0.0005), 5)
+        spread = round(random.uniform(0.0001, 0.0005), precision)
 
-        best_bid = mid_price - spread / 2
-        best_ask = mid_price + spread / 2
+        best_bid = round(mid_price - spread / 2, precision)
+        best_ask = round(mid_price + spread / 2, precision)
 
         for i in range(levels):
-            bids[i][0] = float(round(best_bid - i * 0.0001, 5))
-            bids[i][1] = float(round(random.uniform(0.1, 5.0), 2))
-            asks[i][0] = float(round(best_ask + i * 0.0001, 5))
-            asks[i][1] = float(round(random.uniform(0.1, 5.0), 2))
+            bids[i][0] = float(round(best_bid - i * pip, precision))
+            bids[i][1] = float(random.randint(500_000, 10_000_000))
+            asks[i][0] = float(round(best_ask + i * pip, precision))
+            asks[i][1] = float(random.randint(500_000, 10_000_000))
 
         ts = start_ns + offset
 
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
 
     for offset in offsets_core:
-        symbol, low, high = random.choice(FX_PAIRS)
+        symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(1, max_levels)
         bids = prebuilt_bid_arrays[levels - 1]
         asks = prebuilt_ask_arrays[levels - 1]
 
         mid_price = random.uniform(low, high)
-        spread = round(random.uniform(0.0001, 0.0005), 5)
+        spread = round(random.uniform(0.0001, 0.0005), precision)
 
-        best_bid = mid_price - spread / 2
-        best_ask = mid_price + spread / 2
+        best_bid = round(mid_price - spread / 2, precision)
+        best_ask = round(mid_price + spread / 2, precision)
 
         for i in range(levels):
-            bids[i][0] = float(round(best_bid - i * 0.0001, 5))
-            bids[i][1] = float(round(random.uniform(0.1, 5.0), 2))
-            asks[i][0] = float(round(best_ask + i * 0.0001, 5))
-            asks[i][1] = float(round(random.uniform(0.1, 5.0), 2))
+            bids[i][0] = float(round(best_bid - i * pip, precision))
+            bids[i][1] = float(random.randint(500_000, 10_000_000))
+            asks[i][0] = float(round(best_ask + i * pip, precision))
+            asks[i][1] = float(random.randint(500_000, 10_000_000))
 
         indicators = state[symbol]
         indicators["indicator1"] = evolve_indicator(indicators["indicator1"])
         indicators["indicator2"] = evolve_indicator(indicators["indicator2"])
-
         reason = random.choice(["normal", "news_event", "liquidity_event"])
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
         ts = start_ns + offset
@@ -143,28 +132,22 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
             "core_price",
             symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
             columns={
-                "mid_price": float(mid_price),
-                "spread": float(spread),
                 "bid_price": float(best_bid),
-                "bid_volume": float(bids[0][1]),
+                "bid_volume": random.randint(500_000, 10_000_000),
                 "ask_price": float(best_ask),
-                "ask_volume": float(asks[0][1]),
+                "ask_volume": random.randint(500_000, 10_000_000),
                 "indicator1": float(round(indicators["indicator1"], 3)),
                 "indicator2": float(round(indicators["indicator2"], 3))
             },
             at=TimestampNanos(ts)
         )
 
-# ---------------------------
-# Ingestion Worker
-# ---------------------------
-
 def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns):
     if args.protocol == "http":
         if args.token:
-            conf = f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;protocol_version=2;"
+            conf = f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
         else:
-            conf = f"http::addr={args.host}:9000;protocol_version=2;"
+            conf = f"http::addr={args.host}:9000;"
     else:
         if args.token:
             conf = f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;"
@@ -182,7 +165,7 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
 
     with Sender.from_conf(conf) as sender:
 
-        state = {symbol: {"indicator1": 0.2, "indicator2": 0.5} for symbol, _, _ in FX_PAIRS}
+        state = {symbol: {"indicator1": 0.2, "indicator2": 0.5} for symbol, _, _, _, _ in FX_PAIRS}
         simulated_time_ns = start_timestamp_ns
         market_data_sent = 0
 
@@ -206,10 +189,6 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
 
             if mode == "real-time":
                 time.sleep(1)
-
-# ---------------------------
-# Main Entry Point
-# ---------------------------
 
 def main():
     parser = argparse.ArgumentParser()
