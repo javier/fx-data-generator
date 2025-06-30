@@ -1,0 +1,10 @@
+[project]
+requires-python = "==3.13.*"
+name = "fx-data-generator"
+version = "0.1.0"
+description = "FX Data Generator is a tool to ingest sample FX data into QuestDB."
+dependencies = [
+    "questdb==3.0.0rc1",
+    "psycopg[binary]",
+    "typer"
+]
