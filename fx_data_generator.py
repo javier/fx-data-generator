@@ -18,9 +18,8 @@ def ensure_table_exists(args):
     CREATE TABLE IF NOT EXISTS market_data (
         timestamp TIMESTAMP,
         symbol SYMBOL CAPACITY 15000,
-        side SYMBOL,
-        price DOUBLE,
-        size DOUBLE
+        bids DOUBLE[][],
+        asks DOUBLE[][]
     ) timestamp(timestamp) PARTITION BY HOUR;
     """
 
@@ -28,10 +27,13 @@ def ensure_table_exists(args):
     CREATE TABLE IF NOT EXISTS core_price (
         timestamp TIMESTAMP,
         symbol SYMBOL CAPACITY 15000,
+        ecn SYMBOL,
         mid_price DOUBLE,
         spread DOUBLE,
         bid_price DOUBLE,
+        bid_volume DOUBLE,
         ask_price DOUBLE,
+        ask_volume DOUBLE,
         reason SYMBOL,
         indicator1 DOUBLE,
         indicator2 DOUBLE
@@ -79,55 +81,76 @@ FX_PAIRS = [
     ("CAD/JPY", 110.0, 115.0)
 ]
 
-def generate_price(symbol, low, high):
-    return round(random.uniform(low, high), 5)
-
 def evolve_indicator(value, drift=0.01, shock_prob=0.01):
     value += random.uniform(-drift, drift)
     if random.random() < shock_prob:
         value += random.uniform(-0.2, 0.2)
     return max(0.0, min(1.0, value))
 
-def generate_events_for_second(start_ns, market_event_count, core_count, state, sender):
+def generate_events_for_second(start_ns, market_event_count, core_count, state, sender, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
     offsets_market = sorted([random.randint(0, 999_999_999) for _ in range(market_event_count)])
     offsets_core = sorted([random.randint(0, 999_999_999) for _ in range(core_count)])
 
     for offset in offsets_market:
         symbol, low, high = random.choice(FX_PAIRS)
-        mid_price = generate_price(symbol, low, high)
+        levels = random.randint(1, max_levels)
+        bids = prebuilt_bid_arrays[levels - 1]
+        asks = prebuilt_ask_arrays[levels - 1]
+
+        mid_price = random.uniform(low, high)
         spread = round(random.uniform(0.0001, 0.0005), 5)
-        bid_price = mid_price - spread / 2
-        ask_price = mid_price + spread / 2
-        size = round(random.uniform(0.1, 5.0), 2)
+
+        best_bid = mid_price - spread / 2
+        best_ask = mid_price + spread / 2
+
+        for i in range(levels):
+            bids[i][0] = float(round(best_bid - i * 0.0001, 5))
+            bids[i][1] = float(round(random.uniform(0.1, 5.0), 2))
+            asks[i][0] = float(round(best_ask + i * 0.0001, 5))
+            asks[i][1] = float(round(random.uniform(0.1, 5.0), 2))
+
         ts = start_ns + offset
 
-        sender.row("market_data", symbols={"symbol": symbol, "side": "bid"}, columns={"price": bid_price, "size": size}, at=TimestampNanos(ts))
-        sender.row("market_data", symbols={"symbol": symbol, "side": "ask"}, columns={"price": ask_price, "size": size}, at=TimestampNanos(ts))
+        sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
 
     for offset in offsets_core:
         symbol, low, high = random.choice(FX_PAIRS)
-        mid_price = generate_price(symbol, low, high)
+        levels = random.randint(1, max_levels)
+        bids = prebuilt_bid_arrays[levels - 1]
+        asks = prebuilt_ask_arrays[levels - 1]
+
+        mid_price = random.uniform(low, high)
         spread = round(random.uniform(0.0001, 0.0005), 5)
-        bid_price = mid_price - spread / 2
-        ask_price = mid_price + spread / 2
+
+        best_bid = mid_price - spread / 2
+        best_ask = mid_price + spread / 2
+
+        for i in range(levels):
+            bids[i][0] = float(round(best_bid - i * 0.0001, 5))
+            bids[i][1] = float(round(random.uniform(0.1, 5.0), 2))
+            asks[i][0] = float(round(best_ask + i * 0.0001, 5))
+            asks[i][1] = float(round(random.uniform(0.1, 5.0), 2))
 
         indicators = state[symbol]
         indicators["indicator1"] = evolve_indicator(indicators["indicator1"])
         indicators["indicator2"] = evolve_indicator(indicators["indicator2"])
 
         reason = random.choice(["normal", "news_event", "liquidity_event"])
+        ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
         ts = start_ns + offset
 
         sender.row(
             "core_price",
-            symbols={"symbol": symbol, "reason": reason},
+            symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
             columns={
-                "mid_price": mid_price,
-                "spread": spread,
-                "bid_price": bid_price,
-                "ask_price": ask_price,
-                "indicator1": round(indicators["indicator1"], 3),
-                "indicator2": round(indicators["indicator2"], 3)
+                "mid_price": float(mid_price),
+                "spread": float(spread),
+                "bid_price": float(best_bid),
+                "bid_volume": float(bids[0][1]),
+                "ask_price": float(best_ask),
+                "ask_volume": float(asks[0][1]),
+                "indicator1": float(round(indicators["indicator1"], 3)),
+                "indicator2": float(round(indicators["indicator2"], 3))
             },
             at=TimestampNanos(ts)
         )
@@ -137,10 +160,25 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
 # ---------------------------
 
 def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns):
-    if args.token:
-        conf = f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;"
+    if args.protocol == "http":
+        if args.token:
+            conf = f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;protocol_version=2;"
+        else:
+            conf = f"http::addr={args.host}:9000;protocol_version=2;"
     else:
-        conf = f"tcp::addr={args.host}:9009;"
+        if args.token:
+            conf = f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;"
+        else:
+            conf = f"tcp::addr={args.host}:9009;protocol_version=2;"
+
+    prebuilt_bid_arrays = []
+    prebuilt_ask_arrays = []
+
+    for levels in range(1, args.max_levels + 1):
+        bids = np.array([[100.0 - i * 0.0001, 1.0] for i in range(levels)], dtype=np.float64)
+        asks = np.array([[100.0 + i * 0.0001, 1.0] for i in range(levels)], dtype=np.float64)
+        prebuilt_bid_arrays.append(bids)
+        prebuilt_ask_arrays.append(asks)
 
     with Sender.from_conf(conf) as sender:
 
@@ -149,21 +187,21 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
         market_data_sent = 0
 
         for market_total_rows, core_total in per_second_plan:
-            if end_timestamp_ns and simulated_time_ns >= end_timestamp_ns:
+            if (end_timestamp_ns and simulated_time_ns >= end_timestamp_ns) or (market_data_sent >= total_market_data_events):
                 break
 
-            market_event_count = market_total_rows // 2
+            market_event_count = market_total_rows
             per_worker_market = market_event_count // args.processes
             per_worker_core = core_total // args.processes
 
-            generate_events_for_second(simulated_time_ns, per_worker_market, per_worker_core, state, sender)
+            generate_events_for_second(simulated_time_ns, per_worker_market, per_worker_core, state, sender, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays)
 
-            market_data_sent += per_worker_market * 2
+            market_data_sent += per_worker_market
             simulated_time_ns += int(1e9)
 
             sender.flush()
 
-            if market_data_sent >= total_market_data_events:
+            if (end_timestamp_ns and simulated_time_ns >= end_timestamp_ns) or (market_data_sent >= total_market_data_events):
                 break
 
             if mode == "real-time":
@@ -179,10 +217,11 @@ def main():
     parser.add_argument("--pg_port", default="8812")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
-    parser.add_argument("--ilp_user", default="admin", help="ILP username for tcps connection")
-    parser.add_argument("--token", default=None, help="ILP token to enable tcps connection")
+    parser.add_argument("--ilp_user", default="admin", help="ILP username for ILP connection")
+    parser.add_argument("--token", default=None, help="ILP token to enable secure connection")
     parser.add_argument("--token_x", default=None, help="Optional token_x for tcps connection")
     parser.add_argument("--token_y", default=None, help="Optional token_y for tcps connection")
+    parser.add_argument("--protocol", choices=["http", "tcp"], default="http", help="Ingestion protocol: http or tcp")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1000)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
@@ -192,6 +231,7 @@ def main():
     parser.add_argument("--start_ts", type=str, default=None, help="Start timestamp in ISO UTC format, e.g. 2025-06-27T00:00:00")
     parser.add_argument("--end_ts", type=str, default=None, help="Exclusive end timestamp for faster-than-life mode in ISO UTC format")
     parser.add_argument("--processes", type=int, default=4)
+    parser.add_argument("--max_levels", type=int, default=5, help="Maximum number of bid/ask levels per snapshot")
 
     args = parser.parse_args()
     ensure_table_exists(args)
@@ -215,8 +255,6 @@ def main():
     estimated_seconds = args.total_market_data_events // (args.market_data_min_eps)
     for _ in range(estimated_seconds * 2):
         market_total_rows = random.randint(args.market_data_min_eps, args.market_data_max_eps)
-        if market_total_rows % 2 != 0:
-            market_total_rows -= 1  # ensure even number for bid/ask pairs
         core_total = random.randint(args.core_min_eps, args.core_max_eps)
         per_second_plan.append((market_total_rows, core_total))
 
