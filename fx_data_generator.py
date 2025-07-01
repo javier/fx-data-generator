@@ -73,6 +73,15 @@ def ensure_table_exists(args):
         conn.execute(market_data_ddl)
         conn.execute(core_price_ddl)
 
+def load_initial_state(args):
+    state = {}
+    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    with pg.connect(conn_str) as conn:
+        cur = conn.execute("SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM core_price LATEST BY symbol")
+        for row in cur.fetchall():
+            state[row[0]] = {"bid_price": row[1], "ask_price": row[2], "indicator1": row[3], "indicator2": row[4]}
+    return state
+
 def evolve_indicator(value, drift=0.01, shock_prob=0.01):
     value += random.uniform(-drift, drift)
     if random.random() < shock_prob:
@@ -88,7 +97,12 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         levels = random.randint(min_levels, max_levels)
         bids = prebuilt_bid_arrays[levels - 1]
         asks = prebuilt_ask_arrays[levels - 1]
-        mid_price = random.uniform(low, high)
+
+        if symbol in state:
+            mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
+        else:
+            mid_price = random.uniform(low, high)
+
         spread = round(random.uniform(0.0001, 0.0005), precision)
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
@@ -108,7 +122,14 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         levels = random.randint(min_levels, max_levels)
         bids = prebuilt_bid_arrays[levels - 1]
         asks = prebuilt_ask_arrays[levels - 1]
-        mid_price = random.uniform(low, high)
+
+        if symbol in state:
+            mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
+            indicators = state[symbol]
+        else:
+            mid_price = random.uniform(low, high)
+            indicators = {"indicator1": 0.2, "indicator2": 0.5}
+
         spread = round(random.uniform(0.0001, 0.0005), precision)
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
@@ -120,7 +141,6 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
             asks[i][0] = float(round(best_ask + i * pip, precision))
             asks[i][1] = float(volume)
 
-        indicators = state[symbol]
         indicators["indicator1"] = evolve_indicator(indicators["indicator1"])
         indicators["indicator2"] = evolve_indicator(indicators["indicator2"])
         reason = random.choice(["normal", "news_event", "liquidity_event"])
@@ -141,7 +161,7 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
             at=TimestampNanos(ts)
         )
 
-def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns):
+def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns, state):
     if args.protocol == "http":
         if args.token:
             conf = f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
@@ -163,7 +183,6 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
         prebuilt_ask_arrays.append(asks)
 
     with Sender.from_conf(conf) as sender:
-        state = {symbol: {"indicator1": 0.2, "indicator2": 0.5} for symbol, _, _, _, _ in FX_PAIRS}
         simulated_time_ns = start_timestamp_ns
         market_data_sent = 0
 
@@ -210,9 +229,12 @@ def main():
     parser.add_argument("--processes", type=int, default=4)
     parser.add_argument("--min_levels", type=int, default=5, help="Minimum number of bid/ask levels per snapshot")
     parser.add_argument("--max_levels", type=int, default=5, help="Maximum number of bid/ask levels per snapshot")
+    parser.add_argument("--incremental", action="store_true", help="Use latest state from core_price as initial seed")
 
     args = parser.parse_args()
     ensure_table_exists(args)
+
+    state = load_initial_state(args) if args.incremental else {}
 
     if args.start_ts:
         dt = datetime.datetime.fromisoformat(args.start_ts)
@@ -238,7 +260,7 @@ def main():
 
     pool = []
     for _ in range(args.processes):
-        p = mp.Process(target=ingest_worker, args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns))
+        p = mp.Process(target=ingest_worker, args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns, state))
         p.start()
         pool.append(p)
 
