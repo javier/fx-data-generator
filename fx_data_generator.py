@@ -75,7 +75,7 @@ def ensure_tables_exist(args):
 
 def ensure_materialized_views_exist(args):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
-    core_price_view_ddl = """
+    core_price_view_1s_ddl = """
     CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1s AS (
         SELECT
             timestamp,
@@ -95,8 +95,46 @@ def ensure_materialized_views_exist(args):
         SAMPLE BY 1s
     ) PARTITION BY HOUR TTL 4 HOURS;
     """
+
+    bbo_1s_ddl = """
+    CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1s AS (
+        select timestamp, symbol,
+            last(bids[1][1]) as bid,
+            last(asks[1][1]) as ask
+        from market_data
+        sample by 1s
+    ) PARTITION BY HOUR;
+    """
+
+    market_data_ohlc_15m_ddl = """
+    CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
+        select timestamp, symbol,
+            first((bids[1][1]+asks[1][1])/2) as open,
+            max((bids[1][1]+asks[1][1])/2) as high,
+            min((bids[1][1]+asks[1][1])/2) as low,
+            last((bids[1][1]+asks[1][1])/2) as close
+        from market_data
+        sample by 15m
+    ) PARTITION BY HOUR TTL 2 DAYS;
+    """
+
+    market_data_ohlc_1d_ddl = """
+    CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH START '2025-06-01T00:00:00.000000Z' EVERY 1h AS (
+        select timestamp, symbol,
+            first(open) as open,
+            max(high) as high,
+            min(low) as low,
+            last(close) as close
+        from market_data_ohlc_15m
+        sample by 1d
+    ) PARTITION BY DAY;
+    """
+
     with pg.connect(conn_str, autocommit=True) as conn:
-        conn.execute(core_price_view_ddl)
+        conn.execute(core_price_view_1s_ddl)
+        conn.execute(bbo_1s_ddl)
+        conn.execute(market_data_ohlc_15m_ddl)
+        conn.execute(market_data_ohlc_1d_ddl)
 
 def load_initial_state(args):
     state = {}
