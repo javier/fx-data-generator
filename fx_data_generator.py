@@ -43,9 +43,9 @@ FX_PAIRS = [
 VOLUME_LADDER = [1_000_000, 10_000_000, 30_000_000, 50_000_000, 100_000_000, 150_000_000, 200_000_000, 300_000_000, 500_000_000, 1_000_000_000]
 
 def get_volume(level):
-    return VOLUME_LADDER[min(level, len(VOLUME_LADDER)) - 1]
+    return VOLUME_LADDER[min(level, len(VOLUME_LADDER) - 1)]
 
-def ensure_table_exists(args):
+def ensure_tables_exist(args):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     market_data_ddl = """
     CREATE TABLE IF NOT EXISTS market_data (
@@ -72,6 +72,31 @@ def ensure_table_exists(args):
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(market_data_ddl)
         conn.execute(core_price_ddl)
+
+def ensure_materialized_views_exist(args):
+    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    core_price_view_ddl = """
+    CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1s AS (
+        SELECT
+            timestamp,
+            symbol,
+            first((bid_price + ask_price) / 2) AS open_mid,
+            max((bid_price + ask_price) / 2) AS high_mid,
+            min((bid_price + ask_price) / 2) AS low_mid,
+            last((bid_price + ask_price) / 2) AS close_mid,
+            last(ask_price) - last(bid_price) AS last_spread,
+            max(bid_price) AS max_bid,
+            min(bid_price) AS min_bid,
+            avg(bid_price) AS avg_bid,
+            max(ask_price) AS max_ask,
+            min(ask_price) AS min_ask,
+            avg(ask_price) AS avg_ask
+        FROM core_price
+        SAMPLE BY 1s
+    ) PARTITION BY HOUR TTL 4 HOURS;
+    """
+    with pg.connect(conn_str, autocommit=True) as conn:
+        conn.execute(core_price_view_ddl)
 
 def load_initial_state(args):
     state = {}
@@ -152,9 +177,9 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
             symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
             columns={
                 "bid_price": float(best_bid),
-                "bid_volume": get_volume(0),
+                "bid_volume": int(bids[0][1]),
                 "ask_price": float(best_ask),
-                "ask_volume": get_volume(0),
+                "ask_volume": int(asks[0][1]),
                 "indicator1": float(round(indicators["indicator1"], 3)),
                 "indicator2": float(round(indicators["indicator2"], 3))
             },
@@ -232,7 +257,8 @@ def main():
     parser.add_argument("--incremental", action="store_true", help="Use latest state from core_price as initial seed")
 
     args = parser.parse_args()
-    ensure_table_exists(args)
+    ensure_tables_exist(args)
+    ensure_materialized_views_exist(args)
 
     state = load_initial_state(args) if args.incremental else {}
 
