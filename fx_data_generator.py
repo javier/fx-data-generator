@@ -90,7 +90,7 @@ def ensure_materialized_views_exist(args):
         ) PARTITION BY HOUR TTL 4 HOURS;
         """)
         conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1d REFRESH EVERY 1h START '2025-06-01T00:00:00.000000Z' AS (
+        CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 first((bid_price + ask_price)/2) AS open_mid,
                 max((bid_price + ask_price)/2) AS high_mid,
@@ -105,7 +105,7 @@ def ensure_materialized_views_exist(args):
                 avg(ask_price) AS avg_ask
             FROM core_price
             SAMPLE BY 1d
-        ) PARTITION BY MONTH;
+        );
         """)
         conn.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1s AS (
@@ -114,8 +114,39 @@ def ensure_materialized_views_exist(args):
                 last(asks[1][1]) AS ask
             FROM market_data
             SAMPLE BY 1s
-        ) PARTITION BY HOUR;
+        );
         """)
+
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1m REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+            SELECT timestamp, symbol,
+                max(bid) AS bid,
+                min(ask) AS ask
+            FROM bbo_1s
+            SAMPLE BY 1m
+        );
+        """)
+
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1h REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+            SELECT timestamp, symbol,
+                max(bid) AS bid,
+                min(ask) AS ask
+            FROM bbo_1m
+            SAMPLE BY 1h
+        );
+        """)
+
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+            SELECT timestamp, symbol,
+                max(bid) AS bid,
+                min(ask) AS ask
+            FROM bbo_1h
+            SAMPLE BY 1d
+        );
+        """)
+
         conn.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
             SELECT timestamp, symbol,
@@ -128,15 +159,15 @@ def ensure_materialized_views_exist(args):
         ) PARTITION BY HOUR TTL 2 DAYS;
         """)
         conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH EVERY 1h START '2025-06-01T00:00:00.000000Z' AS (
+        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
-                first(open) AS open,
-                max(high) AS high,
-                min(low) AS low,
-                last(close) AS close
-            FROM market_data_ohlc_15m
-            SAMPLE BY 1d
-        ) PARTITION BY MONTH;
+                first((bids[1][1] + asks[1][1])/2) AS open,
+                max((bids[1][1] + asks[1][1])/2) AS high,
+                min((bids[1][1] + asks[1][1])/2) AS low,
+                last((bids[1][1] + asks[1][1])/2) AS close
+            FROM market_data
+            SAMPLE BY 1h
+        );
         """)
 
 def load_initial_state(args):
