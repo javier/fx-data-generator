@@ -42,99 +42,102 @@ FX_PAIRS = [
 
 VOLUME_LADDER = [1_000_000, 10_000_000, 30_000_000, 50_000_000, 100_000_000, 150_000_000, 200_000_000, 300_000_000, 500_000_000, 1_000_000_000]
 
-def get_volume(level):
-    return VOLUME_LADDER[min(level, len(VOLUME_LADDER) - 1)]
-
 def ensure_tables_exist(args):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
-    market_data_ddl = """
-    CREATE TABLE IF NOT EXISTS market_data (
-        timestamp TIMESTAMP,
-        symbol SYMBOL CAPACITY 15000,
-        bids DOUBLE[][],
-        asks DOUBLE[][]
-    ) timestamp(timestamp) PARTITION BY HOUR;
-    """
-    core_price_ddl = """
-    CREATE TABLE IF NOT EXISTS core_price (
-        timestamp TIMESTAMP,
-        symbol SYMBOL CAPACITY 15000,
-        ecn SYMBOL,
-        bid_price DOUBLE,
-        bid_volume LONG,
-        ask_price DOUBLE,
-        ask_volume LONG,
-        reason SYMBOL,
-        indicator1 DOUBLE,
-        indicator2 DOUBLE
-    ) timestamp(timestamp) PARTITION BY HOUR;
-    """
     with pg.connect(conn_str, autocommit=True) as conn:
-        conn.execute(market_data_ddl)
-        conn.execute(core_price_ddl)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_data (
+            timestamp TIMESTAMP,
+            symbol SYMBOL CAPACITY 15000,
+            bids DOUBLE[][],
+            asks DOUBLE[][]
+        ) timestamp(timestamp) PARTITION BY HOUR;
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS core_price (
+            timestamp TIMESTAMP,
+            symbol SYMBOL CAPACITY 15000,
+            ecn SYMBOL,
+            bid_price DOUBLE,
+            bid_volume LONG,
+            ask_price DOUBLE,
+            ask_volume LONG,
+            reason SYMBOL,
+            indicator1 DOUBLE,
+            indicator2 DOUBLE
+        ) timestamp(timestamp) PARTITION BY HOUR;
+        """)
 
 def ensure_materialized_views_exist(args):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
-    core_price_view_1s_ddl = """
-    CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1s AS (
-        SELECT
-            timestamp,
-            symbol,
-            first((bid_price + ask_price) / 2) AS open_mid,
-            max((bid_price + ask_price) / 2) AS high_mid,
-            min((bid_price + ask_price) / 2) AS low_mid,
-            last((bid_price + ask_price) / 2) AS close_mid,
-            last(ask_price) - last(bid_price) AS last_spread,
-            max(bid_price) AS max_bid,
-            min(bid_price) AS min_bid,
-            avg(bid_price) AS avg_bid,
-            max(ask_price) AS max_ask,
-            min(ask_price) AS min_ask,
-            avg(ask_price) AS avg_ask
-        FROM core_price
-        SAMPLE BY 1s
-    ) PARTITION BY HOUR TTL 4 HOURS;
-    """
-
-    bbo_1s_ddl = """
-    CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1s AS (
-        select timestamp, symbol,
-            last(bids[1][1]) as bid,
-            last(asks[1][1]) as ask
-        from market_data
-        sample by 1s
-    ) PARTITION BY HOUR;
-    """
-
-    market_data_ohlc_15m_ddl = """
-    CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
-        select timestamp, symbol,
-            first((bids[1][1]+asks[1][1])/2) as open,
-            max((bids[1][1]+asks[1][1])/2) as high,
-            min((bids[1][1]+asks[1][1])/2) as low,
-            last((bids[1][1]+asks[1][1])/2) as close
-        from market_data
-        sample by 15m
-    ) PARTITION BY HOUR TTL 2 DAYS;
-    """
-
-    market_data_ohlc_1d_ddl = """
-    CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH START '2025-06-01T00:00:00.000000Z' EVERY 1h AS (
-        select timestamp, symbol,
-            first(open) as open,
-            max(high) as high,
-            min(low) as low,
-            last(close) as close
-        from market_data_ohlc_15m
-        sample by 1d
-    ) PARTITION BY DAY;
-    """
-
     with pg.connect(conn_str, autocommit=True) as conn:
-        conn.execute(core_price_view_1s_ddl)
-        conn.execute(bbo_1s_ddl)
-        conn.execute(market_data_ohlc_15m_ddl)
-        conn.execute(market_data_ohlc_1d_ddl)
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1s AS (
+            SELECT timestamp, symbol,
+                first((bid_price + ask_price)/2) AS open_mid,
+                max((bid_price + ask_price)/2) AS high_mid,
+                min((bid_price + ask_price)/2) AS low_mid,
+                last((bid_price + ask_price)/2) AS close_mid,
+                last(ask_price) - last(bid_price) AS last_spread,
+                max(bid_price) AS max_bid,
+                min(bid_price) AS min_bid,
+                avg(bid_price) AS avg_bid,
+                max(ask_price) AS max_ask,
+                min(ask_price) AS min_ask,
+                avg(ask_price) AS avg_ask
+            FROM core_price
+            SAMPLE BY 1s
+        ) PARTITION BY HOUR TTL 4 HOURS;
+        """)
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1d REFRESH EVERY 1h START '2025-06-01T00:00:00.000000Z' AS (
+            SELECT timestamp, symbol,
+                first((bid_price + ask_price)/2) AS open_mid,
+                max((bid_price + ask_price)/2) AS high_mid,
+                min((bid_price + ask_price)/2) AS low_mid,
+                last((bid_price + ask_price)/2) AS close_mid,
+                last(ask_price) - last(bid_price) AS last_spread,
+                max(bid_price) AS max_bid,
+                min(bid_price) AS min_bid,
+                avg(bid_price) AS avg_bid,
+                max(ask_price) AS max_ask,
+                min(ask_price) AS min_ask,
+                avg(ask_price) AS avg_ask
+            FROM core_price
+            SAMPLE BY 1d
+        ) PARTITION BY MONTH;
+        """)
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1s AS (
+            SELECT timestamp, symbol,
+                last(bids[1][1]) AS bid,
+                last(asks[1][1]) AS ask
+            FROM market_data
+            SAMPLE BY 1s
+        ) PARTITION BY HOUR;
+        """)
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
+            SELECT timestamp, symbol,
+                first((bids[1][1] + asks[1][1])/2) AS open,
+                max((bids[1][1] + asks[1][1])/2) AS high,
+                min((bids[1][1] + asks[1][1])/2) AS low,
+                last((bids[1][1] + asks[1][1])/2) AS close
+            FROM market_data
+            SAMPLE BY 15m
+        ) PARTITION BY HOUR TTL 2 DAYS;
+        """)
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH EVERY 1h START '2025-06-01T00:00:00.000000Z' AS (
+            SELECT timestamp, symbol,
+                first(open) AS open,
+                max(high) AS high,
+                min(low) AS low,
+                last(close) AS close
+            FROM market_data_ohlc_15m
+            SAMPLE BY 1d
+        ) PARTITION BY MONTH;
+        """)
 
 def load_initial_state(args):
     state = {}
@@ -142,7 +145,9 @@ def load_initial_state(args):
     with pg.connect(conn_str) as conn:
         cur = conn.execute("SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM core_price LATEST BY symbol")
         for row in cur.fetchall():
-            state[row[0]] = {"bid_price": row[1], "ask_price": row[2], "indicator1": row[3], "indicator2": row[4]}
+            state[row[0]] = {
+                "bid_price": row[1], "ask_price": row[2], "indicator1": row[3], "indicator2": row[4]
+            }
     return state
 
 def evolve_indicator(value, drift=0.01, shock_prob=0.01):
@@ -151,6 +156,20 @@ def evolve_indicator(value, drift=0.01, shock_prob=0.01):
         value += random.uniform(-0.2, 0.2)
     return max(0.0, min(1.0, value))
 
+def get_volume(level):
+    return VOLUME_LADDER[min(level, len(VOLUME_LADDER) - 1)]
+
+def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask, precision, pip):
+    for i in range(levels):
+        price_bid = round(best_bid - i * pip, precision)
+        price_ask = round(best_ask + i * pip, precision)
+        volume = get_volume(i)
+        prebuilt_bids[0][i] = price_bid
+        prebuilt_bids[1][i] = volume
+        prebuilt_asks[0][i] = price_ask
+        prebuilt_asks[1][i] = volume
+    return prebuilt_bids, prebuilt_asks
+
 def generate_events_for_second(start_ns, market_event_count, core_count, state, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
     offsets_market = sorted([random.randint(0, 999_999_999) for _ in range(market_event_count)])
     offsets_core = sorted([random.randint(0, 999_999_999) for _ in range(core_count)])
@@ -158,24 +177,14 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
     for offset in offsets_market:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
-        bids = prebuilt_bid_arrays[levels - 1]
-        asks = prebuilt_ask_arrays[levels - 1]
+        bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
-        if symbol in state:
-            mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
-        else:
-            mid_price = random.uniform(low, high)
-
+        mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2 if symbol in state else random.uniform(low, high)
         spread = round(random.uniform(0.0001, 0.0005), precision)
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
 
-        for i in range(levels):
-            volume = get_volume(i)
-            bids[i][0] = float(round(best_bid - i * pip, precision))
-            bids[i][1] = float(volume)
-            asks[i][0] = float(round(best_ask + i * pip, precision))
-            asks[i][1] = float(volume)
+        generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
 
         ts = start_ns + offset
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
@@ -183,26 +192,15 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
-        bids = prebuilt_bid_arrays[levels - 1]
-        asks = prebuilt_ask_arrays[levels - 1]
+        bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
-        if symbol in state:
-            mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
-            indicators = state[symbol]
-        else:
-            mid_price = random.uniform(low, high)
-            indicators = {"indicator1": 0.2, "indicator2": 0.5}
-
+        mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2 if symbol in state else random.uniform(low, high)
+        indicators = state.get(symbol, {"indicator1": 0.2, "indicator2": 0.5})
         spread = round(random.uniform(0.0001, 0.0005), precision)
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
 
-        for i in range(levels):
-            volume = get_volume(i)
-            bids[i][0] = float(round(best_bid - i * pip, precision))
-            bids[i][1] = float(volume)
-            asks[i][0] = float(round(best_ask + i * pip, precision))
-            asks[i][1] = float(volume)
+        generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
 
         indicators["indicator1"] = evolve_indicator(indicators["indicator1"])
         indicators["indicator2"] = evolve_indicator(indicators["indicator2"])
@@ -210,62 +208,34 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
         ts = start_ns + offset
 
-        sender.row(
-            "core_price",
-            symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
-            columns={
-                "bid_price": float(best_bid),
-                "bid_volume": int(bids[0][1]),
-                "ask_price": float(best_ask),
-                "ask_volume": int(asks[0][1]),
-                "indicator1": float(round(indicators["indicator1"], 3)),
-                "indicator2": float(round(indicators["indicator2"], 3))
-            },
-            at=TimestampNanos(ts)
-        )
+        sender.row("core_price", symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
+            "bid_price": float(best_bid), "bid_volume": int(bids[1][0]),
+            "ask_price": float(best_ask), "ask_volume": int(asks[1][0]),
+            "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
+        }, at=TimestampNanos(ts))
 
 def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns, state):
     if args.protocol == "http":
-        if args.token:
-            conf = f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
-        else:
-            conf = f"http::addr={args.host}:9000;"
+        conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
     else:
-        if args.token:
-            conf = f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;"
-        else:
-            conf = f"tcp::addr={args.host}:9009;protocol_version=2;"
+        conf = f"tcp::addr={args.host}:9009;protocol_version=2;" if not args.token else f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;"
 
-    prebuilt_bid_arrays = []
-    prebuilt_ask_arrays = []
-
-    for levels in range(1, args.max_levels + 1):
-        bids = np.array([[100.0 - i * 0.0001, 1.0] for i in range(levels)], dtype=np.float64)
-        asks = np.array([[100.0 + i * 0.0001, 1.0] for i in range(levels)], dtype=np.float64)
-        prebuilt_bid_arrays.append(bids)
-        prebuilt_ask_arrays.append(asks)
+    prebuilt_bid_arrays = [np.zeros((2, levels), dtype=np.float64) for levels in range(1, args.max_levels + 1)]
+    prebuilt_ask_arrays = [np.zeros((2, levels), dtype=np.float64) for levels in range(1, args.max_levels + 1)]
 
     with Sender.from_conf(conf) as sender:
         simulated_time_ns = start_timestamp_ns
         market_data_sent = 0
 
         for market_total_rows, core_total in per_second_plan:
-            if (end_timestamp_ns and simulated_time_ns >= end_timestamp_ns) or (market_data_sent >= total_market_data_events):
+            if end_timestamp_ns and simulated_time_ns >= end_timestamp_ns or market_data_sent >= total_market_data_events:
                 break
 
-            market_event_count = market_total_rows
-            per_worker_market = market_event_count // args.processes
-            per_worker_core = core_total // args.processes
-
-            generate_events_for_second(simulated_time_ns, per_worker_market, per_worker_core, state, sender, args.min_levels, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays)
-
-            market_data_sent += per_worker_market
+            generate_events_for_second(simulated_time_ns, market_total_rows // args.processes, core_total // args.processes, state, sender, args.min_levels, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays)
+            market_data_sent += market_total_rows // args.processes
             simulated_time_ns += int(1e9)
 
             sender.flush()
-
-            if (end_timestamp_ns and simulated_time_ns >= end_timestamp_ns) or (market_data_sent >= total_market_data_events):
-                break
 
             if mode == "real-time":
                 time.sleep(1)
@@ -276,28 +246,27 @@ def main():
     parser.add_argument("--pg_port", default="8812")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
-    parser.add_argument("--ilp_user", default="admin", help="ILP username for ILP connection")
-    parser.add_argument("--token", default=None, help="ILP token to enable secure connection")
-    parser.add_argument("--token_x", default=None, help="Optional token_x for tcps connection")
-    parser.add_argument("--token_y", default=None, help="Optional token_y for tcps connection")
-    parser.add_argument("--protocol", choices=["http", "tcp"], default="http", help="Ingestion protocol: http or tcp")
+    parser.add_argument("--ilp_user", default="admin")
+    parser.add_argument("--token", default=None)
+    parser.add_argument("--token_x", default=None)
+    parser.add_argument("--token_y", default=None)
+    parser.add_argument("--protocol", choices=["http", "tcp"], default="http")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1000)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
     parser.add_argument("--core_min_eps", type=int, default=800)
     parser.add_argument("--core_max_eps", type=int, default=1100)
     parser.add_argument("--total_market_data_events", type=int, default=1000000)
-    parser.add_argument("--start_ts", type=str, default=None, help="Start timestamp in ISO UTC format, e.g. 2025-06-27T00:00:00")
-    parser.add_argument("--end_ts", type=str, default=None, help="Exclusive end timestamp for faster-than-life mode in ISO UTC format")
+    parser.add_argument("--start_ts", type=str, default=None)
+    parser.add_argument("--end_ts", type=str, default=None)
     parser.add_argument("--processes", type=int, default=4)
-    parser.add_argument("--min_levels", type=int, default=5, help="Minimum number of bid/ask levels per snapshot")
-    parser.add_argument("--max_levels", type=int, default=5, help="Maximum number of bid/ask levels per snapshot")
-    parser.add_argument("--incremental", action="store_true", help="Use latest state from core_price as initial seed")
-
+    parser.add_argument("--min_levels", type=int, default=5)
+    parser.add_argument("--max_levels", type=int, default=5)
+    parser.add_argument("--incremental", action="store_true")
     args = parser.parse_args()
+
     ensure_tables_exist(args)
     ensure_materialized_views_exist(args)
-
     state = load_initial_state(args) if args.incremental else {}
 
     if args.start_ts:
@@ -333,3 +302,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
