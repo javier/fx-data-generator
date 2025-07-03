@@ -187,18 +187,22 @@ def evolve_indicator(value, drift=0.01, shock_prob=0.01):
         value += random.uniform(-0.2, 0.2)
     return max(0.0, min(1.0, value))
 
-def get_volume(level):
-    return VOLUME_LADDER[min(level, len(VOLUME_LADDER) - 1)]
+
+def get_random_volume_for_level(level_idx):
+    if level_idx == 0:
+        return random.randint(VOLUME_LADDER[0] // 2, VOLUME_LADDER[0])
+    lower = VOLUME_LADDER[level_idx - 1]
+    upper = VOLUME_LADDER[level_idx]
+    return random.randint(lower, upper)
 
 def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask, precision, pip):
     for i in range(levels):
         price_bid = round(best_bid - i * pip, precision)
         price_ask = round(best_ask + i * pip, precision)
-        volume = get_volume(i)
         prebuilt_bids[0][i] = price_bid
-        prebuilt_bids[1][i] = volume
+        prebuilt_bids[1][i] = get_random_volume_for_level(i)
         prebuilt_asks[0][i] = price_ask
-        prebuilt_asks[1][i] = volume
+        prebuilt_asks[1][i] = get_random_volume_for_level(i)
     return prebuilt_bids, prebuilt_asks
 
 def generate_events_for_second(start_ns, market_event_count, core_count, state, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
@@ -238,10 +242,11 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         reason = random.choice(["normal", "news_event", "liquidity_event"])
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
         ts = start_ns + offset
+        selected_level = random.randint(0, levels - 1)
 
         sender.row("core_price", symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
-            "bid_price": float(best_bid), "bid_volume": int(bids[1][0]),
-            "ask_price": float(best_ask), "ask_volume": int(asks[1][0]),
+            "bid_price": float(bids[0][selected_level]), "bid_volume": int(bids[1][selected_level]),
+            "ask_price": float(asks[0][selected_level]), "ask_volume": int(asks[1][selected_level]),
             "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
         }, at=TimestampNanos(ts))
 
