@@ -186,7 +186,6 @@ def ensure_materialized_views_exist(args):
             SAMPLE BY 1h
         );
         """)
-
 def load_initial_state(args):
     state = {}
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
@@ -194,7 +193,9 @@ def load_initial_state(args):
         cur = conn.execute("SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM core_price LATEST BY symbol")
         for row in cur.fetchall():
             state[row[0]] = {
-                "bid_price": row[1], "ask_price": row[2], "indicator1": row[3], "indicator2": row[4]
+                "bid_price": row[1], "ask_price": row[2],
+                "indicator1": row[3], "indicator2": row[4],
+                "spread": 0.0004
             }
     return state
 
@@ -202,17 +203,14 @@ def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.2, shock_prob=
     change = random.uniform(-drift * pip, drift * pip)
     if random.random() < shock_prob:
         change += random.uniform(-20 * pip, 20 * pip)
-
     new_mid = prev_mid + change
-    new_mid = round(max(low, min(high, new_mid)), precision)
-    return new_mid
+    return round(max(low, min(high, new_mid)), precision)
 
 def evolve_indicator(value, drift=0.01, shock_prob=0.01):
     value += random.uniform(-drift, drift)
     if random.random() < shock_prob:
         value += random.uniform(-0.2, 0.2)
     return max(0.0, min(1.0, value))
-
 
 def get_random_volume_for_level(level_idx):
     if level_idx == 0:
@@ -231,126 +229,88 @@ def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask,
         prebuilt_asks[1][i] = get_random_volume_for_level(i)
     return prebuilt_bids, prebuilt_asks
 
-def generate_events_for_second(start_ns, market_event_count, core_count, state, state_lock, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, evolved_mid_prices):
-    offsets_market = sorted([random.randint(0, 999_999_999) for _ in range(market_event_count)])
-    offsets_core = sorted([random.randint(0, 999_999_999) for _ in range(core_count)])
+def price_evolution(state):
+    for symbol, low, high, precision, pip in FX_PAIRS:
+        prev_mid = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
+        prev_spread = state[symbol]["spread"]
+        new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
+        new_spread = round(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), precision)
+        state[symbol]["bid_price"] = round(new_mid - new_spread / 2, precision)
+        state[symbol]["ask_price"] = round(new_mid + new_spread / 2, precision)
+        state[symbol]["spread"] = new_spread
+
+def generate_events_for_second(start_ns, market_event_count, core_count, local_state, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
+    offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
+    offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
 
     for offset in offsets_market:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-
-        mid_price = evolved_mid_prices[symbol]["mid_price"]
-        spread = evolved_mid_prices[symbol]["spread"]
+        mid_price = (local_state[symbol]["bid_price"] + local_state[symbol]["ask_price"]) / 2
+        spread = local_state[symbol]["spread"]
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
-
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
-
         ts = start_ns + offset
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
-
-        # Update shared state under lock
-        with state_lock:
-            state[symbol] = {
-                "bid_price": bids[0][0],
-                "ask_price": asks[0][0],
-                "indicator1": state.get(symbol, {}).get("indicator1", 0.2),
-                "indicator2": state.get(symbol, {}).get("indicator2", 0.5)
-            }
 
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-
-        with state_lock:
-            indicators = state.get(symbol, {"indicator1": 0.2, "indicator2": 0.5})
-
-        mid_price = evolved_mid_prices[symbol]["mid_price"]
-        spread = evolved_mid_prices[symbol]["spread"]
+        indicators = local_state[symbol]
+        mid_price = (local_state[symbol]["bid_price"] + local_state[symbol]["ask_price"]) / 2
+        spread = local_state[symbol]["spread"]
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
-
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
-
         indicators["indicator1"] = evolve_indicator(indicators["indicator1"])
         indicators["indicator2"] = evolve_indicator(indicators["indicator2"])
         reason = random.choice(["normal", "news_event", "liquidity_event"])
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
         ts = start_ns + offset
-        selected_level = random.randint(0, levels - 1)
-
+        lvl = random.randint(0, levels - 1)
         sender.row("core_price", symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
-            "bid_price": float(bids[0][selected_level]), "bid_volume": int(bids[1][selected_level]),
-            "ask_price": float(asks[0][selected_level]), "ask_volume": int(asks[1][selected_level]),
+            "bid_price": float(bids[0][lvl]), "bid_volume": int(bids[1][lvl]),
+            "ask_price": float(asks[0][lvl]), "ask_volume": int(asks[1][lvl]),
             "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
         }, at=TimestampNanos(ts))
 
-        # Update shared state under lock
-        with state_lock:
-            state[symbol] = {
-                "bid_price": best_bid,
-                "ask_price": best_ask,
-                "indicator1": indicators["indicator1"],
-                "indicator2": indicators["indicator2"]
-            }
-
-def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns, state, state_lock):
-    if args.protocol == "http":
-        conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
-    else:
-        conf = f"tcp::addr={args.host}:9009;protocol_version=2;" if not args.token else f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;"
-
-    prebuilt_bid_arrays = [np.zeros((2, levels), dtype=np.float64) for levels in range(1, args.max_levels + 1)]
-    prebuilt_ask_arrays = [np.zeros((2, levels), dtype=np.float64) for levels in range(1, args.max_levels + 1)]
-
+def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, state):
+    conf = f"tcp::addr={args.host}:9009;protocol_version=2;" if args.protocol == "tcp" else f"http::addr={args.host}:9000;"
+    prebuilt_bids = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
+    prebuilt_asks = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
     with Sender.from_conf(conf) as sender:
-        simulated_time_ns = start_timestamp_ns
-        market_data_sent = 0
+        ts = start_ns
+        sent = 0
+        local_state = {}
 
-        for market_total_rows, core_total in per_second_plan:
-            if end_timestamp_ns and simulated_time_ns >= end_timestamp_ns or market_data_sent >= total_market_data_events:
+        # Initialize local_state by copying from shared state once at start
+        for k, v in state.items():
+            local_state[k] = v.copy()
+
+        last_sync_minute = (ts // int(60e9))  # integer minute of simulated time
+
+        for market_total, core_total in per_second_plan:
+            if (end_ns and ts >= end_ns) or (sent >= total_events):
                 break
 
-            evolved_mid_prices = {}
-            # Evolve price centrally using shared state + lock
-            with state_lock:
-                for symbol, low, high, precision, pip in FX_PAIRS:
-                    if symbol in state:
-                        prev_mid = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
-                        prev_spread = state[symbol].get("spread", 0.0004)
-                    else:
-                        prev_mid = random.uniform(low, high)
-                        prev_spread = 0.0004  # sensible default
+            # Sync every simulated minute only
+            current_minute = ts // int(60e9)
+            if current_minute != last_sync_minute:
+                for k, v in state.items():
+                    local_state[k] = v.copy()
+                last_sync_minute = current_minute
 
-                    new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
-                    new_spread = round(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), precision)
-
-                    evolved_mid_prices[symbol] = {
-                        "mid_price": new_mid,
-                        "spread": new_spread
-                    }
-
-                    best_bid = round(new_mid - new_spread / 2, precision)
-                    best_ask = round(new_mid + new_spread / 2, precision)
-
-                    state[symbol] = {
-                        "bid_price": best_bid,
-                        "ask_price": best_ask,
-                        "spread": new_spread,
-                        "indicator1": state.get(symbol, {}).get("indicator1", 0.2),
-                        "indicator2": state.get(symbol, {}).get("indicator2", 0.5)
-                    }
-
-
-            generate_events_for_second(simulated_time_ns, market_total_rows // args.processes, core_total // args.processes, state, state_lock, sender, args.min_levels, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, evolved_mid_prices)
-            market_data_sent += market_total_rows // args.processes
-            simulated_time_ns += int(1e9)
-
+            generate_events_for_second(ts, market_total // args.processes, core_total // args.processes,
+                                      local_state, sender,
+                                      args.min_levels, args.max_levels,
+                                      prebuilt_bids, prebuilt_asks)
+            sent += market_total // args.processes
+            ts += int(1e9)
             sender.flush()
-
-            if mode == "real-time":
+            if args.mode == "real-time":
                 time.sleep(1)
 
 def main():
@@ -359,71 +319,64 @@ def main():
     parser.add_argument("--pg_port", default="8812")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
-    parser.add_argument("--ilp_user", default="admin")
-    parser.add_argument("--token", default=None)
-    parser.add_argument("--token_x", default=None)
-    parser.add_argument("--token_y", default=None)
     parser.add_argument("--protocol", choices=["http", "tcp"], default="http")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1000)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
     parser.add_argument("--core_min_eps", type=int, default=800)
     parser.add_argument("--core_max_eps", type=int, default=1100)
-    parser.add_argument("--total_market_data_events", type=int, default=1000000)
-    parser.add_argument("--start_ts", type=str, default=None)
-    parser.add_argument("--end_ts", type=str, default=None)
+    parser.add_argument("--total_market_data_events", type=int, default=1_000_000)
+    parser.add_argument("--start_ts", type=str)
+    parser.add_argument("--end_ts", type=str)
     parser.add_argument("--processes", type=int, default=4)
     parser.add_argument("--min_levels", type=int, default=5)
     parser.add_argument("--max_levels", type=int, default=5)
     parser.add_argument("--incremental", action="store_true")
+    parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
     args = parser.parse_args()
 
+    state = mp.Manager().dict()
 
-    manager = mp.Manager()
-    state = manager.dict()
-    state_lock = manager.Lock()
+    if args.incremental:
+        initial_state = load_initial_state(args)
+        for k, v in initial_state.items():
+            state[k] = v
 
+    for symbol, low, high, precision, pip in FX_PAIRS:
+        if symbol not in state:
+            state[symbol] = {"bid_price": round((low + high) / 2, precision),
+                             "ask_price": round((low + high) / 2, precision),
+                             "spread": 0.0004, "indicator1": 0.2, "indicator2": 0.5}
 
     ensure_tables_exist(args)
-    ensure_materialized_views_exist(args)
-    state = load_initial_state(args) if args.incremental else {}
+    if args.create_views:
+        ensure_materialized_views_exist(args)
 
     if args.start_ts:
-        dt = datetime.datetime.fromisoformat(args.start_ts)
-        if dt.tzinfo is not None:
-            raise ValueError("start_ts must be a naive ISO datetime string without timezone information. Example: '2025-07-04T11:07:30'")
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-        start_ts_ns = int(dt.timestamp() * 1e9)
+        dt = datetime.datetime.fromisoformat(args.start_ts).replace(tzinfo=datetime.timezone.utc)
+        start_ns = int(dt.timestamp() * 1e9)
     else:
-        # Default to current UTC time
-        start_ts_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
+        start_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
 
-    end_ts_ns = None
-    if args.end_ts:
-        dt = datetime.datetime.fromisoformat(args.end_ts)
-        if dt.tzinfo is not None:
-            raise ValueError("end_ts must be a naive datetime string interpreted as UTC, no timezone allowed. Example: '2025-07-04T15:07:30'")
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-        end_ts_ns = int(dt.timestamp() * 1e9)
+    end_ns = int(datetime.datetime.fromisoformat(args.end_ts).replace(tzinfo=datetime.timezone.utc).timestamp() * 1e9) if args.end_ts else None
+    plan = [(random.randint(args.market_data_min_eps, args.market_data_max_eps),
+             random.randint(args.core_min_eps, args.core_max_eps)) for _ in range((args.total_market_data_events // args.market_data_min_eps) * 2)]
 
-    per_second_plan = []
-    estimated_seconds = args.total_market_data_events // (args.market_data_min_eps)
-    for _ in range(estimated_seconds * 2):
-        market_total_rows = random.randint(args.market_data_min_eps, args.market_data_max_eps)
-        core_total = random.randint(args.core_min_eps, args.core_max_eps)
-        per_second_plan.append((market_total_rows, core_total))
+    pool = [mp.Process(target=ingest_worker, args=(args, plan, args.total_market_data_events // args.processes,
+                                                  start_ns, end_ns, state))
+            for _ in range(args.processes)]
+    for p in pool: p.start()
 
-    pool = []
-    for _ in range(args.processes):
-        p = mp.Process(target=ingest_worker, args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns, state, state_lock))
-        p.start()
-        pool.append(p)
+    if args.mode == "real-time":
+        while any(p.is_alive() for p in pool):
+            price_evolution(state)
+            time.sleep(1)
+    else:
+        while any(p.is_alive() for p in pool):
+            price_evolution(state)
 
     for p in pool:
         p.join()
 
 if __name__ == "__main__":
     main()
-
-
-
