@@ -229,55 +229,66 @@ def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask,
         prebuilt_asks[1][i] = get_random_volume_for_level(i)
     return prebuilt_bids, prebuilt_asks
 
-def price_evolution(state):
-    for symbol, low, high, precision, pip in FX_PAIRS:
-        prev_mid = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
-        prev_spread = state[symbol]["spread"]
-        new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
-        new_spread = round(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), precision)
-        state[symbol]["bid_price"] = round(new_mid - new_spread / 2, precision)
-        state[symbol]["ask_price"] = round(new_mid + new_spread / 2, precision)
-        state[symbol]["spread"] = new_spread
+def precompute_state(args, start_ns, total_seconds, state_template):
+    # state_template is a dict {symbol: {bid_price, ask_price, spread, ...}}
+    states = []
+    current = {k: v.copy() for k, v in state_template.items()}
+    for second in range(total_seconds):
+        # evolve state for each symbol
+        next_state = {}
+        for symbol, low, high, precision, pip in FX_PAIRS:
+            prev_mid = (current[symbol]["bid_price"] + current[symbol]["ask_price"]) / 2
+            prev_spread = current[symbol]["spread"]
+            new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
+            new_spread = round(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), precision)
+            next_state[symbol] = {
+                "bid_price": round(new_mid - new_spread / 2, precision),
+                "ask_price": round(new_mid + new_spread / 2, precision),
+                "spread": new_spread,
+                "indicator1": evolve_indicator(current[symbol]["indicator1"]),
+                "indicator2": evolve_indicator(current[symbol]["indicator2"])
+            }
+        states.append(next_state)
+        current = next_state
+    return states
 
-def generate_events_for_second(start_ns, market_event_count, core_count, local_state, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
+def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
     offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
     offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
-
     for offset in offsets_market:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-        mid_price = (local_state[symbol]["bid_price"] + local_state[symbol]["ask_price"]) / 2
-        spread = local_state[symbol]["spread"]
-        best_bid = round(mid_price - spread / 2, precision)
-        best_ask = round(mid_price + spread / 2, precision)
+        mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
+        spread = state_for_second[symbol]["spread"]
+        mid_jitter = random.uniform(-0.5*pip, 0.5*pip)
+        best_bid = round(mid_price + mid_jitter - spread / 2, precision)
+        best_ask = round(mid_price + mid_jitter + spread / 2, precision)
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
-        ts = start_ns + offset
-        sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
-
+        row_ts = ts + offset
+        sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(row_ts))
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-        indicators = local_state[symbol]
-        mid_price = (local_state[symbol]["bid_price"] + local_state[symbol]["ask_price"]) / 2
-        spread = local_state[symbol]["spread"]
-        best_bid = round(mid_price - spread / 2, precision)
-        best_ask = round(mid_price + spread / 2, precision)
+        indicators = state_for_second[symbol]
+        mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
+        spread = state_for_second[symbol]["spread"]
+        mid_jitter = random.uniform(-0.5*pip, 0.5*pip)
+        best_bid = round(mid_price + mid_jitter - spread / 2, precision)
+        best_ask = round(mid_price + mid_jitter + spread / 2, precision)
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
-        indicators["indicator1"] = evolve_indicator(indicators["indicator1"])
-        indicators["indicator2"] = evolve_indicator(indicators["indicator2"])
         reason = random.choice(["normal", "news_event", "liquidity_event"])
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
-        ts = start_ns + offset
+        row_ts = ts + offset
         lvl = random.randint(0, levels - 1)
         sender.row("core_price", symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
             "bid_price": float(bids[0][lvl]), "bid_volume": int(bids[1][lvl]),
             "ask_price": float(asks[0][lvl]), "ask_volume": int(asks[1][lvl]),
             "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
-        }, at=TimestampNanos(ts))
+        }, at=TimestampNanos(row_ts))
 
-def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, state):
+def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_states, process_idx, processes):
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
     else:
@@ -285,33 +296,24 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, state):
 
     prebuilt_bids = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
     prebuilt_asks = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
+    ts = start_ns
+    sent = 0
+
     with Sender.from_conf(conf) as sender:
-        ts = start_ns
-        sent = 0
-        local_state = {}
-
-        # Initialize local_state by copying from shared state once at start
-        for k, v in state.items():
-            local_state[k] = v.copy()
-
-        last_sync_minute = (ts // int(60e9))  # integer minute of simulated time
-
-        for market_total, core_total in per_second_plan:
+        for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
             if (end_ns and ts >= end_ns) or (sent >= total_events):
                 break
-
-            # Sync every simulated minute only
-            current_minute = ts // int(60e9)
-            if current_minute != last_sync_minute:
-                for k, v in state.items():
-                    local_state[k] = v.copy()
-                last_sync_minute = current_minute
-
-            generate_events_for_second(ts, market_total // args.processes, core_total // args.processes,
-                                      local_state, sender,
-                                      args.min_levels, args.max_levels,
-                                      prebuilt_bids, prebuilt_asks)
-            sent += market_total // args.processes
+            # Each worker only processes its share of events
+            if sec_idx % processes != process_idx:
+                ts += int(1e9)
+                continue
+            state_for_this_second = global_states[sec_idx]
+            generate_events_for_second(
+                ts, market_total // processes, core_total // processes,
+                state_for_this_second, sender,
+                args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks
+            )
+            sent += market_total // processes
             ts += int(1e9)
             sender.flush()
             if args.mode == "real-time":
@@ -343,18 +345,17 @@ def main():
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
     args = parser.parse_args()
 
-    state = mp.Manager().dict()
-
     if args.incremental:
-        initial_state = load_initial_state(args)
-        for k, v in initial_state.items():
-            state[k] = v
-
+        state = load_initial_state(args)
+    else:
+        state = {}
     for symbol, low, high, precision, pip in FX_PAIRS:
         if symbol not in state:
-            state[symbol] = {"bid_price": round((low + high) / 2, precision),
-                             "ask_price": round((low + high) / 2, precision),
-                             "spread": 0.0004, "indicator1": 0.2, "indicator2": 0.5}
+            state[symbol] = {
+                "bid_price": round((low + high) / 2, precision),
+                "ask_price": round((low + high) / 2, precision),
+                "spread": 0.0004, "indicator1": 0.2, "indicator2": 0.5
+            }
 
     ensure_tables_exist(args)
     if args.create_views:
@@ -367,21 +368,27 @@ def main():
         start_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
 
     end_ns = int(datetime.datetime.fromisoformat(args.end_ts).replace(tzinfo=datetime.timezone.utc).timestamp() * 1e9) if args.end_ts else None
-    plan = [(random.randint(args.market_data_min_eps, args.market_data_max_eps),
-             random.randint(args.core_min_eps, args.core_max_eps)) for _ in range((args.total_market_data_events // args.market_data_min_eps) * 2)]
+    # Plan events per simulated second
+    estimated_seconds = args.total_market_data_events // max(1, args.market_data_min_eps)
+    per_second_plan = []
+    for _ in range(estimated_seconds * 2):
+        market_total_rows = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+        core_total = random.randint(args.core_min_eps, args.core_max_eps)
+        per_second_plan.append((market_total_rows, core_total))
+    total_seconds = len(per_second_plan)
 
-    pool = [mp.Process(target=ingest_worker, args=(args, plan, args.total_market_data_events // args.processes,
-                                                  start_ns, end_ns, state))
-            for _ in range(args.processes)]
-    for p in pool: p.start()
+    # Precompute state for every simulated second!
+    global_states = precompute_state(args, start_ns, total_seconds, state)
 
-    if args.mode == "real-time":
-        while any(p.is_alive() for p in pool):
-            price_evolution(state)
-            time.sleep(1)
-    else:
-        while any(p.is_alive() for p in pool):
-            price_evolution(state)
+    # Start workers, each picks a slice of seconds (no overlap)
+    pool = []
+    for process_idx in range(args.processes):
+        p = mp.Process(
+            target=ingest_worker,
+            args=(args, per_second_plan, args.total_market_data_events // args.processes, start_ns, end_ns, global_states, process_idx, args.processes)
+        )
+        p.start()
+        pool.append(p)
 
     for p in pool:
         p.join()
