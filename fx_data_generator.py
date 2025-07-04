@@ -240,8 +240,8 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
-        mid_price = evolved_mid_prices[symbol]
-        spread = round(random.uniform(0.0001, 0.0005), precision)
+        mid_price = evolved_mid_prices[symbol]["mid_price"]
+        spread = evolved_mid_prices[symbol]["spread"]
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
 
@@ -264,12 +264,11 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
-        mid_price = evolved_mid_prices[symbol]
-
         with state_lock:
             indicators = state.get(symbol, {"indicator1": 0.2, "indicator2": 0.5})
 
-        spread = round(random.uniform(0.0001, 0.0005), precision)
+        mid_price = evolved_mid_prices[symbol]["mid_price"]
+        spread = evolved_mid_prices[symbol]["spread"]
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
 
@@ -320,18 +319,26 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
                 for symbol, low, high, precision, pip in FX_PAIRS:
                     if symbol in state:
                         prev_mid = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
+                        prev_spread = state[symbol].get("spread", 0.0004)
                     else:
                         prev_mid = random.uniform(low, high)
+                        prev_spread = 0.0004  # sensible default
 
                     new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
-                    evolved_mid_prices[symbol] = new_mid
+                    new_spread = round(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), precision)
 
-                    # Also update shared state with new mid (optional but consistent)
-                    best_bid = round(new_mid - 0.0002, precision)
-                    best_ask = round(new_mid + 0.0002, precision)
+                    evolved_mid_prices[symbol] = {
+                        "mid_price": new_mid,
+                        "spread": new_spread
+                    }
+
+                    best_bid = round(new_mid - new_spread / 2, precision)
+                    best_ask = round(new_mid + new_spread / 2, precision)
+
                     state[symbol] = {
                         "bid_price": best_bid,
                         "ask_price": best_ask,
+                        "spread": new_spread,
                         "indicator1": state.get(symbol, {}).get("indicator1", 0.2),
                         "indicator2": state.get(symbol, {}).get("indicator2", 0.5)
                     }
