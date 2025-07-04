@@ -278,7 +278,11 @@ def generate_events_for_second(start_ns, market_event_count, core_count, local_s
         }, at=TimestampNanos(ts))
 
 def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, state):
-    conf = f"tcp::addr={args.host}:9009;protocol_version=2;" if args.protocol == "tcp" else f"http::addr={args.host}:9000;"
+    if args.protocol == "http":
+        conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
+    else:
+        conf = f"tcp::addr={args.host}:9009;protocol_version=2;" if not args.token else f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;"
+
     prebuilt_bids = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
     prebuilt_asks = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
     with Sender.from_conf(conf) as sender:
@@ -319,6 +323,10 @@ def main():
     parser.add_argument("--pg_port", default="8812")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
+    parser.add_argument("--token", default=None)
+    parser.add_argument("--token_x", default=None)
+    parser.add_argument("--token_y", default=None)
+    parser.add_argument("--ilp_user", default="admin")
     parser.add_argument("--protocol", choices=["http", "tcp"], default="http")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1000)
