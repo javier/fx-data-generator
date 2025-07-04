@@ -198,6 +198,15 @@ def load_initial_state(args):
             }
     return state
 
+def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.2, shock_prob=0.001):
+    change = random.uniform(-drift * pip, drift * pip)
+    if random.random() < shock_prob:
+        change += random.uniform(-20 * pip, 20 * pip)
+
+    new_mid = prev_mid + change
+    new_mid = round(max(low, min(high, new_mid)), precision)
+    return new_mid
+
 def evolve_indicator(value, drift=0.01, shock_prob=0.01):
     value += random.uniform(-drift, drift)
     if random.random() < shock_prob:
@@ -222,7 +231,7 @@ def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask,
         prebuilt_asks[1][i] = get_random_volume_for_level(i)
     return prebuilt_bids, prebuilt_asks
 
-def generate_events_for_second(start_ns, market_event_count, core_count, state, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
+def generate_events_for_second(start_ns, market_event_count, core_count, state, state_lock, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, evolved_mid_prices):
     offsets_market = sorted([random.randint(0, 999_999_999) for _ in range(market_event_count)])
     offsets_core = sorted([random.randint(0, 999_999_999) for _ in range(core_count)])
 
@@ -231,7 +240,7 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
-        mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2 if symbol in state else random.uniform(low, high)
+        mid_price = evolved_mid_prices[symbol]
         spread = round(random.uniform(0.0001, 0.0005), precision)
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
@@ -241,21 +250,25 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         ts = start_ns + offset
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
 
-        # Update state for price continuity based on market_data
-        state[symbol] = {
-            "bid_price": bids[0][0],
-            "ask_price": asks[0][0],
-            "indicator1": state.get(symbol, {}).get("indicator1", 0.2),
-            "indicator2": state.get(symbol, {}).get("indicator2", 0.5)
-        }
+        # Update shared state under lock
+        with state_lock:
+            state[symbol] = {
+                "bid_price": bids[0][0],
+                "ask_price": asks[0][0],
+                "indicator1": state.get(symbol, {}).get("indicator1", 0.2),
+                "indicator2": state.get(symbol, {}).get("indicator2", 0.5)
+            }
 
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
-        mid_price = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2 if symbol in state else random.uniform(low, high)
-        indicators = state.get(symbol, {"indicator1": 0.2, "indicator2": 0.5})
+        mid_price = evolved_mid_prices[symbol]
+
+        with state_lock:
+            indicators = state.get(symbol, {"indicator1": 0.2, "indicator2": 0.5})
+
         spread = round(random.uniform(0.0001, 0.0005), precision)
         best_bid = round(mid_price - spread / 2, precision)
         best_ask = round(mid_price + spread / 2, precision)
@@ -275,15 +288,16 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
             "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
         }, at=TimestampNanos(ts))
 
-        # update state so price evolving looks continuous
-        state[symbol] = {
-            "bid_price": best_bid,
-            "ask_price": best_ask,
-            "indicator1": indicators["indicator1"],
-            "indicator2": indicators["indicator2"]
-        }
+        # Update shared state under lock
+        with state_lock:
+            state[symbol] = {
+                "bid_price": best_bid,
+                "ask_price": best_ask,
+                "indicator1": indicators["indicator1"],
+                "indicator2": indicators["indicator2"]
+            }
 
-def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns, state):
+def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns, state, state_lock):
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
     else:
@@ -300,7 +314,30 @@ def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_t
             if end_timestamp_ns and simulated_time_ns >= end_timestamp_ns or market_data_sent >= total_market_data_events:
                 break
 
-            generate_events_for_second(simulated_time_ns, market_total_rows // args.processes, core_total // args.processes, state, sender, args.min_levels, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays)
+            evolved_mid_prices = {}
+            # Evolve price centrally using shared state + lock
+            with state_lock:
+                for symbol, low, high, precision, pip in FX_PAIRS:
+                    if symbol in state:
+                        prev_mid = (state[symbol]["bid_price"] + state[symbol]["ask_price"]) / 2
+                    else:
+                        prev_mid = random.uniform(low, high)
+
+                    new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
+                    evolved_mid_prices[symbol] = new_mid
+
+                    # Also update shared state with new mid (optional but consistent)
+                    best_bid = round(new_mid - 0.0002, precision)
+                    best_ask = round(new_mid + 0.0002, precision)
+                    state[symbol] = {
+                        "bid_price": best_bid,
+                        "ask_price": best_ask,
+                        "indicator1": state.get(symbol, {}).get("indicator1", 0.2),
+                        "indicator2": state.get(symbol, {}).get("indicator2", 0.5)
+                    }
+
+
+            generate_events_for_second(simulated_time_ns, market_total_rows // args.processes, core_total // args.processes, state, state_lock, sender, args.min_levels, args.max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, evolved_mid_prices)
             market_data_sent += market_total_rows // args.processes
             simulated_time_ns += int(1e9)
 
@@ -334,6 +371,12 @@ def main():
     parser.add_argument("--incremental", action="store_true")
     args = parser.parse_args()
 
+
+    manager = mp.Manager()
+    state = manager.dict()
+    state_lock = manager.Lock()
+
+
     ensure_tables_exist(args)
     ensure_materialized_views_exist(args)
     state = load_initial_state(args) if args.incremental else {}
@@ -365,7 +408,7 @@ def main():
 
     pool = []
     for _ in range(args.processes):
-        p = mp.Process(target=ingest_worker, args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns, state))
+        p = mp.Process(target=ingest_worker, args=(args, args.mode, per_second_plan, args.total_market_data_events // args.processes, start_ts_ns, end_ts_ns, state, state_lock))
         p.start()
         pool.append(p)
 
