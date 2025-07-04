@@ -303,13 +303,10 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
         for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
             if (end_ns and ts >= end_ns) or (sent >= total_events):
                 break
-            # Each worker only processes its share of events
-            if sec_idx % processes != process_idx:
-                ts += int(1e9)
-                continue
+
             state_for_this_second = global_states[sec_idx]
             generate_events_for_second(
-                ts, market_total // processes, core_total // processes,
+                ts, market_total, core_total,
                 state_for_this_second, sender,
                 args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks
             )
@@ -368,14 +365,28 @@ def main():
         start_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
 
     end_ns = int(datetime.datetime.fromisoformat(args.end_ts).replace(tzinfo=datetime.timezone.utc).timestamp() * 1e9) if args.end_ts else None
-    # Plan events per simulated second
-    estimated_seconds = args.total_market_data_events // max(1, args.market_data_min_eps)
+    # Precompute full per-second plan so we can split across workers and always get the right event count
     per_second_plan = []
-    for _ in range(estimated_seconds * 2):
-        market_total_rows = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+    events_so_far = 0
+    while events_so_far < args.total_market_data_events:
+        market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
         core_total = random.randint(args.core_min_eps, args.core_max_eps)
-        per_second_plan.append((market_total_rows, core_total))
+        per_second_plan.append((market_total, core_total))
+        events_so_far += market_total
+
+    # Trim last second to hit target exactly
+    overage = events_so_far - args.total_market_data_events
+    if overage > 0:
+        market_total, core_total = per_second_plan[-1]
+        per_second_plan[-1] = (market_total - overage, core_total)
+
     total_seconds = len(per_second_plan)
+    # Split plan into even slices for each worker
+    def split_plan_evenly(plan, num_workers):
+        chunk_size = (total_seconds + num_workers - 1) // num_workers  # ceiling division
+        return [plan[i*chunk_size : (i+1)*chunk_size] for i in range(num_workers)]
+
+    worker_plans = split_plan_evenly(per_second_plan, args.processes)
 
     # Precompute state for every simulated second!
     global_states = precompute_state(args, start_ns, total_seconds, state)
@@ -385,7 +396,7 @@ def main():
     for process_idx in range(args.processes):
         p = mp.Process(
             target=ingest_worker,
-            args=(args, per_second_plan, args.total_market_data_events // args.processes, start_ns, end_ns, global_states, process_idx, args.processes)
+            args=(args, worker_plans[process_idx], sum(market for market, _ in worker_plans[process_idx]), start_ns, end_ns, global_states, process_idx, args.processes)
         )
         p.start()
         pool.append(p)
