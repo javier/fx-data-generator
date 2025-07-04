@@ -148,23 +148,40 @@ def ensure_materialized_views_exist(args):
         """)
 
         conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
+        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1m AS (
             SELECT timestamp, symbol,
                 first((bids[1][1] + asks[1][1])/2) AS open,
                 max((bids[1][1] + asks[1][1])/2) AS high,
                 min((bids[1][1] + asks[1][1])/2) AS low,
-                last((bids[1][1] + asks[1][1])/2) AS close
+                last((bids[1][1] + asks[1][1])/2) AS close,
+                SUM(bids[2][1] + asks[2][1]) AS total_volume
             FROM market_data
+            SAMPLE BY 1m
+        ) PARTITION BY HOUR TTL 12 HOURS;
+        """)
+
+        conn.execute("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
+            SELECT timestamp, symbol,
+                first(open) AS open,
+                max(high) AS high,
+                min(low) AS low,
+                last(close) AS close,
+                SUM(total_volume) AS total_volume
+
+            FROM market_data_ohlc_1m
             SAMPLE BY 15m
         ) PARTITION BY HOUR TTL 2 DAYS;
         """)
+
         conn.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 first((bids[1][1] + asks[1][1])/2) AS open,
                 max((bids[1][1] + asks[1][1])/2) AS high,
                 min((bids[1][1] + asks[1][1])/2) AS low,
-                last((bids[1][1] + asks[1][1])/2) AS close
+                last((bids[1][1] + asks[1][1])/2) AS close,
+                SUM(bids[2][1] + asks[2][1]) AS total_volume
             FROM market_data
             SAMPLE BY 1h
         );
@@ -224,6 +241,14 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
         ts = start_ns + offset
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(ts))
 
+        # Update state for price continuity based on market_data
+        state[symbol] = {
+            "bid_price": bids[0][0],
+            "ask_price": asks[0][0],
+            "indicator1": state.get(symbol, {}).get("indicator1", 0.2),
+            "indicator2": state.get(symbol, {}).get("indicator2", 0.5)
+        }
+
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
@@ -249,6 +274,14 @@ def generate_events_for_second(start_ns, market_event_count, core_count, state, 
             "ask_price": float(asks[0][selected_level]), "ask_volume": int(asks[1][selected_level]),
             "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
         }, at=TimestampNanos(ts))
+
+        # update state so price evolving looks continuous
+        state[symbol] = {
+            "bid_price": best_bid,
+            "ask_price": best_ask,
+            "indicator1": indicators["indicator1"],
+            "indicator2": indicators["indicator2"]
+        }
 
 def ingest_worker(args, mode, per_second_plan, total_market_data_events, start_timestamp_ns, end_timestamp_ns, state):
     if args.protocol == "http":
@@ -307,17 +340,20 @@ def main():
 
     if args.start_ts:
         dt = datetime.datetime.fromisoformat(args.start_ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        if dt.tzinfo is not None:
+            raise ValueError("start_ts must be a naive ISO datetime string without timezone information. Example: '2025-07-04T11:07:30'")
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
         start_ts_ns = int(dt.timestamp() * 1e9)
     else:
-        start_ts_ns = int(time.time() * 1e9)
+        # Default to current UTC time
+        start_ts_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
 
     end_ts_ns = None
     if args.end_ts:
         dt = datetime.datetime.fromisoformat(args.end_ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        if dt.tzinfo is not None:
+            raise ValueError("end_ts must be a naive datetime string interpreted as UTC, no timezone allowed. Example: '2025-07-04T15:07:30'")
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
         end_ts_ns = int(dt.timestamp() * 1e9)
 
     per_second_plan = []
