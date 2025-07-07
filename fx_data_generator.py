@@ -310,7 +310,7 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
                 state_for_this_second, sender,
                 args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks
             )
-            sent += market_total // processes
+            sent += market_total
             ts += int(1e9)
             sender.flush()
             if args.mode == "real-time":
@@ -381,12 +381,19 @@ def main():
         per_second_plan[-1] = (market_total - overage, core_total)
 
     total_seconds = len(per_second_plan)
-    # Split plan into even slices for each worker
-    def split_plan_evenly(plan, num_workers):
-        chunk_size = (total_seconds + num_workers - 1) // num_workers  # ceiling division
-        return [plan[i*chunk_size : (i+1)*chunk_size] for i in range(num_workers)]
+    def split_event_counts(total, num_workers):
+        # Returns a list of event counts for each worker that sum to total, as even as possible
+        base = total // num_workers
+        remainder = total % num_workers
+        return [base + (1 if i < remainder else 0) for i in range(num_workers)]
 
-    worker_plans = split_plan_evenly(per_second_plan, args.processes)
+    # Build worker plans: for every second, split event counts among workers
+    worker_plans = [[] for _ in range(args.processes)]
+    for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
+        market_splits = split_event_counts(market_total, args.processes)
+        core_splits = split_event_counts(core_total, args.processes)
+        for i in range(args.processes):
+            worker_plans[i].append((market_splits[i], core_splits[i]))
 
     # Precompute state for every simulated second!
     global_states = precompute_state(args, start_ns, total_seconds, state)
