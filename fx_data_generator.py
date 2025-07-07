@@ -2,6 +2,7 @@ import argparse
 import time
 import random
 import multiprocessing as mp
+from multiprocessing import Event
 import numpy as np
 import datetime
 from questdb.ingress import Sender, TimestampNanos
@@ -288,7 +289,7 @@ def generate_events_for_second(ts, market_event_count, core_count, state_for_sec
             "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
         }, at=TimestampNanos(row_ts))
 
-def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_states, process_idx, processes):
+def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_states, process_idx, processes, pause_event):
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
     else:
@@ -301,6 +302,11 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
 
     with Sender.from_conf(conf) as sender:
         for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
+            # ---- WAL PAUSE CHECK ----
+            while pause_event.is_set():
+                print(f"[WORKER {process_idx}] Paused due to WAL lag (waiting for sequencerTxn==writerTxn)...")
+                time.sleep(2)
+            # ---- /WAL PAUSE CHECK ----
             if (end_ns and ts >= end_ns) or (sent >= total_events):
                 break
 
@@ -315,6 +321,32 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
             sender.flush()
             if args.mode == "real-time":
                 time.sleep(1)
+
+def wal_monitor(args, pause_event, processes, interval=5):
+    import time
+    import psycopg as pg
+    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    threshold = 3 * processes
+    last_logged_paused = False
+
+    with pg.connect(conn_str, autocommit=True) as conn:
+        while True:
+            cur = conn.execute("SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = 'market_data'")
+            row = cur.fetchone()
+            if row:
+                seq, wrt = row
+                lag = seq - wrt
+                if lag > threshold:
+                    pause_event.set()
+                    if not last_logged_paused:
+                        print(f"[WAL MONITOR] Pausing ingestion: sequencerTxn={seq}, writerTxn={wrt}, lag={lag}")
+                        last_logged_paused = True
+                else:
+                    if last_logged_paused:
+                        print(f"[WAL MONITOR] Resuming ingestion: sequencerTxn={seq}, writerTxn={wrt}, lag={lag}")
+                    pause_event.clear()
+                    last_logged_paused = False
+            time.sleep(interval)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -387,6 +419,12 @@ def main():
         remainder = total % num_workers
         return [base + (1 if i < remainder else 0) for i in range(num_workers)]
 
+    #To check if writerTxn is lagging
+    pause_event = Event()
+    # Start WAL monitor process
+    wal_proc = mp.Process(target=wal_monitor, args=(args, pause_event, args.processes))
+    wal_proc.start()
+
     # Build worker plans: for every second, split event counts among workers
     worker_plans = [[] for _ in range(args.processes)]
     for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
@@ -403,13 +441,15 @@ def main():
     for process_idx in range(args.processes):
         p = mp.Process(
             target=ingest_worker,
-            args=(args, worker_plans[process_idx], sum(market for market, _ in worker_plans[process_idx]), start_ns, end_ns, global_states, process_idx, args.processes)
+            args=(args, worker_plans[process_idx], sum(market for market, _ in worker_plans[process_idx]), start_ns, end_ns, global_states, process_idx, args.processes, pause_event)
         )
         p.start()
         pool.append(p)
 
     for p in pool:
         p.join()
+
+    wal_proc.terminate()
 
 if __name__ == "__main__":
     main()
