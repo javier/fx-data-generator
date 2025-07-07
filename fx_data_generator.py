@@ -305,7 +305,7 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
             # ---- WAL PAUSE CHECK ----
             while pause_event.is_set():
                 print(f"[WORKER {process_idx}] Paused due to WAL lag (waiting for sequencerTxn==writerTxn)...")
-                time.sleep(2)
+                time.sleep(5)
             # ---- /WAL PAUSE CHECK ----
             if (end_ns and ts >= end_ns) or (sent >= total_events):
                 break
@@ -344,6 +344,7 @@ def wal_monitor(args, pause_event, processes, interval=5):
                 elif last_logged_paused:
                     # Only resume if sequencerTxn == writerTxn (i.e., no lag at all)
                     if seq == wrt:
+                        time.sleep(interval)
                         print(f"[WAL MONITOR] Resuming ingestion: sequencerTxn={seq}, writerTxn={wrt}, lag={lag}")
                         pause_event.clear()
                         last_logged_paused = False
