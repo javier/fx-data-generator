@@ -341,11 +341,12 @@ def wal_monitor(args, pause_event, processes, interval=5):
                     if not last_logged_paused:
                         print(f"[WAL MONITOR] Pausing ingestion: sequencerTxn={seq}, writerTxn={wrt}, lag={lag}")
                         last_logged_paused = True
-                else:
-                    if last_logged_paused:
+                elif last_logged_paused:
+                    # Only resume if sequencerTxn == writerTxn (i.e., no lag at all)
+                    if seq == wrt:
                         print(f"[WAL MONITOR] Resuming ingestion: sequencerTxn={seq}, writerTxn={wrt}, lag={lag}")
-                    pause_event.clear()
-                    last_logged_paused = False
+                        pause_event.clear()
+                        last_logged_paused = False
             time.sleep(interval)
 
 def main():
