@@ -184,7 +184,7 @@ def ensure_materialized_views_exist(args):
                 last((bids[1][1] + asks[1][1])/2) AS close,
                 SUM(bids[2][1] + asks[2][1]) AS total_volume
             FROM market_data
-            SAMPLE BY 1h
+            SAMPLE BY 1d
         );
         """)
 def load_initial_state(args):
