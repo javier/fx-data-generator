@@ -309,6 +309,7 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
     sent = 0
 
     with Sender.from_conf(conf) as sender:
+        wall_start = None #wall clock for real time control
         for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
             # ---- WAL PAUSE CHECK ----
             while pause_event.is_set():
@@ -328,7 +329,14 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
             ts += int(1e9)
             sender.flush()
             if args.mode == "real-time":
-                time.sleep(1)
+                # Align to wall clock
+                if sec_idx == 0:
+                    wall_start = time.time()
+                next_tick = wall_start + sec_idx + 1
+                now = time.time()
+                sleep_for = next_tick - now
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
 
 def wal_monitor(args, pause_event, processes, interval=5):
     import time
