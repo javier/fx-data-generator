@@ -200,12 +200,16 @@ def load_initial_state(args):
             }
     return state
 
+def quantize_to_pip(price, pip):
+    decimals = abs(int(round(np.log10(pip))))
+    return round(round(price / pip) * pip, decimals)
+
 def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.2, shock_prob=0.001):
     change = random.uniform(-drift * pip, drift * pip)
     if random.random() < shock_prob:
         change += random.uniform(-20 * pip, 20 * pip)
     new_mid = prev_mid + change
-    return round(max(low, min(high, new_mid)), precision)
+    return quantize_to_pip(max(low, min(high, new_mid)), pip)
 
 def evolve_indicator(value, drift=0.01, shock_prob=0.01):
     value += random.uniform(-drift, drift)
@@ -222,8 +226,8 @@ def get_random_volume_for_level(level_idx):
 
 def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask, precision, pip):
     for i in range(levels):
-        price_bid = round(best_bid - i * pip, precision)
-        price_ask = round(best_ask + i * pip, precision)
+        price_bid = quantize_to_pip(best_bid - i * pip, pip)
+        price_ask = quantize_to_pip(best_ask + i * pip, pip)
         prebuilt_bids[0][i] = price_bid
         prebuilt_bids[1][i] = get_random_volume_for_level(i)
         prebuilt_asks[0][i] = price_ask
@@ -241,10 +245,10 @@ def precompute_state(args, start_ns, total_seconds, state_template):
             prev_mid = (current[symbol]["bid_price"] + current[symbol]["ask_price"]) / 2
             prev_spread = current[symbol]["spread"]
             new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
-            new_spread = round(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), precision)
+            new_spread = quantize_to_pip(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), pip)
             next_state[symbol] = {
-                "bid_price": round(new_mid - new_spread / 2, precision),
-                "ask_price": round(new_mid + new_spread / 2, precision),
+                "bid_price": quantize_to_pip(new_mid - new_spread / 2, pip),
+                "ask_price": quantize_to_pip(new_mid + new_spread / 2, pip),
                 "spread": new_spread,
                 "indicator1": evolve_indicator(current[symbol]["indicator1"]),
                 "indicator2": evolve_indicator(current[symbol]["indicator2"])
@@ -263,8 +267,8 @@ def generate_events_for_second(ts, market_event_count, core_count, state_for_sec
         mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
         spread = state_for_second[symbol]["spread"]
         mid_jitter = random.uniform(-0.5*pip, 0.5*pip)
-        best_bid = round(mid_price + mid_jitter - spread / 2, precision)
-        best_ask = round(mid_price + mid_jitter + spread / 2, precision)
+        best_bid = quantize_to_pip(mid_price + mid_jitter - spread / 2, pip)
+        best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
         row_ts = ts + offset
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(row_ts))
@@ -276,8 +280,8 @@ def generate_events_for_second(ts, market_event_count, core_count, state_for_sec
         mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
         spread = state_for_second[symbol]["spread"]
         mid_jitter = random.uniform(-0.5*pip, 0.5*pip)
-        best_bid = round(mid_price + mid_jitter - spread / 2, precision)
-        best_ask = round(mid_price + mid_jitter + spread / 2, precision)
+        best_bid = quantize_to_pip(mid_price + mid_jitter - spread / 2, pip)
+        best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
         reason = random.choice(["normal", "news_event", "liquidity_event"])
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
@@ -382,10 +386,14 @@ def main():
         state = {}
     for symbol, low, high, precision, pip in FX_PAIRS:
         if symbol not in state:
+            mid = (low + high) / 2
+            spread = quantize_to_pip(0.0004, pip)
             state[symbol] = {
-                "bid_price": round((low + high) / 2, precision),
-                "ask_price": round((low + high) / 2, precision),
-                "spread": 0.0004, "indicator1": 0.2, "indicator2": 0.5
+                "bid_price": quantize_to_pip(mid - spread / 2, pip),
+                "ask_price": quantize_to_pip(mid + spread / 2, pip),
+                "spread": spread,
+                "indicator1": 0.2,
+                "indicator2": 0.5
             }
 
     ensure_tables_exist(args)

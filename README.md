@@ -9,6 +9,8 @@ slow down the instance, there are safety controls to avoid transaction lag betwe
 
 - **Realistic Multi-Level Orderbook Simulation:**
   For a configurable set of FX pairs, generates synthetic L2 snapshots and price ticks (best bid/ask + ladders + indicators) at a tunable rate.
+- **Strict FX Pip Rounding and Tick Precision:**
+  All prices, spreads, and orderbook levels are always generated as multiples of the correct pip size for each currency pair (e.g., 0.0001 for EURUSD, 0.01 for USDJPY). This ensures that prices and spreads match the real-world “tick size” and no floating-point artifacts are possible, even for millions of rows. All random walks, order ladders, and initial values are pip-quantized per pair.
 - **Multi-Process High-Throughput Ingestion:**
   Uses Python multiprocessing, splitting the per-second plan *and* the event counts among worker processes, to maximize throughput and exploit multi-core CPUs.
 - **WAL Lag Monitoring & Flow Control:**
@@ -26,6 +28,7 @@ On startup, the script creates the required tables (`market_data`, `core_price`)
 
 - Can load initial state from the latest DB values (`core_price LATEST BY symbol`) or start from deterministic defaults.
 - This state is then evolved forward (tick-by-tick, second-by-second) for as many simulated seconds as needed to cover the event plan.
+- All prices, spreads, and ladders for each currency pair are *always* generated as valid multiples of the pip (tick) for that pair, both at initialization and during all state evolution. This avoids unrealistic price artifacts and ensures downstream queries see only valid market prices.
 
 ### 3. **Event Generation Plan**
 
