@@ -257,7 +257,7 @@ def precompute_state(args, start_ns, total_seconds, state_template):
         current = next_state
     return states
 
-def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays):
+def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, end_ns=None):
     offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
     offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
     for offset in offsets_market:
@@ -271,6 +271,8 @@ def generate_events_for_second(ts, market_event_count, core_count, state_for_sec
         best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
         row_ts = ts + offset
+        if end_ns is not None and row_ts >= end_ns:
+            continue
         sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(row_ts))
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
@@ -286,6 +288,8 @@ def generate_events_for_second(ts, market_event_count, core_count, state_for_sec
         reason = random.choice(["normal", "news_event", "liquidity_event"])
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
         row_ts = ts + offset
+        if end_ns is not None and row_ts >= end_ns:
+            continue
         lvl = random.randint(0, levels - 1)
         sender.row("core_price", symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
             "bid_price": float(bids[0][lvl]), "bid_volume": int(bids[1][lvl]),
@@ -318,7 +322,7 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
             generate_events_for_second(
                 ts, market_total, core_total,
                 state_for_this_second, sender,
-                args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks
+                args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns
             )
             sent += market_total
             ts += int(1e9)
