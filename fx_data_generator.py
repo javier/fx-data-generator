@@ -158,7 +158,7 @@ def ensure_materialized_views_exist(args):
                 SUM(bids[2][1] + asks[2][1]) AS total_volume
             FROM market_data
             SAMPLE BY 1m
-        ) PARTITION BY HOUR TTL 12 HOURS;
+        ) PARTITION BY HOUR TTL 1 DAY;
         """)
 
         conn.execute("""
