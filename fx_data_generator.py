@@ -151,11 +151,11 @@ def ensure_materialized_views_exist(args):
         conn.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1m AS (
             SELECT timestamp, symbol,
-                first((bids[1][1] + asks[1][1])/2) AS open,
-                max((bids[1][1] + asks[1][1])/2) AS high,
-                min((bids[1][1] + asks[1][1])/2) AS low,
-                last((bids[1][1] + asks[1][1])/2) AS close,
-                SUM(bids[2][1] + asks[2][1]) AS total_volume
+                first(bids[1][1]) AS open,
+                max(bids[1][1]) AS high,
+                min(bids[1][1]) AS low,
+                last(bids[1][1]) AS close,
+                SUM(bids[2][1]) AS total_volume
             FROM market_data
             SAMPLE BY 1m
         ) PARTITION BY HOUR TTL 1 DAY;
@@ -178,11 +178,11 @@ def ensure_materialized_views_exist(args):
         conn.execute("""
         CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
-                first((bids[1][1] + asks[1][1])/2) AS open,
-                max((bids[1][1] + asks[1][1])/2) AS high,
-                min((bids[1][1] + asks[1][1])/2) AS low,
-                last((bids[1][1] + asks[1][1])/2) AS close,
-                SUM(bids[2][1] + asks[2][1]) AS total_volume
+                first(bids[1][1]) AS open,
+                max(bids[1][1]) AS high,
+                min(bids[1][1]) AS low,
+                last(bids[1][1]) AS close,
+                SUM(bids[2][1]) AS total_volume
             FROM market_data
             SAMPLE BY 1d
         );
