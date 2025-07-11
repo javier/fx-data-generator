@@ -602,8 +602,8 @@ def main():
         p.join()
 
 
-
     wal_proc.terminate()
+    wal_proc.join()
 
 if __name__ == "__main__":
     main()
