@@ -471,18 +471,22 @@ def main():
     args = parser.parse_args()
     suffix = args.suffix
 
+    # Parse ts ONCE
+    if args.start_ts:
+        start_ns = parse_ts_arg(args.start_ts)
+    else:
+        start_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
+    end_ns = parse_ts_arg(args.end_ts) if args.end_ts else None
+
     if args.min_levels > args.max_levels:
         print("ERROR: min_levels cannot be greater than max_levels.")
         exit(1)
-
     if args.mode == "real-time" and args.processes != 1:
         print("ERROR: real-time mode only supports processes=1 (no parallelism in wallclock mode).")
         exit(1)
-
     if args.mode == "real-time" and args.start_ts:
         print("ERROR: --start_ts is not allowed in real-time mode.")
         exit(1)
-
     if args.mode == "faster-than-life":
         if not args.total_market_data_events or args.total_market_data_events <= 0:
             print("ERROR: --total_market_data_events must be set to a positive integer in faster-than-life mode.")
@@ -500,13 +504,42 @@ def main():
 
     max_latest_ns = max(x for x in [latest_market_ns, latest_core_ns] if x is not None) if (latest_market_ns is not None or latest_core_ns is not None) else None
 
-    # Handle end_ts logic
-    end_ns = parse_ts_arg(args.end_ts) if args.end_ts else None
-    if end_ns and max_latest_ns is not None and end_ns <= max_latest_ns:
-        print(f"[ERROR] Provided --end_ts ({args.end_ts}) is earlier than the most recent data in tables ({ns_to_iso(max_latest_ns)}). Aborting.")
-        exit(1)
+    if args.mode == "faster-than-life":
+        if max_latest_ns is not None:
+            next_ns = max_latest_ns + 1_000  # 1 microsecond
+            if next_ns > start_ns:
+                print(f"[INFO] Advancing start_ns from {ns_to_iso(start_ns)} to {ns_to_iso(next_ns)} to avoid overlap with existing data.")
+                start_ns = next_ns
 
+            if end_ns is not None and start_ns >= end_ns:
+                print(f"[INFO] All data in requested range is already present. Exiting.")
+                exit(0)
 
+        if end_ns is not None and start_ns >= end_ns:
+            print(f"[INFO] No work to do: start_ts ({ns_to_iso(start_ns)}) >= end_ts ({ns_to_iso(end_ns)})")
+            print("Exiting.")
+            exit(0)
+
+        if end_ns and max_latest_ns is not None and end_ns <= max_latest_ns:
+            print(f"[ERROR] Provided --end_ts ({args.end_ts}) is earlier than the most recent data in tables ({ns_to_iso(max_latest_ns)}). Aborting.")
+            exit(1)
+
+    elif args.mode == "real-time":
+        now_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
+        if max_latest_ns is not None:
+            next_ns = max_latest_ns + 1_000  # 1 microsecond after last row
+            if next_ns > now_ns:
+                wait_seconds = (next_ns - now_ns) / 1e9
+                print(f"[INFO] Last row in DB is {ns_to_iso(max_latest_ns)}. Waiting {wait_seconds:.1f}s to avoid overlap...")
+                time.sleep(wait_seconds)
+        # In real-time mode, always use wallclock, so start_ns is always "now"
+        start_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
+        if end_ns is not None and start_ns >= end_ns:
+            print(f"[INFO] No work to do: wallclock now ({ns_to_iso(start_ns)}) >= end_ts ({ns_to_iso(end_ns)})")
+            print("Exiting.")
+            exit(0)
+
+    # Build state
     if args.incremental:
         state = load_initial_state(args, suffix)
     else:
@@ -523,14 +556,7 @@ def main():
                 "indicator2": 0.5
             }
 
-    if args.start_ts:
-        start_ns = parse_ts_arg(args.start_ts)
-    else:
-        start_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
-
-    #To check if writerTxn is lagging
     pause_event = Event()
-    # Start WAL monitor process
     wal_proc = mp.Process(
         target=wal_monitor,
         args=(args, pause_event, args.processes),
@@ -539,7 +565,6 @@ def main():
     wal_proc.start()
 
     if args.mode == "faster-than-life":
-        # Build the per-second event plan up front
         per_second_plan = []
         events_so_far = 0
         while events_so_far < args.total_market_data_events:
@@ -547,26 +572,18 @@ def main():
             core_total = random.randint(args.core_min_eps, args.core_max_eps)
             per_second_plan.append((market_total, core_total))
             events_so_far += market_total
-
-        # Trim last second to hit target exactly
         overage = events_so_far - args.total_market_data_events
         if overage > 0:
             market_total, core_total = per_second_plan[-1]
             per_second_plan[-1] = (market_total - overage, core_total)
-
         total_seconds = len(per_second_plan)
-        # Build worker plans
         worker_plans = [[] for _ in range(args.processes)]
         for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
             market_splits = split_event_counts(market_total, args.processes)
             core_splits = split_event_counts(core_total, args.processes)
             for i in range(args.processes):
                 worker_plans[i].append((market_splits[i], core_splits[i]))
-
-        # Precompute state for every simulated second!
         global_states = precompute_state(args, start_ns, total_seconds, state)
-
-        # Start workers (each gets a per-second plan, non-overlapping slices)
         pool = []
         for process_idx in range(args.processes):
             p = mp.Process(
@@ -587,7 +604,6 @@ def main():
             pool.append(p)
         for p in pool:
             p.join()
-
     elif args.mode == "real-time":
         p = mp.Process(
             target=ingest_worker,
@@ -605,7 +621,6 @@ def main():
         )
         p.start()
         p.join()
-
 
     wal_proc.terminate()
     wal_proc.join()
