@@ -392,7 +392,7 @@ def ingest_worker(
                 if sleep_for > 0:
                     time.sleep(sleep_for)
 
-def wal_monitor(args, pause_event, processes, interval=5):
+def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
     import time
     import psycopg as pg
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
@@ -401,7 +401,7 @@ def wal_monitor(args, pause_event, processes, interval=5):
 
     with pg.connect(conn_str, autocommit=True) as conn:
         while True:
-            cur = conn.execute("SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = 'market_data'")
+            cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{table_name('market_data', suffix)}'")
             row = cur.fetchone()
             if row:
                 seq, wrt = row
@@ -526,7 +526,11 @@ def main():
     #To check if writerTxn is lagging
     pause_event = Event()
     # Start WAL monitor process
-    wal_proc = mp.Process(target=wal_monitor, args=(args, pause_event, args.processes))
+    wal_proc = mp.Process(
+        target=wal_monitor,
+        args=(args, pause_event, args.processes),
+        kwargs={'suffix': suffix}
+    )
     wal_proc.start()
 
     if args.mode == "faster-than-life":
