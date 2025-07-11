@@ -43,19 +43,31 @@ FX_PAIRS = [
 
 VOLUME_LADDER = [1_000_000, 10_000_000, 30_000_000, 50_000_000, 100_000_000, 150_000_000, 200_000_000, 300_000_000, 500_000_000, 1_000_000_000]
 
-def ensure_tables_exist(args):
+def table_name(name, suffix):
+    return name + suffix if suffix else name
+
+
+def get_latest_timestamp_ns(conn, table):
+    cur = conn.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp DESC LIMIT 1")
+    row = cur.fetchone()
+    if row and row[0]:
+        return int(row[0].timestamp() * 1e9)
+    else:
+        return None
+
+def ensure_tables_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str, autocommit=True) as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_data (
+        conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
             timestamp TIMESTAMP,
             symbol SYMBOL CAPACITY 15000,
             bids DOUBLE[][],
             asks DOUBLE[][]
         ) timestamp(timestamp) PARTITION BY HOUR;
         """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS core_price (
+        conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name('core_price', suffix)} (
             timestamp TIMESTAMP,
             symbol SYMBOL CAPACITY 15000,
             ecn SYMBOL,
@@ -69,11 +81,11 @@ def ensure_tables_exist(args):
         ) timestamp(timestamp) PARTITION BY HOUR;
         """)
 
-def ensure_materialized_views_exist(args):
+def ensure_materialized_views_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str, autocommit=True) as conn:
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1s AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1s', suffix)}  AS (
             SELECT timestamp, symbol,
                 first((bid_price + ask_price)/2) AS open_mid,
                 max((bid_price + ask_price)/2) AS high_mid,
@@ -86,12 +98,12 @@ def ensure_materialized_views_exist(args):
                 max(ask_price) AS max_ask,
                 min(ask_price) AS min_ask,
                 avg(ask_price) AS avg_ask
-            FROM core_price
+            FROM {table_name('core_price', suffix)}
             SAMPLE BY 1s
         ) PARTITION BY HOUR TTL 4 HOURS;
         """)
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 first((bid_price + ask_price)/2) AS open_mid,
                 max((bid_price + ask_price)/2) AS high_mid,
@@ -104,65 +116,65 @@ def ensure_materialized_views_exist(args):
                 max(ask_price) AS max_ask,
                 min(ask_price) AS min_ask,
                 avg(ask_price) AS avg_ask
-            FROM core_price
+            FROM {table_name('core_price', suffix)}
             SAMPLE BY 1d
         );
         """)
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1s AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1s', suffix)} AS (
             SELECT timestamp, symbol,
                 last(bids[1][1]) AS bid,
                 last(asks[1][1]) AS ask
-            FROM market_data
+            FROM {table_name('market_data', suffix)}
             SAMPLE BY 1s
         );
         """)
 
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1m REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1m', suffix)} REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
                 min(ask) AS ask
-            FROM bbo_1s
+            FROM {table_name('bbo_1s', suffix)}
             SAMPLE BY 1m
         );
         """)
 
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1h REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1h', suffix)} REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
                 min(ask) AS ask
-            FROM bbo_1m
+            FROM  {table_name('bbo_1m', suffix)}
             SAMPLE BY 1h
         );
         """)
 
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
                 min(ask) AS ask
-            FROM bbo_1h
+            FROM {table_name('bbo_1h', suffix)}
             SAMPLE BY 1d
         );
         """)
 
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1m AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1m', suffix)}  AS (
             SELECT timestamp, symbol,
                 first(bids[1][1]) AS open,
                 max(bids[1][1]) AS high,
                 min(bids[1][1]) AS low,
                 last(bids[1][1]) AS close,
                 SUM(bids[2][1]) AS total_volume
-            FROM market_data
+            FROM {table_name('market_data', suffix)}
             SAMPLE BY 1m
         ) PARTITION BY HOUR TTL 1 DAY;
         """)
 
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_15m', suffix)} AS (
             SELECT timestamp, symbol,
                 first(open) AS open,
                 max(high) AS high,
@@ -170,28 +182,29 @@ def ensure_materialized_views_exist(args):
                 last(close) AS close,
                 SUM(total_volume) AS total_volume
 
-            FROM market_data_ohlc_1m
+            FROM {table_name('market_data_ohlc_1m', suffix)}
             SAMPLE BY 15m
         ) PARTITION BY HOUR TTL 2 DAYS;
         """)
 
-        conn.execute("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 first(bids[1][1]) AS open,
                 max(bids[1][1]) AS high,
                 min(bids[1][1]) AS low,
                 last(bids[1][1]) AS close,
                 SUM(bids[2][1]) AS total_volume
-            FROM market_data
+            FROM {table_name('market_data', suffix)}
             SAMPLE BY 1d
         );
         """)
-def load_initial_state(args):
+
+def load_initial_state(args, suffix):
     state = {}
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str) as conn:
-        cur = conn.execute("SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM core_price LATEST BY symbol")
+        cur = conn.execute(f"SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM {table_name('core_price', suffix)} LATEST BY symbol")
         for row in cur.fetchall():
             state[row[0]] = {
                 "bid_price": row[1], "ask_price": row[2],
@@ -234,30 +247,33 @@ def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask,
         prebuilt_asks[1][i] = get_random_volume_for_level(i)
     return prebuilt_bids, prebuilt_asks
 
+def evolve_state_one_tick(prev_state):
+    """Returns evolved state for all FX_PAIRS from previous state dict."""
+    next_state = {}
+    for symbol, low, high, precision, pip in FX_PAIRS:
+        prev_mid = (prev_state[symbol]["bid_price"] + prev_state[symbol]["ask_price"]) / 2
+        prev_spread = prev_state[symbol]["spread"]
+        new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
+        new_spread = quantize_to_pip(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), pip)
+        next_state[symbol] = {
+            "bid_price": quantize_to_pip(new_mid - new_spread / 2, pip),
+            "ask_price": quantize_to_pip(new_mid + new_spread / 2, pip),
+            "spread": new_spread,
+            "indicator1": evolve_indicator(prev_state[symbol]["indicator1"]),
+            "indicator2": evolve_indicator(prev_state[symbol]["indicator2"])
+        }
+    return next_state
+
 def precompute_state(args, start_ns, total_seconds, state_template):
-    # state_template is a dict {symbol: {bid_price, ask_price, spread, ...}}
     states = []
     current = {k: v.copy() for k, v in state_template.items()}
-    for second in range(total_seconds):
-        # evolve state for each symbol
-        next_state = {}
-        for symbol, low, high, precision, pip in FX_PAIRS:
-            prev_mid = (current[symbol]["bid_price"] + current[symbol]["ask_price"]) / 2
-            prev_spread = current[symbol]["spread"]
-            new_mid = evolve_mid_price(prev_mid, low, high, precision, pip)
-            new_spread = quantize_to_pip(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), pip)
-            next_state[symbol] = {
-                "bid_price": quantize_to_pip(new_mid - new_spread / 2, pip),
-                "ask_price": quantize_to_pip(new_mid + new_spread / 2, pip),
-                "spread": new_spread,
-                "indicator1": evolve_indicator(current[symbol]["indicator1"]),
-                "indicator2": evolve_indicator(current[symbol]["indicator2"])
-            }
-        states.append(next_state)
-        current = next_state
+    for _ in range(total_seconds):
+        current = evolve_state_one_tick(current)
+        states.append(current)
     return states
 
-def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, end_ns=None):
+
+def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, end_ns=None, suffix=""):
     offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
     offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
     for offset in offsets_market:
@@ -273,7 +289,7 @@ def generate_events_for_second(ts, market_event_count, core_count, state_for_sec
         row_ts = ts + offset
         if end_ns is not None and row_ts >= end_ns:
             continue
-        sender.row("market_data", symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(row_ts))
+        sender.row(table_name('market_data', suffix), symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(row_ts))
     for offset in offsets_core:
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
@@ -291,13 +307,28 @@ def generate_events_for_second(ts, market_event_count, core_count, state_for_sec
         if end_ns is not None and row_ts >= end_ns:
             continue
         lvl = random.randint(0, levels - 1)
-        sender.row("core_price", symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
+        sender.row(table_name('core_price', suffix), symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
             "bid_price": float(bids[0][lvl]), "bid_volume": int(bids[1][lvl]),
             "ask_price": float(asks[0][lvl]), "ask_volume": int(asks[1][lvl]),
             "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
         }, at=TimestampNanos(row_ts))
 
-def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_states, process_idx, processes, pause_event):
+def wait_if_paused(pause_event, process_idx):
+    while pause_event.is_set():
+        print(f"[WORKER {process_idx}] Paused due to WAL lag (waiting for sequencerTxn==writerTxn)...")
+        time.sleep(5)
+
+def ingest_worker(
+    args,
+    per_second_plan,
+    total_events,
+    start_ns,
+    end_ns,
+    global_states,
+    process_idx,
+    processes,
+    pause_event
+):
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
     else:
@@ -309,30 +340,53 @@ def ingest_worker(args, per_second_plan, total_events, start_ns, end_ns, global_
     sent = 0
 
     with Sender.from_conf(conf) as sender:
-        wall_start = None #wall clock for real time control
-        for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
-            # ---- WAL PAUSE CHECK ----
-            while pause_event.is_set():
-                print(f"[WORKER {process_idx}] Paused due to WAL lag (waiting for sequencerTxn==writerTxn)...")
-                time.sleep(5)
-            # ---- /WAL PAUSE CHECK ----
-            if (end_ns and ts >= end_ns) or (sent >= total_events):
-                break
+        wall_start = None  # for real-time alignment
 
-            state_for_this_second = global_states[sec_idx]
-            generate_events_for_second(
-                ts, market_total, core_total,
-                state_for_this_second, sender,
-                args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns
-            )
-            sent += market_total
-            ts += int(1e9)
-            sender.flush()
-            if args.mode == "real-time":
-                # Align to wall clock
-                if sec_idx == 0:
-                    wall_start = time.time()
-                next_tick = wall_start + sec_idx + 1
+        if args.mode == "faster-than-life":
+            # Precomputed state: bounded by per_second_plan and global_states
+            for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
+                wait_if_paused(pause_event, process_idx)
+                if (end_ns and ts >= end_ns) or (sent >= total_events):
+                    break
+
+                state_for_this_second = global_states[sec_idx]
+                generate_events_for_second(
+                    ts, market_total, core_total,
+                    state_for_this_second, sender,
+                    args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns, args.suffix
+                )
+                sent += market_total
+                ts += int(1e9)
+
+        else:
+            # Real-time mode: infinite, build state as we go
+            # Start with global_states as initial state (can be state or initial state dict)
+            if isinstance(global_states, list):
+                current_state = {k: v.copy() for k, v in global_states[0].items()}
+            else:
+                current_state = {k: v.copy() for k, v in global_states.items()}
+            sec_idx = 0
+            wall_start = time.time()
+
+            while not (end_ns and ts >= end_ns) and (sent < total_events):
+                wait_if_paused(pause_event, process_idx)
+
+                market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+                core_total = random.randint(args.core_min_eps, args.core_max_eps)
+                # Evolve state for this tick using the shared helper
+                next_state = evolve_state_one_tick(current_state)
+                generate_events_for_second(
+                    ts, market_total, core_total,
+                    next_state, sender,
+                    args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns, args.suffix
+                )
+                current_state = next_state
+                sent += market_total
+                ts += int(1e9)
+                sec_idx += 1
+
+                # Wall clock alignment
+                next_tick = wall_start + sec_idx
                 now = time.time()
                 sleep_for = next_tick - now
                 if sleep_for > 0:
@@ -366,6 +420,28 @@ def wal_monitor(args, pause_event, processes, interval=5):
                         last_logged_paused = False
             time.sleep(interval)
 
+def parse_ts_arg(ts):
+    # Accepts 2025-07-11T14:00:00, 2025-07-11T14:00:00Z, or 2025-07-11T14:00:00+00:00 as UTC
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    dt = datetime.datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    else:
+        dt = dt.astimezone(datetime.timezone.utc)
+    return int(dt.timestamp() * 1e9)
+
+def ns_to_iso(ns):
+    dt = datetime.datetime.utcfromtimestamp(ns / 1e9)
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+def split_event_counts(total, num_workers):
+    # Returns a list of event counts for each worker that sum to total, as even as possible
+    base = total // num_workers
+    remainder = total % num_workers
+    return [base + (1 if i < remainder else 0) for i in range(num_workers)]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -385,15 +461,45 @@ def main():
     parser.add_argument("--total_market_data_events", type=int, default=1_000_000)
     parser.add_argument("--start_ts", type=str)
     parser.add_argument("--end_ts", type=str)
-    parser.add_argument("--processes", type=int, default=4)
+    parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--min_levels", type=int, default=5)
     parser.add_argument("--max_levels", type=int, default=5)
-    parser.add_argument("--incremental", action="store_true")
+    parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=True)
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
+    parser.add_argument("--suffix", type=str, default="")
+
     args = parser.parse_args()
+    suffix = args.suffix
+
+    if args.min_levels > args.max_levels:
+        print("ERROR: min_levels cannot be greater than max_levels.")
+        exit(1)
+
+    if args.mode == "real-time" and args.processes != 1:
+        print("ERROR: real-time mode only supports processes=1 (no parallelism in wallclock mode).")
+        exit(1)
+
+    if args.mode == "real-time" and args.start_ts:
+        print("ERROR: --start_ts is not allowed in real-time mode.")
+        exit(1)
+
+    # Connect and get latest timestamps
+    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    with pg.connect(conn_str) as conn:
+        latest_market_ns = get_latest_timestamp_ns(conn, table_name('market_data', suffix))
+        latest_core_ns = get_latest_timestamp_ns(conn, table_name('core_price', suffix))
+
+    max_latest_ns = max(x for x in [latest_market_ns, latest_core_ns] if x is not None) if (latest_market_ns is not None or latest_core_ns is not None) else None
+
+    # Handle end_ts logic
+    end_ns = parse_ts_arg(args.end_ts) if args.end_ts else None
+    if end_ns and max_latest_ns is not None and end_ns <= max_latest_ns:
+        print(f"[ERROR] Provided --end_ts ({args.end_ts}) is earlier than the most recent data in tables ({ns_to_iso(max_latest_ns)}). Aborting.")
+        exit(1)
+
 
     if args.incremental:
-        state = load_initial_state(args)
+        state = load_initial_state(args, suffix)
     else:
         state = {}
     for symbol, low, high, precision, pip in FX_PAIRS:
@@ -408,38 +514,14 @@ def main():
                 "indicator2": 0.5
             }
 
-    ensure_tables_exist(args)
+    ensure_tables_exist(args, suffix)
     if args.create_views:
-        ensure_materialized_views_exist(args)
+        ensure_materialized_views_exist(args, suffix)
 
     if args.start_ts:
-        dt = datetime.datetime.fromisoformat(args.start_ts).replace(tzinfo=datetime.timezone.utc)
-        start_ns = int(dt.timestamp() * 1e9)
+        start_ns = parse_ts_arg(args.start_ts)
     else:
         start_ns = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
-
-    end_ns = int(datetime.datetime.fromisoformat(args.end_ts).replace(tzinfo=datetime.timezone.utc).timestamp() * 1e9) if args.end_ts else None
-    # Precompute full per-second plan so we can split across workers and always get the right event count
-    per_second_plan = []
-    events_so_far = 0
-    while events_so_far < args.total_market_data_events:
-        market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
-        core_total = random.randint(args.core_min_eps, args.core_max_eps)
-        per_second_plan.append((market_total, core_total))
-        events_so_far += market_total
-
-    # Trim last second to hit target exactly
-    overage = events_so_far - args.total_market_data_events
-    if overage > 0:
-        market_total, core_total = per_second_plan[-1]
-        per_second_plan[-1] = (market_total - overage, core_total)
-
-    total_seconds = len(per_second_plan)
-    def split_event_counts(total, num_workers):
-        # Returns a list of event counts for each worker that sum to total, as even as possible
-        base = total // num_workers
-        remainder = total % num_workers
-        return [base + (1 if i < remainder else 0) for i in range(num_workers)]
 
     #To check if writerTxn is lagging
     pause_event = Event()
@@ -447,29 +529,75 @@ def main():
     wal_proc = mp.Process(target=wal_monitor, args=(args, pause_event, args.processes))
     wal_proc.start()
 
-    # Build worker plans: for every second, split event counts among workers
-    worker_plans = [[] for _ in range(args.processes)]
-    for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
-        market_splits = split_event_counts(market_total, args.processes)
-        core_splits = split_event_counts(core_total, args.processes)
-        for i in range(args.processes):
-            worker_plans[i].append((market_splits[i], core_splits[i]))
+    if args.mode == "faster-than-life":
+        # Build the per-second event plan up front
+        per_second_plan = []
+        events_so_far = 0
+        while events_so_far < args.total_market_data_events:
+            market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+            core_total = random.randint(args.core_min_eps, args.core_max_eps)
+            per_second_plan.append((market_total, core_total))
+            events_so_far += market_total
 
-    # Precompute state for every simulated second!
-    global_states = precompute_state(args, start_ns, total_seconds, state)
+        # Trim last second to hit target exactly
+        overage = events_so_far - args.total_market_data_events
+        if overage > 0:
+            market_total, core_total = per_second_plan[-1]
+            per_second_plan[-1] = (market_total - overage, core_total)
 
-    # Start workers, each picks a slice of seconds (no overlap)
-    pool = []
-    for process_idx in range(args.processes):
+        total_seconds = len(per_second_plan)
+        # Build worker plans
+        worker_plans = [[] for _ in range(args.processes)]
+        for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
+            market_splits = split_event_counts(market_total, args.processes)
+            core_splits = split_event_counts(core_total, args.processes)
+            for i in range(args.processes):
+                worker_plans[i].append((market_splits[i], core_splits[i]))
+
+        # Precompute state for every simulated second!
+        global_states = precompute_state(args, start_ns, total_seconds, state)
+
+        # Start workers (each gets a per-second plan, non-overlapping slices)
+        pool = []
+        for process_idx in range(args.processes):
+            p = mp.Process(
+                target=ingest_worker,
+                args=(
+                    args,
+                    worker_plans[process_idx],
+                    sum(market for market, _ in worker_plans[process_idx]),
+                    start_ns,
+                    end_ns,
+                    global_states,
+                    process_idx,
+                    args.processes,
+                    pause_event
+                )
+            )
+            p.start()
+            pool.append(p)
+        for p in pool:
+            p.join()
+
+    elif args.mode == "real-time":
         p = mp.Process(
             target=ingest_worker,
-            args=(args, worker_plans[process_idx], sum(market for market, _ in worker_plans[process_idx]), start_ns, end_ns, global_states, process_idx, args.processes, pause_event)
+            args=(
+                args,
+                None,  # No per-second plan
+                args.total_market_data_events,
+                start_ns,
+                end_ns,
+                state,  # Only initial state
+                0,  # process_idx
+                1,  # processes
+                pause_event
+            )
         )
         p.start()
-        pool.append(p)
-
-    for p in pool:
         p.join()
+
+
 
     wal_proc.terminate()
 
