@@ -483,6 +483,10 @@ def main():
         print("ERROR: --start_ts is not allowed in real-time mode.")
         exit(1)
 
+    ensure_tables_exist(args, suffix)
+    if args.create_views:
+        ensure_materialized_views_exist(args, suffix)
+
     # Connect and get latest timestamps
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str) as conn:
@@ -513,10 +517,6 @@ def main():
                 "indicator1": 0.2,
                 "indicator2": 0.5
             }
-
-    ensure_tables_exist(args, suffix)
-    if args.create_views:
-        ensure_materialized_views_exist(args, suffix)
 
     if args.start_ts:
         start_ns = parse_ts_arg(args.start_ts)
