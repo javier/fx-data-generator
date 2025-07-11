@@ -483,6 +483,11 @@ def main():
         print("ERROR: --start_ts is not allowed in real-time mode.")
         exit(1)
 
+    if args.mode == "faster-than-life":
+        if not args.total_market_data_events or args.total_market_data_events <= 0:
+            print("ERROR: --total_market_data_events must be set to a positive integer in faster-than-life mode.")
+            exit(1)
+
     ensure_tables_exist(args, suffix)
     if args.create_views:
         ensure_materialized_views_exist(args, suffix)
