@@ -4,6 +4,7 @@ set -e
 # Build the python command from env vars. Extend as needed.
 exec python fx_data_generator.py \
   --mode "${MODE}" \
+  --short_ttl "${SHORT_TTL}" \
   --market_data_min_eps "${MARKET_DATA_MIN_EPS}" \
   --market_data_max_eps "${MARKET_DATA_MAX_EPS}" \
   --core_min_eps "${CORE_MIN_EPS}" \

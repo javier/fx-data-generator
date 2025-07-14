@@ -20,6 +20,7 @@ USER fxuser
 
 # Set defaults for environment variables (used by entrypoint script)
 ENV MODE=real-time
+ENV SHORT_TTL=True
 ENV MARKET_DATA_MIN_EPS=8200
 ENV MARKET_DATA_MAX_EPS=11000
 ENV CORE_MIN_EPS=700

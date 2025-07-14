@@ -57,6 +57,7 @@ def get_latest_timestamp_ns(conn, table):
 
 def ensure_tables_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    short_ttl = args.short_ttl
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
@@ -64,7 +65,7 @@ def ensure_tables_exist(args, suffix):
             symbol SYMBOL CAPACITY 15000,
             bids DOUBLE[][],
             asks DOUBLE[][]
-        ) timestamp(timestamp) PARTITION BY HOUR;
+        ) timestamp(timestamp) PARTITION BY HOUR {'TTL 3 DAYS' if short_ttl else ''};
         """)
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('core_price', suffix)} (
@@ -78,11 +79,12 @@ def ensure_tables_exist(args, suffix):
             reason SYMBOL,
             indicator1 DOUBLE,
             indicator2 DOUBLE
-        ) timestamp(timestamp) PARTITION BY HOUR;
+        ) timestamp(timestamp) PARTITION BY HOUR {'TTL 3 DAYS' if short_ttl else ''};
         """)
 
 def ensure_materialized_views_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    short_ttl = args.short_ttl
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1s', suffix)}  AS (
@@ -118,7 +120,7 @@ def ensure_materialized_views_exist(args, suffix):
                 avg(ask_price) AS avg_ask
             FROM {table_name('core_price', suffix)}
             SAMPLE BY 1d
-        );
+        ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
         """)
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1s', suffix)} AS (
@@ -127,7 +129,7 @@ def ensure_materialized_views_exist(args, suffix):
                 last(asks[1][1]) AS ask
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1s
-        );
+        ) PARTITION BY HOUR  {'TTL 3 DAYS' if short_ttl else ''};
         """)
 
         conn.execute(f"""
@@ -137,7 +139,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM {table_name('bbo_1s', suffix)}
             SAMPLE BY 1m
-        );
+        ) PARTITION BY DAY {'TTL 3 DAYS' if short_ttl else ''};
         """)
 
         conn.execute(f"""
@@ -147,7 +149,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM  {table_name('bbo_1m', suffix)}
             SAMPLE BY 1h
-        );
+        ) PARTITION BY MONTH {'TTL 1 MONTH' if short_ttl else ''};
         """)
 
         conn.execute(f"""
@@ -157,7 +159,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM {table_name('bbo_1h', suffix)}
             SAMPLE BY 1d
-        );
+        ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
         """)
 
         conn.execute(f"""
@@ -197,7 +199,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1d
-        );
+        ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
         """)
 
 def load_initial_state(args, suffix):
@@ -466,6 +468,7 @@ def main():
     parser.add_argument("--max_levels", type=int, default=5)
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=True)
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
+    parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
     parser.add_argument("--suffix", type=str, default="")
 
     args = parser.parse_args()
