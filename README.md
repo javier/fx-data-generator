@@ -78,7 +78,8 @@ Tables (`market_data`, `core_price`, with optional suffix) and their required ma
 | `--min_levels`               | int       | Min orderbook levels (bids/asks). Default: `5`                                                                 |
 | `--max_levels`               | int       | Max orderbook levels. Default: `5`                                                                             |
 | `--incremental`              | bool/flag | If true (default), load last state from DB to continue appending, never overlap existing data.                 |
-| `--create_views`             | bool/flag | If true (default), create required materialized views if not present.                                          |
+| `--create_views`             | bool/flag | If true (default), create required materialized views if not present.
+| `--short_ttl`                | bool/flag | If true (non-default), will enforce TTL for all tables (3 DAYS) and views (3 DAYS or 1 MONTH, depending on sampling).                                       |
 | `--suffix`                   | str       | (Optional) Suffix to append to all table/view names.                                                           |
 
 ---
