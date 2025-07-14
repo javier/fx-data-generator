@@ -1,106 +1,100 @@
 # FX Synthetic Data Generator & Ingestor for QuestDB
 
 This script generates highly realistic, multi-level FX order book and price tick data and ingests it into QuestDB at high speed.
-It is specifically designed for *stress testing*, benchmarking, and demo scenarios, and contains multi-process orchestration
-and ingestion to get high throughput. Since multi process can lead to out-of-order ingestion in QuestDB, and that might
-slow down the instance, there are safety controls to avoid transaction lag between sequencer and writer.
+
+Designed for **stress testing**, benchmarking, and live demo scenarios, it supports both wall-clock-paced (“real-time”) and maximum-throughput (“faster-than-life”) simulation. Multi-process orchestration, pip-accurate orderbooks, WAL backpressure detection, and robust state management ensure both realism and throughput—without data overlap or out-of-order chaos.
+
+---
 
 ## Features
 
 - **Realistic Multi-Level Orderbook Simulation:**
-  For a configurable set of FX pairs, generates synthetic L2 snapshots and price ticks (best bid/ask + ladders + indicators) at a tunable rate.
-- **Strict FX Pip Rounding and Tick Precision:**
-  All prices, spreads, and orderbook levels are always generated as multiples of the correct pip size for each currency pair (e.g., 0.0001 for EURUSD, 0.01 for USDJPY). This ensures that prices and spreads match the real-world “tick size” and no floating-point artifacts are possible, even for millions of rows. All random walks, order ladders, and initial values are pip-quantized per pair.
-- **Multi-Process High-Throughput Ingestion:**
-  Uses Python multiprocessing, splitting the per-second plan *and* the event counts among worker processes, to maximize throughput and exploit multi-core CPUs.
-- **WAL Lag Monitoring & Flow Control:**
-  Monitors QuestDB's WAL transaction lag in a separate process, pausing ingestion across all workers when lag exceeds a configurable threshold, and only resuming once the WAL has fully caught up.
-- **Resilient, Debounced Ingestion Resume:**
-  Avoids "flapping" between pause/resume by requiring the WAL to be fully caught up for at least one full interval before resuming ingestion, reducing the risk of thrashing under heavy write load.
+  For a configurable set of FX pairs, generates L2 snapshots (bids/asks/volumes at multiple levels) and price ticks at a tunable, randomized rate. All values are always valid multiples of the correct pip for each pair (e.g., 0.0001 for EURUSD, 0.01 for USDJPY).
+- **True Tick Precision, No Floating Point Drift:**
+  All prices, spreads, and ladders are always generated as valid pips—never random floats—at every step.
+- **Parallel High-Throughput Ingestion:**
+  Multiprocessing splits both the event plan and pre-evolved state for max CPU utilization and ingest bandwidth. Each process ingests a unique time partition, never overlapping.
+- **WAL Lag Detection and Flow Control:**
+  Dedicated monitor process queries QuestDB’s WAL progress; when lag exceeds a threshold, all workers pause and resume cleanly.
+- **Resumable, Incremental Ingestion:**
+  Supports loading state from the latest DB rows, for continuous/incremental ingestion without data overlap, or generating from scratch.
+- **Start/End Timestamp Enforcement:**
+  The generator will **never** overlap or backfill data into already-populated time ranges; it automatically advances the start time if needed and stops cleanly at the end.
+- **Materialized Views Auto-Setup:**
+  On startup, creates all necessary tables and downstream views (with suffix support) if not already present.
 
-## Mechanics & Architecture
+---
 
-### 1. **Table/View Setup**
+## Mechanics
 
-On startup, the script creates the required tables (`market_data`, `core_price`) and all downstream materialized views, if not already present.
+### Table & View Creation
 
-### 2. **Initial State Bootstrapping**
+Tables (`market_data`, `core_price`, with optional suffix) and their required materialized views are created at startup.
 
-- Can load initial state from the latest DB values (`core_price LATEST BY symbol`) or start from deterministic defaults.
-- This state is then evolved forward (tick-by-tick, second-by-second) for as many simulated seconds as needed to cover the event plan.
-- All prices, spreads, and ladders for each currency pair are *always* generated as valid multiples of the pip (tick) for that pair, both at initialization and during all state evolution. This avoids unrealistic price artifacts and ensures downstream queries see only valid market prices.
+### Initial State
 
-### 3. **Event Generation Plan**
+- By default (incremental mode), loads last-known state from the DB (`core_price LATEST BY symbol`), advancing the simulation timestamp just after the latest row found.
+- Otherwise, starts from deterministic pip-aligned midpoints for each pair.
 
-- The total number of `market_data` (L2) events is specified by `--total_market_data_events`.
-- For each simulated second, a random (but bounded) number of market and core price events are generated, using `--market_data_min_eps`, `--market_data_max_eps`, etc.
-- The script **precomputes** this per-second event plan, then splits it evenly among all worker processes, so each process gets a unique slice of the event plan and their total event counts add up to the requested global total.
+### Event Plan
 
-### 4. **Multiprocessing & Event Coordination**
+- In `"faster-than-life"` mode, the total number of `market_data` (L2) events is set by `--total_market_data_events` and distributed across simulated seconds, then evenly split among processes. Each process gets a unique time slice—no overlap.
+- In `"real-time"` mode, the generator respects wall-clock time, writing only as time passes. If prior data exists in the DB, it waits for wall-clock to advance past the last ingested row, then starts.
 
-- Each worker process receives its per-second slice, along with the precomputed state for each second.
-- Each worker repeatedly:
-  1. Checks if a global pause event is set (see below); if so, waits.
-  2. Generates and ingests its assigned events for the current second.
-  3. Flushes and proceeds to the next simulated second.
+### Backpressure Management
 
-### 5. **WAL Transaction Lag Monitoring & Pausing**
+- The WAL monitor process checks for lag (`sequencerTxn - writerTxn` on the `market_data` table) and pauses/resumes ingestion globally via a multiprocessing event.
+- The threshold is `3 * num_processes`, with resume only when lag is fully cleared (debounced).
 
-- A dedicated `wal_monitor` process queries QuestDB every few seconds:
-  - `SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = 'market_data'`
-- If `sequencerTxn - writerTxn > (3 x num_processes)` (the threshold), the `pause_event` is set.
-- **All worker processes respect this event**: when set, they pause ingestion (with a message) and loop waiting for resume.
-- **Resume is debounced**: workers only resume when `sequencerTxn == writerTxn` for at least one monitor interval.
-- This prevents the database from being overwhelmed by excessive WAL lag or IO stalls.
+### Exit Logic
 
-### 6. **Other Safeguards**
+- If the requested start timestamp is already covered by existing data (or the end is past), the script exits with a clear message and does **not** overwrite or overlap existing data.
+- All subprocesses, including the WAL monitor, are cleanly terminated at the end.
 
-- Cleanly terminates the WAL monitor process when all workers complete.
-- Optionally supports incremental mode, view (re-)creation, and full parameterization.
+---
 
 ## Arguments
 
-| Argument                     | Type      | Description                                                                                                              |
-|------------------------------|-----------|--------------------------------------------------------------------------------------------------------------------------|
-| `--host`                     | str       | Hostname or IP address of the QuestDB instance. Default: `127.0.0.1`                                                     |
-| `--pg_port`                  | str/int   | PostgreSQL port for QuestDB. Default: `8812`                                                                             |
-| `--user`                     | str       | Database user for metadata connection. Default: `admin`                                                                  |
-| `--password`                 | str       | Database password for metadata connection. Default: `quest`                                                              |
-| `--token`                    | str       | (Optional) ILP/HTTP authentication token (JWK)                                                                           |
-| `--token_x`                  | str       | (Optional) JWK token X (public key) for tcps ingestion                                                                  |
-| `--token_y`                  | str       | (Optional) JWK token Y (public key) for tcps ingestion                                                                  |
-| `--ilp_user`                 | str       | (Optional) ILP/HTTP ingestion user. Default: `admin`                                                                     |
-| `--protocol`                 | str       | `tcp` or `http` (or `tcps`/`https` if token present). Controls ingestion method. Default: `http`                         |
-| `--mode`                     | str       | Either `"real-time"` (1 second pacing) or `"faster-than-life"` (max speed). **Required**                                 |
-| `--market_data_min_eps`      | int       | Minimum events/sec for `market_data` (per simulated second). Default: `1000`                                             |
-| `--market_data_max_eps`      | int       | Maximum events/sec for `market_data` (per simulated second). Default: `15000`                                            |
-| `--core_min_eps`             | int       | Minimum events/sec for `core_price` (per simulated second). Default: `800`                                               |
-| `--core_max_eps`             | int       | Maximum events/sec for `core_price` (per simulated second). Default: `1100`                                              |
-| `--total_market_data_events` | int       | Total number of `market_data` (L2) events to generate (global across all workers). Default: `1_000_000`                  |
-| `--start_ts`                 | str       | (Optional) Simulation start time in ISO8601 format. Default: now (UTC)                                                   |
-| `--end_ts`                   | str       | (Optional) Simulation end time in ISO8601 format. Optional.                                                              |
-| `--processes`                | int       | Number of worker processes to use. Default: `4`                                                                          |
-| `--min_levels`               | int       | Minimum number of orderbook levels (for both bids/asks). Default: `5`                                                    |
-| `--max_levels`               | int       | Maximum number of orderbook levels. Default: `5`                                                                         |
-| `--incremental`              | flag      | If set, load last known prices from QuestDB as starting state (for incremental/continuous ingestion).                    |
-| `--create_views`             | bool      | Create required materialized views if not present. Default: `True`                                                       |
+| Argument                     | Type      | Description                                                                                                    |
+|------------------------------|-----------|----------------------------------------------------------------------------------------------------------------|
+| `--host`                     | str       | Host/IP of QuestDB instance. Default: `127.0.0.1`                                                              |
+| `--pg_port`                  | str/int   | PostgreSQL port for QuestDB. Default: `8812`                                                                   |
+| `--user`                     | str       | Database user for metadata. Default: `admin`                                                                   |
+| `--password`                 | str       | Password for metadata. Default: `quest`                                                                        |
+| `--token`                    | str       | (Optional) ILP/HTTP authentication token (JWK)                                                                 |
+| `--token_x`                  | str       | (Optional) JWK token X (for tcps)                                                                              |
+| `--token_y`                  | str       | (Optional) JWK token Y (for tcps)                                                                              |
+| `--ilp_user`                 | str       | (Optional) ILP/HTTP ingestion user. Default: `admin`                                                           |
+| `--protocol`                 | str       | `tcp` or `http` (`tcps`/`https` if token present). Default: `http`                                             |
+| `--mode`                     | str       | `"real-time"` (wall clock pacing) or `"faster-than-life"` (max speed). **Required**                            |
+| `--market_data_min_eps`      | int       | Min events/sec for `market_data` (per simulated second). Default: `1000`                                       |
+| `--market_data_max_eps`      | int       | Max events/sec for `market_data`. Default: `15000`                                                             |
+| `--core_min_eps`             | int       | Min events/sec for `core_price`. Default: `800`                                                                |
+| `--core_max_eps`             | int       | Max events/sec for `core_price`. Default: `1100`                                                               |
+| `--total_market_data_events` | int       | Total `market_data` (L2) events to generate (across all workers). Default: `1_000_000`                         |
+| `--start_ts`                 | str       | (Optional) Simulation start time, ISO8601 format. Default: now (UTC)                                           |
+| `--end_ts`                   | str       | (Optional) Simulation end time, ISO8601 format.                                                                |
+| `--processes`                | int       | Number of worker processes. Default: `1`                                                                       |
+| `--min_levels`               | int       | Min orderbook levels (bids/asks). Default: `5`                                                                 |
+| `--max_levels`               | int       | Max orderbook levels. Default: `5`                                                                             |
+| `--incremental`              | bool/flag | If true (default), load last state from DB to continue appending, never overlap existing data.                 |
+| `--create_views`             | bool/flag | If true (default), create required materialized views if not present.                                          |
+| `--suffix`                   | str       | (Optional) Suffix to append to all table/view names.                                                           |
 
+---
 
-## WAL Backpressure Logic
+## WAL Backpressure Control
 
-- **Threshold:**
-  Pausing triggers when WAL sequencerTxn is > `3 x num_processes` ahead of writerTxn.
-- **Pause:**
-  Workers enter a paused state and print messages until lag is fully gone.
-- **Resume:**
-  Only resumes after at least one interval with *no lag* (`sequencerTxn == writerTxn`).
+- **Pause:** When `sequencerTxn - writerTxn > 3 * num_processes`, all workers pause and print a message.
+- **Resume:** Only resumes after at least one interval with *zero* lag (`sequencerTxn == writerTxn`).
 
-## How To Run
+---
 
-Scenario 1: This would generate date in `faster-than-life` mode, for 24 hours of data, as per the `start_ts` and `end_ts`
-parameters. It will ingest about 850 million rows in the `market_data` table, as per the eps rate passed as parameters.
+## Usage Examples
 
-Example in with tcp ingestion and authentication (will use tcps)
+### High-speed batch ingest (“faster-than-life” mode)
+
+Ingests ~900M rows in one day, using TCP/TCPS with authentication:
 
 ```bash
 python fx_data_generator.py \
@@ -117,45 +111,35 @@ python fx_data_generator.py \
   --mode faster-than-life \
   --processes 8 \
   --total_market_data_events 900_000_000 \
-  --start_ts "2025-07-05T00:00:00" \
-  --end_ts "2025-07-06T00:00:00"
+  --start_ts "2025-07-05T00:00:00Z" \
+  --end_ts "2025-07-06T00:00:00Z"
 ```
 
+### Wall-clock pacing (“real-time” mode)
 
-Example with http ingestion and authentication (will use https)
+Ingests in real time, with up to 100M events. Starts now (ignores `--start_ts`):
 
 ```bash
 python fx_data_generator.py \
   --host 192.21.12.42 \
-  --market_data_min_eps 8200 \
-  --market_data_max_eps 11000 \
-  --core_min_eps 700 \
-  --core_max_eps 1000 \
-  --token "secret_jwk_token" \
-  --protocol http \
-  --mode faster-than-life \
-  --processes 8 \
-  --total_market_data_events 900_000_000 \
-  --start_ts "2025-07-05T00:00:00" \
-  --end_ts "2025-07-06T00:00:00"
-```
-
-Scenario 2: This would generate date in `real-time` mode, up to 100_000_000 events in the `market_data` table, starting
-from the `start_ts` date. If no `start_ts` is provided, the current timestamp in UTC will be used as starting point. Data
-is sent via http and with no authentication.
-
-
-```bash
-python fx_data_generator.py \
-  --host 192.21.12.42 \
-  --market_data_min_eps 8200 \
-  --market_data_max_eps 11000 \
+  --market_data_min_eps 1000 \
+  --market_data_max_eps 2000 \
   --core_min_eps 700 \
   --core_max_eps 1000 \
   --protocol http \
   --mode real-time \
-  --processes 8 \
-  --total_market_data_events 100_000_000 \
-  --start_ts "2025-07-05T00:00:00"
+  --processes 1 \
+  --total_market_data_events 100_000_000
 ```
 
+---
+
+## Notes
+
+- The script will **never** insert data that overlaps existing rows—if there is already data for the requested range, it advances the start timestamp or exits.
+- All state, event counts, and random walks are pip-quantized, so *no invalid ticks or drift* are possible.
+- All subprocesses are shut down cleanly, and WAL monitoring never lingers after completion.
+
+---
+
+**Questions?** See comments in the script or [open an issue](https://github.com/questdb/questdb).
