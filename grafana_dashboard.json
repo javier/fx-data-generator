@@ -1,8 +1,8 @@
 {
   "__inputs": [
     {
-      "name": "DS_QDB",
-      "label": "qdb",
+      "name": "DS_QUESTDB",
+      "label": "QuestDB",
       "description": "",
       "type": "datasource",
       "pluginId": "questdb-questdb-datasource",
@@ -13,6 +13,12 @@
   "__requires": [
     {
       "type": "panel",
+      "id": "ae3e-plotly-panel",
+      "name": "Plotly panel",
+      "version": "0.5.0"
+    },
+    {
+      "type": "panel",
       "id": "candlestick",
       "name": "Candlestick",
       "version": ""
@@ -21,7 +27,7 @@
       "type": "grafana",
       "id": "grafana",
       "name": "Grafana",
-      "version": "11.6.0"
+      "version": "10.4.1"
     },
     {
       "type": "datasource",
@@ -58,7 +64,7 @@
       }
     ]
   },
-  "description": "FX Orderbook Demo with Arrays",
+  "description": "FX Orderbook Realtime Demo with Arrays",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
@@ -66,163 +72,72 @@
   "links": [],
   "panels": [
     {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "description": "Visualizes the order book snapshot for the selected currency pair, showing the price and cumulative volume at each bid and ask level. The area under the green (bids) and red (asks) lines represents market liquidity on both sides, with the mid-price and top volume “walls” highlighted for quick identification of major support and resistance.",
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "hideTimeOverride": true,
+      "id": 27,
+      "maxPerRow": 2,
+      "options": {
+        "onclick": "console.log(data)\nwindow.updateVariables({query:{'var-project':'test'}, partial: true})",
+        "script": "const table = data.series[0];\nconst fields = table.fields;\n\nconst side = fields.find(f => f.name === \"side\");\nconst price = fields.find(f => f.name === \"price\");\nconst cum_volume = fields.find(f => f.name === \"cum_volume\");\nconst volume = fields.find(f => f.name === \"volume\");\n\nif (!side || !price || !cum_volume || !volume) {\n  throw new Error(\"Missing required fields\");\n}\n\nconst sideVals = side.values.toArray();\nconst priceVals = price.values.toArray();\nconst cumVolVals = cum_volume.values.toArray();\nconst volVals = volume.values.toArray();\n\nconst bids = [];\nconst asks = [];\n\nfor (let i = 0; i < priceVals.length; i++) {\n  const s = sideVals[i];\n  const p = priceVals[i];\n  const v = cumVolVals[i];\n  const raw = volVals[i];\n\n  if (s === \"bid\") bids.push({ x: p, y: v, raw });\n  else if (s === \"ask\") asks.push({ x: p, y: v, raw });\n}\n\nbids.sort((a, b) => b.x - a.x);\nasks.sort((a, b) => a.x - b.x);\n\nconst bestBid = bids[0]?.x ?? 0;\nconst bestAsk = asks[0]?.x ?? 0;\nconst mid = (bestBid + bestAsk) / 2;\n\nif (bids.length > 0) bids.unshift({ x: mid, y: bids[0].y });\nif (asks.length > 0) asks.unshift({ x: mid, y: 0 });\n\nconst topBids = [...bids]\n  .filter(b => b.raw)\n  .sort((a, b) => b.raw - a.raw)\n  .slice(-2); // largest 2\n\nconst topAsks = [...asks]\n  .filter(a => a.raw)\n  .sort((a, b) => b.raw - a.raw)\n  .slice(-2); // largest 2\n\nconst wallLines = [...topBids, ...topAsks].map(wall => ({\n  type: \"line\",\n  x0: wall.x,\n  x1: wall.x,\n  y0: 0,\n  y1: 1,\n  xref: \"x\",\n  yref: \"paper\",\n  line: {\n    color: \"yellow\",\n    width: 1,\n    dash: \"dot\"\n  }\n}));\n\nconst wallLabels = [...topBids, ...topAsks].map(wall => ({\n  x: wall.x,\n  y: 1.02,\n  xref: \"x\",\n  yref: \"paper\",\n  text: wall.x.toFixed(5),\n  showarrow: false,\n  font: { color: \"yellow\", size: 10 }\n}));\n\nreturn {\n  data: [\n    {\n      name: \"Bids\",\n      x: bids.map(pt => pt.x),\n      y: bids.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(0,255,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(0,255,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    },\n    {\n      name: \"Asks\",\n      x: asks.map(pt => pt.x),\n      y: asks.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(255,0,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(255,0,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    }\n  ],\n  layout: {\n    plot_bgcolor: \"black\",\n    paper_bgcolor: \"black\",\n    font: { color: \"white\" },\n    xaxis: {\n      title: \"Price\",\n      type: \"linear\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false\n    },\n    yaxis: {\n      title: \"Cumulative Volume\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false\n    },\n    margin: { t: 40, l: 60, r: 20, b: 50 },\n    shapes: [\n      {\n        type: \"line\",\n        x0: mid,\n        x1: mid,\n        y0: 0,\n        y1: 1,\n        xref: \"x\",\n        yref: \"paper\",\n        line: {\n          color: \"white\",\n          width: 1,\n          dash: \"dot\"\n        }\n      },\n      ...wallLines\n    ],\n    annotations: wallLabels,\n    legend: {\n      orientation: \"h\",\n      x: 0.5,\n      xanchor: \"center\",\n      y: -0.3\n    }\n  }\n};"
+      },
+      "pluginVersion": "0.5.0",
+      "repeat": "SYMBOL",
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "format": 1,
+          "meta": {
+            "builderOptions": {
+              "fields": [],
+              "limit": "",
+              "mode": "list",
+              "timeField": ""
+            }
+          },
+          "queryType": "sql",
+          "rawSql": "WITH snapshot AS (\n  SELECT timestamp, bids, asks\n  FROM market_data\n  WHERE $__timeFilter(timestamp) and  symbol = '${SYMBOL}'\n  ORDER BY timestamp DESC\n  LIMIT 1\n),\nbid_levels AS (\n  SELECT timestamp, 'bid' AS side, bids[1,1] AS price, bids[2,1] AS volume FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,2], bids[2,2] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,3], bids[2,3] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,4], bids[2,4] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,5], bids[2,5] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,6], bids[2,6] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,7], bids[2,7] FROM snapshot\n),\nask_levels AS (\n  SELECT timestamp, 'ask' AS side, asks[1,1] AS price, asks[2,1] AS volume FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,2], asks[2,2] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,3], asks[2,3] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,4], asks[2,4] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,5], asks[2,5] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,6], asks[2,6] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,7], asks[2,7] FROM snapshot\n),\nbid_cum AS (\n  SELECT\n    timestamp,\n    side,\n    price,\n    volume,\n    SUM(volume) OVER (ORDER BY price DESC) AS cum_volume\n  FROM bid_levels\n  WHERE price IS NOT NULL\n),\nask_cum AS (\n  SELECT\n    timestamp,\n    side,\n    price,\n    volume,\n    SUM(volume) OVER (ORDER BY price ASC) AS cum_volume\n  FROM ask_levels\n  WHERE price IS NOT NULL\n)\nSELECT * FROM bid_cum\nUNION ALL\nSELECT * FROM ask_cum\nORDER BY side, price;\n",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ],
+      "timeFrom": "10m",
+      "title": "Market Depth - ${SYMBOL}",
+      "type": "ae3e-plotly-panel"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 0
+        "y": 10
       },
       "id": 21,
       "panels": [],
-      "title": "Last minute stats",
+      "repeat": "SYMBOL",
+      "title": "Prices and Spread",
       "type": "row"
     },
     {
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
+        "uid": "${DS_QUESTDB}"
       },
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "fixedColor": "blue",
-            "mode": "continuous-BlPu"
-          },
-          "custom": {
-            "align": "auto",
-            "cellOptions": {
-              "type": "color-background"
-            },
-            "inspect": false,
-            "minWidth": 50
-          },
-          "fieldMinMax": false,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "#6ED0E0",
-                "value": 11000000
-              },
-              {
-                "color": "#EAB839",
-                "value": 13000000
-              },
-              {
-                "color": "red",
-                "value": 14000000
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Time"
-            },
-            "properties": [
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-background"
-                }
-              },
-              {
-                "id": "custom.minWidth",
-                "value": 200
-              },
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "semi-dark-blue",
-                  "mode": "shades"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Symbol"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 80
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 0,
-        "y": 1
-      },
-      "id": 7,
-      "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "enablePagination": false,
-          "fields": "",
-          "reducer": [
-            "sum"
-          ],
-          "show": false
-        },
-        "showHeader": true
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          },
-          "editorMode": "code",
-          "format": 1,
-          "rawQuery": true,
-          "rawSql": "SELECT timestamp as Time, Symbol, sum(bid_volume*bid_price) as Bid_Volume \nfrom core_price\nWHERE \n$__timeFilter(timestamp)\nSAMPLE BY 1y\nlimit 6\n--order by bid_volume desc \n--limit 10",
-          "refId": "A",
-          "selectedFormat": 1,
-          "sql": {
-            "columns": [
-              {
-                "parameters": [],
-                "type": "function"
-              }
-            ],
-            "groupBy": [
-              {
-                "property": {
-                  "type": "string"
-                },
-                "type": "groupBy"
-              }
-            ],
-            "limit": 50
-          }
-        }
-      ],
-      "timeShift": "1m",
-      "title": "Traded Volume last minute (all currencies)",
-      "type": "table"
-    },
-    {
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
-      },
-      "description": "",
+      "description": "Displays a rolling table of the most recent seconds for the selected currency pair, summarizing the current average spread (difference between best ask and best bid) along with the aggregated bid and ask volumes. Use this to monitor how liquidity and price tightness evolve in real time, and spot sudden widening or bursts in traded volume.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -243,7 +158,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "#6ED0E0",
@@ -292,9 +208,10 @@
       "gridPos": {
         "h": 8,
         "w": 7,
-        "x": 6,
-        "y": 1
+        "x": 0,
+        "y": 11
       },
+      "hideTimeOverride": true,
       "id": 20,
       "options": {
         "cellHeight": "sm",
@@ -309,17 +226,17 @@
         },
         "showHeader": true
       },
-      "pluginVersion": "11.6.0",
+      "pluginVersion": "10.4.1",
       "targets": [
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
+            "uid": "${DS_QUESTDB}"
           },
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT timestamp as Time, sum(asks[1,1]-bids[1,1]) as Spread, sum(bids[1,1]*bids[2,1]) as Bid_Volume, sum(asks[1,1]*asks[2,1]) as Ask_Volume\nfrom market_data\nWHERE \n$__timeFilter(timestamp) and symbol = '${SYMBOL}'\nSAMPLE BY 1s\norder by timestamp desc \nlimit 6",
+          "rawSql": "SELECT timestamp as Time, avg(asks[1,1]-bids[1,1]) as Spread, sum(bids[1,1]*bids[2,1]) as Bid_Volume, sum(asks[1,1]*asks[2,1]) as Ask_Volume\nfrom market_data\nWHERE \n$__timeFilter(timestamp) and symbol = '${SYMBOL}'\nSAMPLE BY 1s\norder by timestamp desc \nlimit 6",
           "refId": "A",
           "selectedFormat": 2,
           "sql": {
@@ -349,8 +266,9 @@
     {
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
+        "uid": "${DS_QUESTDB}"
       },
+      "description": "Compares the best bid in the order book (from L2 market data) using an ASOF JOIN against the corresponding “core” quote price from upstream sources (e.g., ECNs). This table helps detect price alignment issues, latency, or anomalies between your live order book and reference prices provided by liquidity venues.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -371,7 +289,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -453,10 +372,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 11,
-        "x": 13,
-        "y": 1
+        "w": 9,
+        "x": 7,
+        "y": 11
       },
+      "hideTimeOverride": true,
       "id": 19,
       "options": {
         "cellHeight": "sm",
@@ -470,9 +390,13 @@
         },
         "showHeader": true
       },
-      "pluginVersion": "11.6.0",
+      "pluginVersion": "10.4.1",
       "targets": [
         {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
           "format": 1,
           "meta": {
             "builderOptions": {
@@ -485,11 +409,7 @@
           "queryType": "sql",
           "rawSql": "with p as (select timestamp, bid_price, bid_volume, symbol, ecn  from core_price where $__timeFilter(timestamp) and symbol = '${SYMBOL}' limit -6), levels as (\n        select market_data.timestamp as md_timestamp, insertion_point(bids[2], bid_volume) as level, bids[1][insertion_point(bids[2], bid_volume)] as price, bids[2][insertion_point(bids[2], bid_volume)] as volume, \n         p.timestamp, p.bid_price, p.bid_volume as bid_volume,p.ecn from p asof join market_data on symbol\n\n         )\n         select md_timestamp as MarketData_Time, case when price is null then null else level end as Level, Price, Volume, timestamp as CorePrice_Time, bid_price as Bid_Price, bid_volume1 as Bid_Volume, ecn as ECN from levels;",
           "refId": "A",
-          "selectedFormat": 1,
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          }
+          "selectedFormat": 1
         }
       ],
       "timeFrom": "1m",
@@ -498,24 +418,11 @@
       "type": "table"
     },
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 9
-      },
-      "id": 24,
-      "panels": [],
-      "title": "OHLC Bars",
-      "type": "row"
-    },
-    {
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
+        "uid": "${DS_QUESTDB}"
       },
-      "description": "",
+      "description": "Candlestick chart summarizing price action using the best bid from the order book, aggregated into 15-minute intervals. Each candlestick shows the open, high, low, and close bid price, along with traded volume. Ideal for visualizing price trends, volatility, and market regime changes over time. Data is queried from a materialized view.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -528,143 +435,6 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineStyle": {
-              "fill": "solid"
-            },
-            "lineWidth": 1,
-            "pointSize": 3,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "fieldMinMax": false,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 7,
-        "x": 0,
-        "y": 10
-      },
-      "id": 6,
-      "options": {
-        "candleStyle": "candles",
-        "colorStrategy": "close-close",
-        "colors": {
-          "down": "light-blue",
-          "up": "semi-dark-purple"
-        },
-        "fields": {
-          "close": "close",
-          "high": "high",
-          "low": "low",
-          "open": "open",
-          "volume": "total_volume"
-        },
-        "includeAllFields": false,
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "mode": "candles",
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          },
-          "editorMode": "code",
-          "format": 0,
-          "rawQuery": true,
-          "rawSql": "select timestamp, first(open) open, max(high) high, min(low) low, last(close) close, sum(total_volume) total_volume\n        from market_data_ohlc_1m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n        sample by 2m\n        \n        \n",
-          "refId": "A",
-          "selectedFormat": 0,
-          "sql": {
-            "columns": [
-              {
-                "parameters": [],
-                "type": "function"
-              }
-            ],
-            "groupBy": [
-              {
-                "property": {
-                  "type": "string"
-                },
-                "type": "groupBy"
-              }
-            ],
-            "limit": 50
-          }
-        }
-      ],
-      "timeFrom": "2h",
-      "title": "OHLC - Bids - 1m - (${SYMBOL})",
-      "transparent": true,
-      "type": "candlestick"
-    },
-    {
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
-      },
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
@@ -698,7 +468,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -710,10 +481,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 7,
-        "w": 10,
-        "x": 7,
-        "y": 10
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 11
       },
       "id": 13,
       "options": {
@@ -749,12 +520,12 @@
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
+            "uid": "${DS_QUESTDB}"
           },
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "select timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_15m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n        \n        \n",
+          "rawSql": "select timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_15m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n        \n        \n        \n",
           "refId": "A",
           "selectedFormat": 2,
           "sql": {
@@ -776,143 +547,8 @@
           }
         }
       ],
-      "timeFrom": "12h",
+      "timeFrom": "now/d",
       "title": "OHLC - Bids - 15m - (${SYMBOL})",
-      "transparent": true,
-      "type": "candlestick"
-    },
-    {
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
-      },
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineStyle": {
-              "fill": "solid"
-            },
-            "lineWidth": 1,
-            "pointSize": 3,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 7,
-        "x": 17,
-        "y": 10
-      },
-      "id": 14,
-      "options": {
-        "candleStyle": "candles",
-        "colorStrategy": "close-close",
-        "colors": {
-          "down": "light-blue",
-          "up": "semi-dark-purple"
-        },
-        "fields": {
-          "close": "close",
-          "high": "high",
-          "low": "low",
-          "open": "open",
-          "volume": "total_volume"
-        },
-        "includeAllFields": false,
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "mode": "candles+volume",
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          },
-          "editorMode": "code",
-          "format": 1,
-          "rawQuery": true,
-          "rawSql": "select timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_1d\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n        \n        \n",
-          "refId": "A",
-          "selectedFormat": 2,
-          "sql": {
-            "columns": [
-              {
-                "parameters": [],
-                "type": "function"
-              }
-            ],
-            "groupBy": [
-              {
-                "property": {
-                  "type": "string"
-                },
-                "type": "groupBy"
-              }
-            ],
-            "limit": 50
-          }
-        }
-      ],
-      "timeFrom": "7d",
-      "title": "OHLC - Bids - 1d - (${SYMBOL})",
       "transparent": true,
       "type": "candlestick"
     },
@@ -922,18 +558,20 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 28
       },
       "id": 23,
       "panels": [],
-      "title": "VWAP",
+      "repeat": "SYMBOL",
+      "title": "Indicators",
       "type": "row"
     },
     {
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
+        "uid": "${DS_QUESTDB}"
       },
+      "description": "Multi-layered chart, overlaid on OHLC candles, combining three technical indicators for the selected symbol:\n\t•\tVWAP: Shows the Volume-Weighted Average Price, a key benchmark for execution quality.\n\t•\tRSI (12h): The Relative Strength Index, computed over 12-hour rolling windows, highlights overbought/oversold conditions and price momentum.\n\t•\tBollinger Bands (20,2): Plots a 20-period moving average with ±2 standard deviations, indicating price volatility and potential breakout/reversal zones. Each period is 15 minutes, so the simple moving average (SMA) covers a 6-hour window.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -946,7 +584,6 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
@@ -986,13 +623,53 @@
             ]
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "RSI"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "RSI %"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "auto"
+              },
+              {
+                "id": "custom.axisSoftMax",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "Bollinger"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "light-blue",
+                  "mode": "palette-classic-by-name"
+                }
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 7,
-        "w": 12,
+        "w": 13,
         "x": 0,
-        "y": 18
+        "y": 29
       },
       "hideTimeOverride": false,
       "id": 11,
@@ -1029,7 +706,7 @@
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
+            "uid": "${DS_QUESTDB}"
           },
           "format": 1,
           "meta": {
@@ -1041,118 +718,17 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "\nWITH sampled AS (\n    SELECT\n          timestamp,  symbol,\n          total_volume,\n          ((open+close)/2) * total_volume AS traded_value\n     FROM market_data_ohlc_1m\n     WHERE $__timeFilter(timestamp)\n      AND \n      symbol IN '${SYMBOL}'     \n), cumulative AS (\n     SELECT timestamp, symbol,\n           SUM(traded_value)\n                OVER (ORDER BY timestamp) AS cumulative_value,\n           SUM(total_volume)\n                OVER (ORDER BY timestamp) AS cumulative_volume\n     FROM sampled\n), vwap as (\nSELECT timestamp, cumulative_value/cumulative_volume AS vwap FROM cumulative\n), ohlc AS (\n     select timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_1m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n)        \nselect * from vwap asof join ohlc        \n",
-          "refId": "A",
+          "rawSql": "\nWITH sampled AS (\n    SELECT\n          timestamp,  symbol,\n          total_volume,\n          ((open+close)/2) * total_volume AS traded_value\n     FROM market_data_ohlc_1m\n     WHERE $__timeFilter(timestamp)\n      AND \n      symbol IN '${SYMBOL}'     \n), cumulative AS (\n     SELECT timestamp, symbol,\n           SUM(traded_value)\n                OVER (ORDER BY timestamp) AS cumulative_value,\n           SUM(total_volume)\n                OVER (ORDER BY timestamp) AS cumulative_volume\n     FROM sampled\n), vwap as (\nSELECT timestamp, cumulative_value/cumulative_volume AS vwap FROM cumulative\n)    \nselect * from vwap      \n",
+          "refId": "VWAP",
           "selectedFormat": 2
-        }
-      ],
-      "timeFrom": "now/d",
-      "title": "VWAP today - 1m intervals - (${SYMBOL})",
-      "type": "candlestick"
-    },
-    {
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
         },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 18
-      },
-      "hideTimeOverride": false,
-      "id": 17,
-      "options": {
-        "candleStyle": "candles",
-        "colorStrategy": "open-close",
-        "colors": {
-          "down": "light-blue",
-          "up": "semi-dark-purple"
-        },
-        "fields": {
-          "close": "close",
-          "high": "high",
-          "low": "low",
-          "open": "open",
-          "volume": "total_volume"
-        },
-        "includeAllFields": true,
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "mode": "candles+volume",
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
+            "uid": "${DS_QUESTDB}"
           },
           "format": 1,
+          "hide": false,
           "meta": {
             "builderOptions": {
               "fields": [],
@@ -1162,143 +738,17 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "\nWITH sampled AS (\n    SELECT\n          timestamp,  symbol,\n          total_volume,\n          ((open+close)/2) * total_volume AS traded_value\n     FROM market_data_ohlc_15m\n     WHERE $__timeFilter(timestamp)\n      AND \n      symbol IN '${SYMBOL}'     \n), cumulative AS (\n     SELECT timestamp, symbol,\n           SUM(traded_value)\n                OVER (ORDER BY timestamp) AS cumulative_value,\n           SUM(total_volume)\n                OVER (ORDER BY timestamp) AS cumulative_volume\n     FROM sampled\n), vwap AS (\nSELECT timestamp, cumulative_value/cumulative_volume AS vwap FROM cumulative\n), ohlc AS (\nselect timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_15m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n)\nselect * from vwap asof join ohlc        \n        \n",
-          "refId": "A",
+          "rawSql": "     select timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_15m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n",
+          "refId": "OHLC",
           "selectedFormat": 2
-        }
-      ],
-      "timeFrom": "now-1d/d",
-      "title": "VWAP yesterday - 15m intervals - (${SYMBOL})",
-      "type": "candlestick"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 25
-      },
-      "id": 22,
-      "panels": [],
-      "title": "Other Indicators",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Bid"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "semi-dark-purple",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "RSI_12h"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "light-blue",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 26
-      },
-      "hideTimeOverride": false,
-      "id": 16,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
         {
-          "format": 0,
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "format": 1,
+          "hide": false,
           "meta": {
             "builderOptions": {
               "fields": [],
@@ -1309,116 +759,16 @@
           },
           "queryType": "sql",
           "rawSql": "WITH price_changes AS (\n    SELECT\n        timestamp,    \n        symbol,    \n        bid,\n        bid - prev_bid price_change\n    FROM (    \n      SELECT \n          timestamp,\n          symbol,\n          bid,\n          LAG(bid) OVER (PARTITION BY symbol ORDER BY timestamp) AS prev_bid\n      FROM bbo_1h\n      WHERE  $__timeFilter(timestamp)\n      AND symbol = '${SYMBOL}'\n    )  \n),\ngains_losses AS (\n    SELECT \n        timestamp,\n        symbol,\n        bid,\n        CASE WHEN price_change > 0 THEN price_change ELSE 0 END AS gain,\n        CASE WHEN price_change < 0 THEN ABS(price_change) ELSE 0 END AS loss\n    FROM price_changes\n),\n\navg_gains_losses AS (\n    SELECT \n        timestamp,\n        symbol,\n        bid,\n        AVG(gain) OVER (PARTITION BY symbol ORDER BY timestamp ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS avg_gain,\n        AVG(loss) OVER (PARTITION BY symbol ORDER BY timestamp ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS avg_loss\n    FROM gains_losses\n)\n\nSELECT \n    timestamp,    \n    Bid,\n    CASE \n        WHEN avg_loss = 0 THEN 100\n        ELSE 100 - (100 / (1 + (avg_gain / NULLIF(avg_loss, 0))))\n    END AS RSI_12h\nFROM avg_gains_losses\nORDER BY timestamp;\n",
-          "refId": "A",
-          "selectedFormat": 0,
+          "refId": "RSI",
+          "selectedFormat": 2
+        },
+        {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          }
-        }
-      ],
-      "timeFrom": "now-24h",
-      "title": "Relative Strenght Index - 12h - (${SYMBOL})",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
+            "uid": "${DS_QUESTDB}"
           },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 26
-      },
-      "id": 26,
-      "options": {
-        "candleStyle": "candles",
-        "colorStrategy": "open-close",
-        "colors": {
-          "down": "light-blue",
-          "up": "semi-dark-purple"
-        },
-        "fields": {
-          "close": "close",
-          "high": "high",
-          "low": "low",
-          "open": "open",
-          "volume": "total_volume"
-        },
-        "includeAllFields": true,
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "mode": "candles+volume",
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
-        {
-          "format": 0,
+          "format": 1,
+          "hide": false,
           "meta": {
             "builderOptions": {
               "fields": [],
@@ -1428,37 +778,21 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "WITH stats AS (\n  SELECT\n    timestamp,\n    close,\n    AVG(close) OVER (\n      ORDER BY timestamp\n      ROWS BETWEEN 19 PRECEDING AND CURRENT ROW\n    ) AS sma20,\n    AVG(close * close ) OVER (\n      ORDER BY timestamp\n      ROWS BETWEEN 19 PRECEDING AND CURRENT ROW \n    ) AS avg_close_sq\n  FROM market_data_ohlc_15m -- 20 periods of 15 minutes = SMA 6h\n   WHERE  $__timeFilter(timestamp)\n      AND symbol IN '${SYMBOL}'\n), bollinger AS (\nSELECT\n  timestamp,\n  sma20,\n  -- sqrt(avg_close_sq - (sma20 * sma20)) as stdev20,\n  sma20 + 2 * sqrt(avg_close_sq - (sma20 * sma20)) as upper_band,\n  sma20 - 2 * sqrt(avg_close_sq - (sma20 * sma20)) as lower_band\nFROM stats\nORDER BY timestamp ),\nohlc as (\n  select timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_15m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n)\nselect * from bollinger asof join ohlc",
-          "refId": "A",
-          "selectedFormat": 0,
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          }
+          "rawSql": "WITH stats AS (\n  SELECT\n    timestamp,\n    close,\n    AVG(close) OVER (\n      ORDER BY timestamp\n      ROWS BETWEEN 19 PRECEDING AND CURRENT ROW\n    ) AS sma20,\n    AVG(close * close ) OVER (\n      ORDER BY timestamp\n      ROWS BETWEEN 19 PRECEDING AND CURRENT ROW \n    ) AS avg_close_sq\n  FROM market_data_ohlc_15m -- 20 periods of 15 minutes = SMA 6h\n   WHERE  $__timeFilter(timestamp)\n      AND symbol IN '${SYMBOL}'\n), bollinger AS (\nSELECT\n  timestamp,\n  sma20,\n  -- sqrt(avg_close_sq - (sma20 * sma20)) as stdev20,\n  sma20 + 2 * sqrt(avg_close_sq - (sma20 * sma20)) as upper_band,\n  sma20 - 2 * sqrt(avg_close_sq - (sma20 * sma20)) as lower_band\nFROM stats\nORDER BY timestamp )\nselect * from bollinger ",
+          "refId": "Bollinger",
+          "selectedFormat": 2
         }
       ],
-      "timeFrom": "now-15h",
-      "title": "Bollinger Bands (20, 2) – 15m OHLC (6h Window) - (${SYMBOL})",
+      "timeFrom": "now/d",
+      "title": "VWAP - Relative Strength Index 12h - Bollinger Bands (20,2) (${SYMBOL})",
       "type": "candlestick"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 34
-      },
-      "id": 25,
-      "panels": [],
-      "title": "Bids / Asks",
-      "type": "row"
     },
     {
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
+        "uid": "${DS_QUESTDB}"
       },
+      "description": "Time series chart comparing the aggregated bid and ask volumes over 30-second intervals, alongside the best bid and offer (BBO) price at 1-second granularity. Useful for monitoring shifts in market pressure, liquidity imbalances, and rapid changes in top-of-book pricing.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1471,7 +805,6 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
@@ -1497,6 +830,8 @@
               "mode": "off"
             }
           },
+          "decimals": 4,
+          "fieldMinMax": false,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -1509,7 +844,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "currencyUSD"
         },
         "overrides": [
           {
@@ -1541,16 +877,46 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "Volume"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "volume"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "BBO"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "palette-classic-by-name"
+                }
+              }
+            ]
           }
         ]
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 35
+        "h": 7,
+        "w": 11,
+        "x": 13,
+        "y": 29
       },
-      "id": 18,
+      "id": 26,
       "options": {
         "legend": {
           "calcs": [],
@@ -1567,6 +933,10 @@
       "pluginVersion": "11.6.0",
       "targets": [
         {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
           "format": 1,
           "meta": {
             "builderOptions": {
@@ -1578,256 +948,37 @@
           },
           "queryType": "sql",
           "rawSql": "\nSELECT timestamp time, symbol, sum(bids[1,1] * bids[2,1]) as bid, -1 * sum(asks[1,1] * asks[2,1]) as ask\n  from market_data where $__timeFilter(timestamp) and \nsymbol IN '${SYMBOL}'\nsample by 30s;\n\n\n",
-          "refId": "A",
-          "selectedFormat": 2,
+          "refId": "Volume",
+          "selectedFormat": 2
+        },
+        {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          }
-        }
-      ],
-      "timeFrom": "30m",
-      "title": "Bid vs Ask Volume -  30s - (${SYMBOL})",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "${DS_QDB}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Ask"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "light-blue",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Mid"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "semi-dark-green",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Bid"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "semi-dark-purple",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 35
-      },
-      "id": 12,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.6.0",
-      "targets": [
-        {
-          "builderOptions": {
-            "0": "T",
-            "1": "h",
-            "2": "e",
-            "3": " ",
-            "4": "q",
-            "5": "u",
-            "6": "e",
-            "7": "r",
-            "8": "y",
-            "9": " ",
-            "10": "c",
-            "11": "a",
-            "12": "n",
-            "13": "'",
-            "14": "t",
-            "15": " ",
-            "16": "b",
-            "17": "e",
-            "18": " ",
-            "19": "p",
-            "20": "a",
-            "21": "r",
-            "22": "s",
-            "23": "e",
-            "24": "d",
-            "25": ".",
-            "fields": [],
-            "filters": [],
-            "groupBy": [],
-            "limit": "",
-            "metrics": [
-              {
-                "aggregation": "avg",
-                "alias": "mid_bbo",
-                "field": "bid"
-              }
-            ],
-            "mode": "trend",
-            "orderBy": [],
-            "partitionBy": [],
-            "sampleByAlignTo": "CALENDAR",
-            "table": "bbo_1s",
-            "timeField": "timestamp"
+            "uid": "${DS_QUESTDB}"
           },
           "format": 0,
+          "hide": false,
           "meta": {
             "builderOptions": {
-              "0": "T",
-              "1": "h",
-              "2": "e",
-              "3": " ",
-              "4": "q",
-              "5": "u",
-              "6": "e",
-              "7": "r",
-              "8": "y",
-              "9": " ",
-              "10": "c",
-              "11": "a",
-              "12": "n",
-              "13": "'",
-              "14": "t",
-              "15": " ",
-              "16": "b",
-              "17": "e",
-              "18": " ",
-              "19": "p",
-              "20": "a",
-              "21": "r",
-              "22": "s",
-              "23": "e",
-              "24": "d",
-              "25": ".",
               "fields": [],
-              "filters": [],
-              "groupBy": [],
               "limit": "",
-              "metrics": [
-                {
-                  "aggregation": "avg",
-                  "alias": "mid_bbo",
-                  "field": "bid"
-                }
-              ],
-              "mode": "trend",
-              "orderBy": [],
-              "partitionBy": [],
-              "sampleByAlignTo": "CALENDAR",
-              "table": "bbo_1s",
-              "timeField": "timestamp"
+              "mode": "list",
+              "timeField": ""
             }
           },
           "queryType": "sql",
-          "rawSql": "--SELECT timestamp as time,  symbol,\n--avg(bid) best_bid,\n--avg(ask) best_ask,\n--avg((bid+ask)/2) best_mid,\n-- FROM \"bbo_1s\" \n--WHERE $__timeFilter(timestamp)\n--and symbol IN '${SYMBOL}'\n--SAMPLE BY $__sampleByInterval\n\nSELECT timestamp as Time,  Symbol, Bid, Ask, (bid+ask)/2 as Mid\n FROM \"bbo_1s\" \nWHERE $__timeFilter(timestamp)\nand symbol IN '${SYMBOL}'\n",
-          "refId": "A",
-          "selectedFormat": 2,
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "${DS_QDB}"
-          }
+          "rawSql": "\n\nSELECT timestamp as Time,  Symbol, Bid, Ask, (bid+ask)/2 as Mid\n FROM \"bbo_1s\" \nWHERE $__timeFilter(timestamp)\nand symbol IN '${SYMBOL}'\n",
+          "refId": "BBO",
+          "selectedFormat": 2
         }
       ],
-      "timeFrom": "2h",
-      "title": "Best Bid and Offer - 1s - (${SYMBOL})",
+      "timeFrom": "30m",
+      "title": "Bid vs Ask Volume  (30s) - BBO (1s) - (${SYMBOL})",
       "type": "timeseries"
     }
   ],
-  "refresh": "750ms",
-  "schemaVersion": 41,
+  "refresh": "250ms",
+  "schemaVersion": 39,
   "tags": [],
   "templating": {
     "list": [
@@ -1836,27 +987,31 @@
         "current": {},
         "datasource": {
           "type": "questdb-questdb-datasource",
-          "uid": "${DS_QDB}"
+          "uid": "${DS_QUESTDB}"
         },
         "definition": "SELECT distinct SYMBOL FROM (\nSELECT  SYMBOL FROM core_price\nwhere timestamp > dateadd('d',-4,now())\nlatest on timestamp partition by symbol\n) order by symbol;\n",
         "description": "symbol to filter by",
         "hide": 1,
         "includeAll": false,
         "label": "symbol",
+        "multi": true,
         "name": "SYMBOL",
         "options": [],
         "query": "SELECT distinct SYMBOL FROM (\nSELECT  SYMBOL FROM core_price\nwhere timestamp > dateadd('d',-4,now())\nlatest on timestamp partition by symbol\n) order by symbol;\n",
         "refresh": 1,
         "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
         "type": "query"
       }
     ]
   },
   "time": {
-    "from": "now-1h",
+    "from": "now-6h",
     "to": "now"
   },
   "timepicker": {
+    "hidden": true,
     "refresh_intervals": [
       "250ms",
       "500ms",
@@ -1876,8 +1031,8 @@
     ]
   },
   "timezone": "browser",
-  "title": "FX Orderbook Demo",
-  "uid": "beqtshx9hciyod",
-  "version": 41,
+  "title": "FX Orderbook - Realtime Demo",
+  "uid": "beriuq09sqry8e",
+  "version": 9,
   "weekStart": ""
 }
