@@ -1,5 +1,6 @@
 import argparse
 import time
+import sys
 import random
 import multiprocessing as mp
 from multiprocessing import Event
@@ -51,7 +52,13 @@ def get_latest_timestamp_ns(conn, table):
     cur = conn.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp DESC LIMIT 1")
     row = cur.fetchone()
     if row and row[0]:
-        return int(row[0].timestamp() * 1e9)
+        dt = row[0]
+        if dt.tzinfo is None:
+            # Assume UTC if naive
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone(datetime.timezone.utc)
+        return int(dt.timestamp() * 1e9)
     else:
         return None
 
@@ -219,7 +226,7 @@ def quantize_to_pip(price, pip):
     decimals = abs(int(round(np.log10(pip))))
     return round(round(price / pip) * pip, decimals)
 
-def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.2, shock_prob=0.001):
+def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.4, shock_prob=0.005):
     change = random.uniform(-drift * pip, drift * pip)
     if random.random() < shock_prob:
         change += random.uniform(-20 * pip, 20 * pip)
@@ -394,6 +401,18 @@ def ingest_worker(
                 if sleep_for > 0:
                     time.sleep(sleep_for)
 
+    # ... main event loop ends here ...
+    # Print reason for exit
+    if end_ns is not None and ts >= end_ns:
+        print(f"[WORKER {process_idx}] Finished. Exiting because end_ts ({ns_to_iso(end_ns)}) was reached (last ts: {ns_to_iso(ts)}). Events sent from worker {sent} ")
+    elif sent >= total_events:
+        print(f"[WORKER {process_idx}] Finished. Exiting because total_market_data_events ({total_events}) was reached (last ts: {ns_to_iso(ts)}).")
+    else:
+        print(f"[WORKER {process_idx}] Finished. Exiting for unknown reason (last ts: {ns_to_iso(ts)}).")
+
+    sys.exit(0)
+
+
 def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
     import time
     import psycopg as pg
@@ -514,9 +533,20 @@ def main():
                 print(f"[INFO] Advancing start_ns from {ns_to_iso(start_ns)} to {ns_to_iso(next_ns)} to avoid overlap with existing data.")
                 start_ns = next_ns
 
+
+
             if end_ns is not None and start_ns >= end_ns:
                 print(f"[INFO] All data in requested range is already present. Exiting.")
                 exit(0)
+
+            if end_ns is not None:
+                available_seconds = (end_ns - start_ns) // 1_000_000_000
+                if available_seconds <= 0:
+                    print(f"[INFO] No available interval after advancing start_ns.")
+                    print("Exiting.")
+                    exit(0)
+                elif available_seconds < 5:
+                    print(f"[WARN] Only {available_seconds} seconds available for event generation. Very little data will be generated.")
 
         if end_ns is not None and start_ns >= end_ns:
             print(f"[INFO] No work to do: start_ts ({ns_to_iso(start_ns)}) >= end_ts ({ns_to_iso(end_ns)})")
@@ -587,6 +617,12 @@ def main():
             for i in range(args.processes):
                 worker_plans[i].append((market_splits[i], core_splits[i]))
         global_states = precompute_state(args, start_ns, total_seconds, state)
+
+        if end_ns is not None and start_ns >= end_ns:
+            print(f"[INFO] No work to do: start_ts ({ns_to_iso(start_ns)}) >= end_ts ({ns_to_iso(end_ns)})")
+            print("Exiting.")
+            exit(0)
+
         pool = []
         for process_idx in range(args.processes):
             p = mp.Process(
