@@ -424,7 +424,12 @@ def ingest_worker(
                 if (end_ns and ts >= end_ns) or (sent >= total_events):
                     break
 
-                state_for_this_second = global_states[sec_idx]
+
+                if last_close_per_symbol:
+                    state_for_this_second = {k: v.copy() for k, v in last_close_per_symbol.items()}
+                else:
+                    state_for_this_second = global_states[sec_idx]
+
                 per_second_symbol_state =  generate_events_for_second(
                     ts, market_total, core_total,
                     state_for_this_second, sender,
