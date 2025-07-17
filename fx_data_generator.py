@@ -226,7 +226,7 @@ def quantize_to_pip(price, pip):
     decimals = abs(int(round(np.log10(pip))))
     return round(round(price / pip) * pip, decimals)
 
-def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.4, shock_prob=0.005):
+def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.5, shock_prob=0.010):
     change = random.uniform(-drift * pip, drift * pip)
     if random.random() < shock_prob:
         change += random.uniform(-20 * pip, 20 * pip)
@@ -281,61 +281,109 @@ def precompute_state(args, start_ns, total_seconds, state_template):
         states.append(current)
     return states
 
-def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, end_ns=None, suffix="", prev_states=None):
+
+def generate_events_for_second(
+    ts,
+    market_event_count,
+    core_count,
+    state_for_second,
+    sender,
+    min_levels,
+    max_levels,
+    prebuilt_bid_arrays,
+    prebuilt_ask_arrays,
+    end_ns=None,
+    suffix="",
+    prev_states=None
+):
     """
-    prev_states: dict mapping symbol -> previous state's close bid/ask
+    state_for_second: dict mapping symbol -> dict of bid_price, ask_price, etc. for this second
+    prev_states: dict mapping symbol -> previous close bid/ask (for continuity)
     """
-    # --- Build per-symbol open price for this second ---
-    # If prev_states is provided, ensure open == previous close
-    per_symbol_first_market = {}
-    for offset in sorted(random.sample(range(0, 999_999_999), market_event_count)):
-        symbol, low, high, precision, pip = random.choice(FX_PAIRS)
+    per_second_symbol_state = {}
+
+
+    offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
+    offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
+
+    # Pre-select symbols per event (with possible repeats)
+    symbol_choices = random.choices(FX_PAIRS, k=market_event_count)
+
+    for i, offset in enumerate(offsets_market):
+        symbol, low, high, precision, pip = symbol_choices[i]
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-        # Determine if this is the "first" tick for this symbol this second
-        is_first = symbol not in per_symbol_first_market
-        # Apply continuity: force open = prev close if available
-        if is_first and prev_states and symbol in prev_states:
-            # Use previous close as mid price, but keep spread from new state
-            mid_price = (prev_states[symbol]["bid_price"] + prev_states[symbol]["ask_price"]) / 2
-            spread = state_for_second[symbol]["spread"]
-            best_bid = quantize_to_pip(mid_price - spread / 2, pip)
-            best_ask = quantize_to_pip(mid_price + spread / 2, pip)
-            per_symbol_first_market[symbol] = True
+
+        # --- CONTINUITY: use previous close as the open for first event of symbol in this second ---
+        if symbol not in per_second_symbol_state:
+            if prev_states and symbol in prev_states:
+                # Start from previous close
+                per_second_symbol_state[symbol] = prev_states[symbol].copy()
+            else:
+                per_second_symbol_state[symbol] = state_for_second[symbol].copy()
         else:
-            # Slightly random walk
-            mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
-            spread = state_for_second[symbol]["spread"]
-            mid_jitter = random.uniform(-0.5 * pip, 0.5 * pip)
-            best_bid = quantize_to_pip(mid_price + mid_jitter - spread / 2, pip)
-            best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
-        generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
+            # Evolve from previous event's state with meaningful walk
+            last_state = per_second_symbol_state[symbol]
+            prev_mid = (last_state["bid_price"] + last_state["ask_price"]) / 2
+            spread = last_state["spread"]
+
+            # Larger walk to survive pip rounding
+            mid = prev_mid + random.uniform(-2.0, 2.0) * pip
+            mid = max(low, min(high, mid))  # clamp to bounds
+
+            bid_price = quantize_to_pip(mid - spread / 2, pip)
+            ask_price = quantize_to_pip(mid + spread / 2, pip)
+
+            per_second_symbol_state[symbol] = {
+                "bid_price": bid_price,
+                "ask_price": ask_price,
+                "spread": spread,
+                "indicator1": evolve_indicator(last_state["indicator1"]),
+                "indicator2": evolve_indicator(last_state["indicator2"])
+            }
+
+        s = per_second_symbol_state[symbol]
+        generate_bids_asks(bids, asks, levels, s["bid_price"], s["ask_price"], precision, pip)
         row_ts = ts + offset
         if end_ns is not None and row_ts >= end_ns:
             continue
-        sender.row(table_name('market_data', suffix), symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(row_ts))
-    for offset in sorted(random.sample(range(0, 999_999_999), core_count)):
-        symbol, low, high, precision, pip = random.choice(FX_PAIRS)
+        sender.row(
+            table_name('market_data', suffix),
+            symbols={"symbol": symbol},
+            columns={"bids": bids, "asks": asks},
+            at=TimestampNanos(row_ts)
+        )
+
+    symbol_choices_core = random.choices(FX_PAIRS, k=core_count)
+    for i, offset in enumerate(offsets_core):
+        symbol, low, high, precision, pip = symbol_choices_core[i]
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
         indicators = state_for_second[symbol]
-        mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
-        spread = state_for_second[symbol]["spread"]
-        mid_jitter = random.uniform(-0.5 * pip, 0.5 * pip)
-        best_bid = quantize_to_pip(mid_price + mid_jitter - spread / 2, pip)
-        best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
-        generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
+        bid_price = state_for_second[symbol]["bid_price"]
+        ask_price = state_for_second[symbol]["ask_price"]
         reason = random.choice(["normal", "news_event", "liquidity_event"])
         ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
         row_ts = ts + offset
         if end_ns is not None and row_ts >= end_ns:
             continue
         lvl = random.randint(0, levels - 1)
-        sender.row(table_name('core_price', suffix), symbols={"symbol": symbol, "ecn": ecn, "reason": reason}, columns={
-            "bid_price": float(bids[0][lvl]), "bid_volume": int(bids[1][lvl]),
-            "ask_price": float(asks[0][lvl]), "ask_volume": int(asks[1][lvl]),
-            "indicator1": float(round(indicators["indicator1"], 3)), "indicator2": float(round(indicators["indicator2"], 3))
-        }, at=TimestampNanos(row_ts))
+        generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip)
+        sender.row(
+            table_name('core_price', suffix),
+            symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
+            columns={
+                "bid_price": float(bids[0][lvl]),
+                "bid_volume": int(bids[1][lvl]),
+                "ask_price": float(asks[0][lvl]),
+                "ask_volume": int(asks[1][lvl]),
+                "indicator1": float(round(indicators["indicator1"], 3)),
+                "indicator2": float(round(indicators["indicator2"], 3))
+            },
+            at=TimestampNanos(row_ts)
+        )
+
+    return per_second_symbol_state
 
 def wait_if_paused(pause_event, process_idx):
     while pause_event.is_set():
@@ -363,6 +411,9 @@ def ingest_worker(
     ts = start_ns
     sent = 0
 
+    # <-- NEW: Track last close per symbol for continuity
+    last_close_per_symbol = {}
+
     with Sender.from_conf(conf) as sender:
         wall_start = None  # for real-time alignment
 
@@ -374,12 +425,16 @@ def ingest_worker(
                     break
 
                 state_for_this_second = global_states[sec_idx]
-                generate_events_for_second(
+                per_second_symbol_state =  generate_events_for_second(
                     ts, market_total, core_total,
                     state_for_this_second, sender,
-                    args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns, args.suffix
+                    args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns, args.suffix,
+                    last_close_per_symbol
                 )
                 sent += market_total
+                for symbol, s in per_second_symbol_state.items():
+                    last_close_per_symbol[symbol] = s.copy()
+
                 ts += int(1e9)
 
         else:
@@ -399,12 +454,17 @@ def ingest_worker(
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
                 # Evolve state for this tick using the shared helper
                 next_state = evolve_state_one_tick(current_state)
-                generate_events_for_second(
+                per_second_symbol_state = generate_events_for_second(
                     ts, market_total, core_total,
                     next_state, sender,
-                    args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns, args.suffix
+                    args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns, args.suffix,
+                    last_close_per_symbol
                 )
                 current_state = next_state
+                # Update continuity state
+                for symbol, s in per_second_symbol_state.items():
+                    last_close_per_symbol[symbol] = s.copy()
+
                 sent += market_total
                 ts += int(1e9)
                 sec_idx += 1
@@ -426,7 +486,6 @@ def ingest_worker(
         print(f"[WORKER {process_idx}] Finished. Exiting for unknown reason (last ts: {ns_to_iso(ts)}).")
 
     sys.exit(0)
-
 
 def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
     import time
