@@ -418,29 +418,28 @@ def ingest_worker(
         wall_start = None  # for real-time alignment
 
         if args.mode == "faster-than-life":
+            current_state = {k: v.copy() for k, v in global_states[0].items()}
             # Precomputed state: bounded by per_second_plan and global_states
             for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
                 wait_if_paused(pause_event, process_idx)
                 if (end_ns and ts >= end_ns) or (sent >= total_events):
                     break
 
-
-                if last_close_per_symbol:
-                    state_for_this_second = {k: v.copy() for k, v in last_close_per_symbol.items()}
-                else:
-                    state_for_this_second = global_states[sec_idx]
-
-                per_second_symbol_state =  generate_events_for_second(
+                # Evolve state from current_state
+                evolved_state = evolve_state_one_tick(current_state)
+                per_second_symbol_state = generate_events_for_second(
                     ts, market_total, core_total,
-                    state_for_this_second, sender,
-                    args.min_levels, args.max_levels, prebuilt_bids, prebuilt_asks, end_ns, args.suffix,
+                    evolved_state, sender,
+                    args.min_levels, args.max_levels,
+                    prebuilt_bids, prebuilt_asks,
+                    end_ns, args.suffix,
                     last_close_per_symbol
                 )
-                sent += market_total
-                for symbol, s in per_second_symbol_state.items():
-                    last_close_per_symbol[symbol] = s.copy()
-
+                # Instead of losing the full state, only update the symbols we used
+                for symbol in per_second_symbol_state:
+                    current_state[symbol] = per_second_symbol_state[symbol]
                 ts += int(1e9)
+                sent += market_total
 
         else:
             # Real-time mode: infinite, build state as we go
