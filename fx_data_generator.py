@@ -281,32 +281,47 @@ def precompute_state(args, start_ns, total_seconds, state_template):
         states.append(current)
     return states
 
-
-def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, end_ns=None, suffix=""):
-    offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
-    offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
-    for offset in offsets_market:
+def generate_events_for_second(ts, market_event_count, core_count, state_for_second, sender, min_levels, max_levels, prebuilt_bid_arrays, prebuilt_ask_arrays, end_ns=None, suffix="", prev_states=None):
+    """
+    prev_states: dict mapping symbol -> previous state's close bid/ask
+    """
+    # --- Build per-symbol open price for this second ---
+    # If prev_states is provided, ensure open == previous close
+    per_symbol_first_market = {}
+    for offset in sorted(random.sample(range(0, 999_999_999), market_event_count)):
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-        mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
-        spread = state_for_second[symbol]["spread"]
-        mid_jitter = random.uniform(-0.5*pip, 0.5*pip)
-        best_bid = quantize_to_pip(mid_price + mid_jitter - spread / 2, pip)
-        best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
+        # Determine if this is the "first" tick for this symbol this second
+        is_first = symbol not in per_symbol_first_market
+        # Apply continuity: force open = prev close if available
+        if is_first and prev_states and symbol in prev_states:
+            # Use previous close as mid price, but keep spread from new state
+            mid_price = (prev_states[symbol]["bid_price"] + prev_states[symbol]["ask_price"]) / 2
+            spread = state_for_second[symbol]["spread"]
+            best_bid = quantize_to_pip(mid_price - spread / 2, pip)
+            best_ask = quantize_to_pip(mid_price + spread / 2, pip)
+            per_symbol_first_market[symbol] = True
+        else:
+            # Slightly random walk
+            mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
+            spread = state_for_second[symbol]["spread"]
+            mid_jitter = random.uniform(-0.5 * pip, 0.5 * pip)
+            best_bid = quantize_to_pip(mid_price + mid_jitter - spread / 2, pip)
+            best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
         row_ts = ts + offset
         if end_ns is not None and row_ts >= end_ns:
             continue
         sender.row(table_name('market_data', suffix), symbols={"symbol": symbol}, columns={"bids": bids, "asks": asks}, at=TimestampNanos(row_ts))
-    for offset in offsets_core:
+    for offset in sorted(random.sample(range(0, 999_999_999), core_count)):
         symbol, low, high, precision, pip = random.choice(FX_PAIRS)
         levels = random.randint(min_levels, max_levels)
         bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
         indicators = state_for_second[symbol]
         mid_price = (state_for_second[symbol]["bid_price"] + state_for_second[symbol]["ask_price"]) / 2
         spread = state_for_second[symbol]["spread"]
-        mid_jitter = random.uniform(-0.5*pip, 0.5*pip)
+        mid_jitter = random.uniform(-0.5 * pip, 0.5 * pip)
         best_bid = quantize_to_pip(mid_price + mid_jitter - spread / 2, pip)
         best_ask = quantize_to_pip(mid_price + mid_jitter + spread / 2, pip)
         generate_bids_asks(bids, asks, levels, best_bid, best_ask, precision, pip)
