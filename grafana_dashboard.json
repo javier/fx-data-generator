@@ -186,6 +186,13 @@
               {
                 "id": "custom.minWidth",
                 "value": 200
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f894d",
+                  "mode": "fixed"
+                }
               }
             ]
           },
@@ -198,7 +205,38 @@
               {
                 "id": "color",
                 "value": {
-                  "mode": "continuous-BlPu"
+                  "fixedColor": "#692f8980",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bid_Volume"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89bf",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ask_Volume"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89",
+                  "mode": "fixed"
                 }
               }
             ]
@@ -236,7 +274,7 @@
           "editorMode": "code",
           "format": 1,
           "rawQuery": true,
-          "rawSql": "SELECT timestamp as Time, avg(asks[1,1]-bids[1,1]) as Spread, sum(bids[1,1]*bids[2,1]) as Bid_Volume, sum(asks[1,1]*asks[2,1]) as Ask_Volume\nfrom market_data\nWHERE \n$__timeFilter(timestamp) and symbol = '${SYMBOL}'\nSAMPLE BY 1s\norder by timestamp desc \nlimit 6",
+          "rawSql": "SELECT\n  timestamp AS Time,\n  avg(asks [ 1, 1 ] - bids [ 1, 1 ]) AS Spread,\n  sum(bids [ 1, 1 ] * bids [ 2, 1 ]) AS Bid_Volume,\n  sum(asks [ 1, 1 ] * asks [ 2, 1 ]) AS Ask_Volume\nFROM market_data\nWHERE $__timeFilter(timestamp) AND symbol = '${SYMBOL}'\nSAMPLE BY 1s\nORDER BY timestamp DESC\nLIMIT 6;",
           "refId": "A",
           "selectedFormat": 2,
           "sql": {
@@ -268,7 +306,7 @@
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
       },
-      "description": "Compares the best bid in the order book (from L2 market data) using an ASOF JOIN against the corresponding “core” quote price from upstream sources (e.g., ECNs). This table helps detect price alignment issues, latency, or anomalies between your live order book and reference prices provided by liquidity venues.",
+      "description": "Compares the best bid in the order book (from L2 market data) using an ASOF JOIN against the corresponding “core” quote price from upstream sources (e.g., ECNs). Then it finds at which level we could trade the core price bid volume. If no matching level is found, Level and Price will be empty. This table helps detect price alignment issues, latency, or anomalies between your live order book and reference prices provided by liquidity venues.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -313,6 +351,13 @@
               {
                 "id": "custom.width",
                 "value": 180
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f894d",
+                  "mode": "fixed"
+                }
               }
             ]
           },
@@ -329,6 +374,13 @@
               {
                 "id": "custom.width",
                 "value": 180
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f894d",
+                  "mode": "fixed"
+                }
               }
             ]
           },
@@ -341,6 +393,13 @@
               {
                 "id": "custom.width",
                 "value": 55
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f8980",
+                  "mode": "fixed"
+                }
               }
             ]
           },
@@ -353,6 +412,13 @@
               {
                 "id": "custom.width",
                 "value": 60
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89bf",
+                  "mode": "fixed"
+                }
               }
             ]
           },
@@ -365,6 +431,58 @@
               {
                 "id": "custom.width",
                 "value": 80
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f8980",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Volume"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bid_Volume"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89bf",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ECN"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89",
+                  "mode": "fixed"
+                }
               }
             ]
           }
@@ -407,13 +525,13 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "with p as (select timestamp, bid_price, bid_volume, symbol, ecn  from core_price where $__timeFilter(timestamp) and symbol = '${SYMBOL}' limit -6), levels as (\n        select market_data.timestamp as md_timestamp, insertion_point(bids[2], bid_volume) as level, bids[1][insertion_point(bids[2], bid_volume)] as price, bids[2][insertion_point(bids[2], bid_volume)] as volume, \n         p.timestamp, p.bid_price, p.bid_volume as bid_volume,p.ecn from p asof join market_data on symbol\n\n         )\n         select md_timestamp as MarketData_Time, case when price is null then null else level end as Level, Price, Volume, timestamp as CorePrice_Time, bid_price as Bid_Price, bid_volume1 as Bid_Volume, ecn as ECN from levels;",
+          "rawSql": "WITH p AS (\n  SELECT\n    timestamp,\n    bid_price,\n    bid_volume,\n    symbol,\n    ecn\n  FROM core_price\n  WHERE $__timeFilter(timestamp) AND symbol = '${SYMBOL}'\n  LIMIT -6\n), levels AS (\n  SELECT\n    market_data.timestamp AS md_timestamp,\n    insertion_point(bids [ 2 ], bid_volume) AS level,\n    bids [ 1 ] [ insertion_point(bids [ 2 ], bid_volume) ] AS price,\n    bids [ 2 ] [ insertion_point(bids [ 2 ], bid_volume) ] AS volume,\n    p.timestamp,\n    p.bid_price,\n    p.bid_volume AS bid_volume,\n    p.ecn\n  FROM p ASOF JOIN market_data ON symbol\n)\nSELECT\n  md_timestamp AS MarketData_Time,\n  CASE WHEN price IS null THEN null ELSE level end AS Level,\n  Price,\n  Volume,\n  timestamp AS CorePrice_Time,\n  bid_price AS Bid_Price,\n  bid_volume1 AS Bid_Volume,\n  ecn AS ECN\nFROM levels;",
           "refId": "A",
           "selectedFormat": 1
         }
       ],
       "timeFrom": "1m",
-      "title": "Top-of-book Price vs Core Price - ${SYMBOL}",
+      "title": "Top-of-book Levels vs Core Price - ${SYMBOL}",
       "transparent": true,
       "type": "table"
     },
@@ -422,7 +540,7 @@
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
       },
-      "description": "Candlestick chart summarizing price action using the best bid from the order book, aggregated into 15-minute intervals. Each candlestick shows the open, high, low, and close bid price, along with traded volume. Ideal for visualizing price trends, volatility, and market regime changes over time. Data is queried from a materialized view.",
+      "description": "Candlestick chart summarizing price action using the best bid from the order book, aggregated into 5-second intervals. Each candlestick shows the open, high, low, and close bid price, along with traded volume. Ideal for visualizing price trends, volatility, and market regime changes over time. Data is queried from a live table and aggregated on the fly.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -524,8 +642,9 @@
           },
           "editorMode": "code",
           "format": 1,
+          "queryType": "sql",
           "rawQuery": true,
-          "rawSql": "select timestamp, open, high, low,  close, total_volume\n        from market_data_ohlc_15m\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n        \n        \n        \n",
+          "rawSql": "select\n    timestamp,\n    first(bids[1,1]) open,\n    max(bids[1,1]) high,\n    min(bids[1,1]) low, \n    last(bids[1,1]) close,\n    sum(bids[2,1]) total_volume\nfrom market_data\nwhere  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\nsample by 5s;",
           "refId": "A",
           "selectedFormat": 2,
           "sql": {
@@ -547,8 +666,8 @@
           }
         }
       ],
-      "timeFrom": "now/d",
-      "title": "OHLC - Bids - 15m - (${SYMBOL})",
+      "timeFrom": "5m",
+      "title": "OHLC - Bids - 5secs - (${SYMBOL})",
       "transparent": true,
       "type": "candlestick"
     },
@@ -614,7 +733,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -718,7 +838,7 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "\nWITH sampled AS (\n    SELECT\n          timestamp,  symbol,\n          total_volume,\n          ((open+close)/2) * total_volume AS traded_value\n     FROM market_data_ohlc_1m\n     WHERE $__timeFilter(timestamp)\n      AND \n      symbol IN '${SYMBOL}'     \n), cumulative AS (\n     SELECT timestamp, symbol,\n           SUM(traded_value)\n                OVER (ORDER BY timestamp) AS cumulative_value,\n           SUM(total_volume)\n                OVER (ORDER BY timestamp) AS cumulative_volume\n     FROM sampled\n), vwap as (\nSELECT timestamp, cumulative_value/cumulative_volume AS vwap FROM cumulative\n)    \nselect * from vwap      \n",
+          "rawSql": "WITH sampled AS (\n    SELECT\n          timestamp,  symbol,\n          total_volume,\n          ((open+close)/2) * total_volume AS traded_value\n     FROM market_data_ohlc_1m\n     WHERE $__timeFilter(timestamp)\n      AND \n      symbol IN '${SYMBOL}'     \n), cumulative AS (\n     SELECT timestamp, symbol,\n           SUM(traded_value)\n                OVER (ORDER BY timestamp) AS cumulative_value,\n           SUM(total_volume)\n                OVER (ORDER BY timestamp) AS cumulative_volume\n     FROM sampled\n), vwap as (\nSELECT timestamp, cumulative_value/cumulative_volume AS vwap FROM cumulative\n)    \nSELECT * FROM vwap",
           "refId": "VWAP",
           "selectedFormat": 2
         },
@@ -784,7 +904,7 @@
         }
       ],
       "timeFrom": "now/d",
-      "title": "VWAP - Relative Strength Index 12h - Bollinger Bands (20,2) (${SYMBOL})",
+      "title": "VWAP - RSI 12h - Bollinger Bands (20,2) (${SYMBOL})",
       "type": "candlestick"
     },
     {
@@ -837,7 +957,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -947,7 +1068,7 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "\nSELECT timestamp time, symbol, sum(bids[1,1] * bids[2,1]) as bid, -1 * sum(asks[1,1] * asks[2,1]) as ask\n  from market_data where $__timeFilter(timestamp) and \nsymbol IN '${SYMBOL}'\nsample by 30s;\n\n\n",
+          "rawSql": "SELECT\n  timestamp time,\n  symbol,\n  sum(bids [ 1, 1 ] * bids [ 2, 1 ]) AS bid,\n  -1 * sum(asks [ 1, 1 ] * asks [ 2, 1 ]) AS ask\nFROM\n  market_data\nWHERE $__timeFilter(timestamp) AND symbol IN '${SYMBOL}'\nSAMPLE BY 30s;",
           "refId": "Volume",
           "selectedFormat": 2
         },
@@ -977,7 +1098,7 @@
       "type": "timeseries"
     }
   ],
-  "refresh": "250ms",
+  "refresh": "500ms",
   "schemaVersion": 39,
   "tags": [],
   "templating": {
@@ -1033,6 +1154,6 @@
   "timezone": "browser",
   "title": "FX Orderbook - Realtime Demo",
   "uid": "beriuq09sqry8e",
-  "version": 9,
+  "version": 23,
   "weekStart": ""
 }
