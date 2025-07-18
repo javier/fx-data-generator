@@ -223,6 +223,10 @@
                   "fixedColor": "#692f89bf",
                   "mode": "fixed"
                 }
+              },
+              {
+                "id": "unit",
+                "value": "short"
               }
             ]
           },
@@ -238,6 +242,10 @@
                   "fixedColor": "#692f89",
                   "mode": "fixed"
                 }
+              },
+              {
+                "id": "unit",
+                "value": "short"
               }
             ]
           }
@@ -372,8 +380,7 @@
                 "value": 200
               },
               {
-                "id": "custom.width",
-                "value": 180
+                "id": "custom.width"
               },
               {
                 "id": "color",
@@ -392,7 +399,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 55
+                "value": 20
               },
               {
                 "id": "color",
@@ -400,6 +407,10 @@
                   "fixedColor": "#692f8980",
                   "mode": "fixed"
                 }
+              },
+              {
+                "id": "noValue",
+                "value": "-"
               }
             ]
           },
@@ -410,8 +421,7 @@
             },
             "properties": [
               {
-                "id": "custom.width",
-                "value": 60
+                "id": "custom.width"
               },
               {
                 "id": "color",
@@ -419,6 +429,10 @@
                   "fixedColor": "#692f89bf",
                   "mode": "fixed"
                 }
+              },
+              {
+                "id": "noValue",
+                "value": "-"
               }
             ]
           },
@@ -429,8 +443,7 @@
             },
             "properties": [
               {
-                "id": "custom.width",
-                "value": 80
+                "id": "custom.width"
               },
               {
                 "id": "color",
@@ -453,6 +466,10 @@
                   "fixedColor": "#692f89",
                   "mode": "fixed"
                 }
+              },
+              {
+                "id": "unit",
+                "value": "short"
               }
             ]
           },
@@ -468,6 +485,10 @@
                   "fixedColor": "#692f89bf",
                   "mode": "fixed"
                 }
+              },
+              {
+                "id": "unit",
+                "value": "short"
               }
             ]
           },
@@ -607,7 +628,7 @@
       "id": 13,
       "options": {
         "candleStyle": "candles",
-        "colorStrategy": "close-close",
+        "colorStrategy": "open-close",
         "colors": {
           "down": "light-blue",
           "up": "semi-dark-purple"
@@ -621,8 +642,10 @@
         },
         "includeAllFields": false,
         "legend": {
-          "calcs": [],
-          "displayMode": "list",
+          "calcs": [
+            "last"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": false
         },
@@ -878,7 +901,7 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "WITH price_changes AS (\n    SELECT\n        timestamp,    \n        symbol,    \n        bid,\n        bid - prev_bid price_change\n    FROM (    \n      SELECT \n          timestamp,\n          symbol,\n          bid,\n          LAG(bid) OVER (PARTITION BY symbol ORDER BY timestamp) AS prev_bid\n      FROM bbo_1h\n      WHERE  $__timeFilter(timestamp)\n      AND symbol = '${SYMBOL}'\n    )  \n),\ngains_losses AS (\n    SELECT \n        timestamp,\n        symbol,\n        bid,\n        CASE WHEN price_change > 0 THEN price_change ELSE 0 END AS gain,\n        CASE WHEN price_change < 0 THEN ABS(price_change) ELSE 0 END AS loss\n    FROM price_changes\n),\n\navg_gains_losses AS (\n    SELECT \n        timestamp,\n        symbol,\n        bid,\n        AVG(gain) OVER (PARTITION BY symbol ORDER BY timestamp ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS avg_gain,\n        AVG(loss) OVER (PARTITION BY symbol ORDER BY timestamp ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS avg_loss\n    FROM gains_losses\n)\n\nSELECT \n    timestamp,    \n    Bid,\n    CASE \n        WHEN avg_loss = 0 THEN 100\n        ELSE 100 - (100 / (1 + (avg_gain / NULLIF(avg_loss, 0))))\n    END AS RSI_12h\nFROM avg_gains_losses\nORDER BY timestamp;\n",
+          "rawSql": "WITH price_changes AS (\n    SELECT\n        timestamp,    \n        symbol,    \n        bid,\n        bid - prev_bid price_change\n    FROM (    \n      SELECT \n          timestamp,\n          symbol,\n          bid,\n          LAG(bid) OVER (PARTITION BY symbol ORDER BY timestamp) AS prev_bid\n      FROM bbo_1h\n      WHERE  $__timeFilter(timestamp)\n      AND symbol = '${SYMBOL}'\n    )  \n),\ngains_losses AS (\n    SELECT \n        timestamp,\n        symbol,\n        bid,\n        CASE WHEN price_change > 0 THEN price_change ELSE 0 END AS gain,\n        CASE WHEN price_change < 0 THEN ABS(price_change) ELSE 0 END AS loss\n    FROM price_changes\n),\n\navg_gains_losses AS (\n    SELECT \n        timestamp,\n        symbol,\n        bid,\n        AVG(gain) OVER (PARTITION BY symbol ORDER BY timestamp ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS avg_gain,\n        AVG(loss) OVER (PARTITION BY symbol ORDER BY timestamp ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS avg_loss\n    FROM gains_losses\n)\n\nSELECT \n    timestamp,    \n    --Bid,\n    CASE \n        WHEN avg_loss = 0 THEN 100\n        ELSE 100 - (100 / (1 + (avg_gain / NULLIF(avg_loss, 0))))\n    END AS RSI_12h\nFROM avg_gains_losses\nORDER BY timestamp;\n",
           "refId": "RSI",
           "selectedFormat": 2
         },
@@ -1154,6 +1177,6 @@
   "timezone": "browser",
   "title": "FX Orderbook - Realtime Demo",
   "uid": "beriuq09sqry8e",
-  "version": 24,
+  "version": 28,
   "weekStart": ""
 }
