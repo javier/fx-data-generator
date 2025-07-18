@@ -1007,7 +1007,7 @@
             "properties": [
               {
                 "id": "unit",
-                "value": "volume"
+                "value": "short"
               }
             ]
           },
@@ -1154,6 +1154,6 @@
   "timezone": "browser",
   "title": "FX Orderbook - Realtime Demo",
   "uid": "beriuq09sqry8e",
-  "version": 23,
+  "version": 24,
   "weekStart": ""
 }
