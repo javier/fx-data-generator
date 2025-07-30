@@ -242,7 +242,7 @@ def load_initial_state_from_brackets(fx_pairs):
 def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
     out = []
     pct = bracket_pct / 100.0
-    print("[INFO] Refreshing reference data from Yahoo Finance.")
+    print("[INFO] Refreshing reference data from Yahoo Finance.", flush=True)
     for symbol, _low, _high, precision, pip in fx_pairs_template:
         ysym = symbol + "=X"
         try:
@@ -250,7 +250,7 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
             if not bars.empty:
                 mid = float(bars["Close"].iloc[-1])
                 if math.isnan(mid) or mid == 0.0:
-                    print(f"[YF] {symbol}: DataFrame non-empty, but got NaN or zero as price! Fallback used.")
+                    print(f"[YF] {symbol}: DataFrame non-empty, but got NaN or zero as price! Fallback used.", flush=True)
                     raise ValueError("Yahoo price NaN/zero")
                 else:
                     pass
@@ -258,12 +258,12 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
                 low = mid * (1 - pct)
                 high = mid * (1 + pct)
             else:
-                print(f"[YF] {symbol}: DataFrame EMPTY. Fallback used.")
+                print(f"[YF] {symbol}: DataFrame EMPTY. Fallback used.", flush=True)
                 raise ValueError("No data from Yahoo")
         except Exception:
             low = _low
             high = _high
-            print(f"[YF] {symbol}: Fallback to template low/high: {low}, {high}")
+            print(f"[YF] {symbol}: Fallback to template low/high: {low}, {high}", flush=True)
         out.append((symbol, low, high, precision, pip))
     return out
 
@@ -718,9 +718,9 @@ def main():
                                         kwargs={'first_ready_event': first_ready_event})
             refresher_proc.daemon = True
             refresher_proc.start()
-            print("[INFO] Waiting for Yahoo FX brackets initial load...")
+            print("[INFO] Waiting for Yahoo FX brackets initial load...", flush=True)
             first_ready_event.wait()
-            print("[INFO] FX brackets loaded from Yahoo. Proceeding with ingestion.")
+            print("[INFO] FX brackets loaded from Yahoo. Proceeding with ingestion.", flush=True)
             # Initial state is built from the initial brackets
             state = load_initial_state_from_brackets(list(fx_pairs))
         else:
