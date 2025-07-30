@@ -211,6 +211,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
         """)
 
+# used only with incremental mode
 def load_initial_state(args, suffix):
     state = {}
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
@@ -224,32 +225,25 @@ def load_initial_state(args, suffix):
             }
     return state
 
-def update_fx_pairs_bracket(symbol, new_mid, bracket_pct=1.0):
-    """Update FX_PAIRS tuple for symbol, setting low/high to ±bracket_pct around new_mid."""
-    global FX_PAIRS
+def load_initial_state_from_brackets(fx_pairs):
+    state = {}
+    for symbol, low, high, precision, pip in fx_pairs:
+        mid = (low + high) / 2
+        spread = quantize_to_pip(0.0004, pip)
+        state[symbol] = {
+            "bid_price": quantize_to_pip(mid - spread / 2, pip),
+            "ask_price": quantize_to_pip(mid + spread / 2, pip),
+            "spread": spread,
+            "indicator1": 0.2,
+            "indicator2": 0.5
+        }
+    return state
+
+def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
     out = []
     pct = bracket_pct / 100.0
-    found = False
-    for s, _low, _high, prec, pip in FX_PAIRS:
-        if s == symbol:
-            low = new_mid * (1 - pct)
-            high = new_mid * (1 + pct)
-            out.append((s, low, high, prec, pip))
-            found = True
-        else:
-            out.append((s, _low, _high, prec, pip))
-    if not found:
-        raise ValueError(f"Symbol {symbol} not in FX_PAIRS!")
-    FX_PAIRS = out
-
-def load_initial_state_from_yahoo(fx_pairs, fallback_state, bracket_pct=1.0):
-    """
-    For each FX pair, fetch the most recent 'Close' from Yahoo,
-    set a ±bracket_pct percent window as min/max in FX_PAIRS,
-    and update current state.
-    """
-    state = {}
-    for symbol, old_low, old_high, precision, pip in fx_pairs:
+    print("[INFO] Refreshing reference data from Yahoo Finance.")
+    for symbol, _low, _high, precision, pip in fx_pairs_template:
         ysym = symbol + "=X"
         try:
             bars = yf.Ticker(ysym).history(period="1d", interval="1m")
@@ -259,34 +253,28 @@ def load_initial_state_from_yahoo(fx_pairs, fallback_state, bracket_pct=1.0):
                     print(f"[YF] {symbol}: DataFrame non-empty, but got NaN or zero as price! Fallback used.")
                     raise ValueError("Yahoo price NaN/zero")
                 else:
-                    print(f"[YF] {symbol}: Got {mid}")
-                # --- Update FX_PAIRS in-place for this symbol! ---
-                update_fx_pairs_bracket(symbol, mid, bracket_pct)
+                    pass
+                    #print(f"[YF] {symbol}: Got {mid}")
+                low = mid * (1 - pct)
+                high = mid * (1 + pct)
             else:
                 print(f"[YF] {symbol}: DataFrame EMPTY. Fallback used.")
                 raise ValueError("No data from Yahoo")
         except Exception:
-            # fallback to last known prices
-            old = fallback_state[symbol]
-            state[symbol] = {
-                "bid_price": old["bid_price"],
-                "ask_price": old["ask_price"],
-                "spread":    old["spread"],
-                "indicator1": old["indicator1"],
-                "indicator2": old["indicator2"],
-            }
-            continue
+            low = _low
+            high = _high
+            print(f"[YF] {symbol}: Fallback to template low/high: {low}, {high}")
+        out.append((symbol, low, high, precision, pip))
+    return out
 
-        spread = pip
-        state[symbol] = {
-            "bid_price": quantize_to_pip(mid - spread/2, pip),
-            "ask_price": quantize_to_pip(mid + spread/2, pip),
-            "spread": spread,
-            "indicator1": 0.2,
-            "indicator2": 0.5
-        }
-    print(state)
-    return state
+def fx_pairs_refresher(shared_fx_pairs, interval=300, bracket_pct=1.0, first_ready_event=None):
+    while True:
+        new_fx_pairs = fetch_fx_pairs_from_yahoo(list(shared_fx_pairs), bracket_pct)
+        for i in range(len(shared_fx_pairs)):
+            shared_fx_pairs[i] = new_fx_pairs[i]
+        if first_ready_event is not None and not first_ready_event.is_set():
+            first_ready_event.set()
+        time.sleep(interval)
 
 def quantize_to_pip(price, pip):
     decimals = abs(int(round(np.log10(pip))))
@@ -322,9 +310,9 @@ def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask,
         prebuilt_asks[1][i] = get_random_volume_for_level(i)
     return prebuilt_bids, prebuilt_asks
 
-def evolve_state_one_tick(prev_state, drift=5.0):
+def evolve_state_one_tick(prev_state, fx_pairs, drift=5.0):
     next_state = {}
-    for symbol, low, high, precision, pip in FX_PAIRS:
+    for symbol, low, high, precision, pip in fx_pairs:
         prev_mid = (prev_state[symbol]["bid_price"] + prev_state[symbol]["ask_price"]) / 2
         prev_spread = prev_state[symbol]["spread"]
         new_mid = evolve_mid_price(prev_mid, low, high, precision, pip, drift=drift)
@@ -338,7 +326,7 @@ def evolve_state_one_tick(prev_state, drift=5.0):
         }
     return next_state
 
-def precompute_open_close_state(args, start_ns, total_seconds, state_template):
+def precompute_open_close_state(total_seconds, fx_pairs, state_template):
     open_per_second = []
     close_per_second = []
 
@@ -347,7 +335,7 @@ def precompute_open_close_state(args, start_ns, total_seconds, state_template):
         # open: state at start of second
         open_per_second.append({k: v.copy() for k, v in current.items()})
         # evolve to close
-        current = evolve_state_one_tick(current)
+        current = evolve_state_one_tick(current, fx_pairs)
         close_per_second.append({k: v.copy() for k, v in current.items()})
     return open_per_second, close_per_second
 
@@ -356,6 +344,7 @@ def generate_events_for_second(
     ts,
     market_event_count,
     core_count,
+    fx_pairs,
     open_state_for_second,
     close_state_for_second,
     sender,
@@ -368,10 +357,10 @@ def generate_events_for_second(
 ):
     # Prepare offsets and symbol picks
     offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
-    symbol_choices = random.choices(FX_PAIRS, k=market_event_count)
+    symbol_choices = random.choices(fx_pairs, k=market_event_count)
 
     # Track how many events we generate per symbol for this second
-    symbol_event_indices = {symbol: [] for symbol, *_ in FX_PAIRS}
+    symbol_event_indices = {symbol: [] for symbol, *_ in fx_pairs}
     for i, (symbol, *_ ) in enumerate(symbol_choices):
         symbol_event_indices[symbol].append(i)
 
@@ -381,7 +370,7 @@ def generate_events_for_second(
             continue
         for j, i in enumerate(indices):
             offset = offsets_market[i]
-            _, low, high, precision, pip = [v for v in FX_PAIRS if v[0] == symbol][0]
+            _, low, high, precision, pip = [v for v in fx_pairs if v[0] == symbol][0]
             levels = random.randint(min_levels, max_levels)
             bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
@@ -415,7 +404,7 @@ def generate_events_for_second(
 
     # --- Core price events: use open state (or close, your call) ---
     offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
-    symbol_choices_core = random.choices(FX_PAIRS, k=core_count)
+    symbol_choices_core = random.choices(fx_pairs, k=core_count)
     for i, offset in enumerate(offsets_core):
         symbol, low, high, precision, pip = symbol_choices_core[i]
         levels = random.randint(min_levels, max_levels)
@@ -456,6 +445,7 @@ def ingest_worker(
     start_ns,
     end_ns,
     global_states,
+    fx_pairs,
     process_idx,
     processes,
     pause_event,
@@ -486,7 +476,7 @@ def ingest_worker(
                 open_state = open_per_second[sec_idx]
                 close_state = close_per_second[sec_idx]
                 generate_events_for_second(
-                    ts, market_total, core_total,
+                    ts, market_total, core_total, fx_pairs,
                     open_state, close_state, sender,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
@@ -507,29 +497,19 @@ def ingest_worker(
             last_refresh = time.time()
 
             while not (end_ns and ts >= end_ns) and (sent < total_events):
+                fx_pairs_snapshot = list(fx_pairs)
                 wait_if_paused(pause_event, process_idx)
                 market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
-
-                if time.time() - last_refresh >= args.refresh_interval_secs:
-                    # Pull a fresh “baseline” state from Yahoo
-                    new_state = load_initial_state_from_yahoo(FX_PAIRS, current_state)
-
-                    # Overwrite only the price fields in your current_state
-                    for symbol, data in new_state.items():
-                        current_state[symbol]["bid_price"] = data["bid_price"]
-                        current_state[symbol]["ask_price"] = data["ask_price"]
-                        current_state[symbol]["spread"]    = data["spread"]
-                    last_refresh = time.time()
 
 
                 # At the beginning of the second: capture OPEN state
                 open_state = {k: v.copy() for k, v in current_state.items()}
                 # Evolve for close (to be used as interpolation target)
-                close_state = evolve_state_one_tick(current_state, 7.0)
+                close_state = evolve_state_one_tick(current_state, fx_pairs_snapshot, 7.0)
 
                 generate_events_for_second(
-                    ts, market_total, core_total,
+                    ts, market_total, core_total, fx_pairs_snapshot,
                     open_state, close_state, sender,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
@@ -630,11 +610,11 @@ def main():
     parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--min_levels", type=int, default=5)
     parser.add_argument("--max_levels", type=int, default=5)
-    parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=True)
+    parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
     parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
     parser.add_argument("--suffix", type=str, default="")
-    parser.add_argument("--refresh_interval_secs", type=int, default=300)
+    parser.add_argument("--yahoo_refresh_secs", type=int, default=300)
 
     args = parser.parse_args()
     suffix = args.suffix
@@ -719,25 +699,33 @@ def main():
             exit(0)
 
     # Build state
+    manager = mp.Manager()
+    fx_pairs = manager.list(FX_PAIRS)
+    refresher_proc = None
+
     if args.incremental:
         if args.mode == "real-time":
-            print(f"[INFO] loading initial FX midpoints from Yahoo Finance…")
-            state = load_initial_state_from_yahoo(FX_PAIRS, FX_PAIRS)
+            print(f"[ERROR] Incremental load not allowed in real-time, as real-time syncs from yahoo finance.")
+            exit(1)
         else:
+            fx_pairs = FX_PAIRS
             state = load_initial_state(args, suffix)
     else:
-        state = {}
-    for symbol, low, high, precision, pip in FX_PAIRS:
-        if symbol not in state:
-            mid = (low + high) / 2
-            spread = quantize_to_pip(0.0004, pip)
-            state[symbol] = {
-                "bid_price": quantize_to_pip(mid - spread / 2, pip),
-                "ask_price": quantize_to_pip(mid + spread / 2, pip),
-                "spread": spread,
-                "indicator1": 0.2,
-                "indicator2": 0.5
-            }
+        if args.mode == "real-time":
+            first_ready_event = mp.Event()
+            # Start the refresher
+            refresher_proc = mp.Process(target=fx_pairs_refresher, args=(fx_pairs, args.yahoo_refresh_secs),
+                                        kwargs={'first_ready_event': first_ready_event})
+            refresher_proc.daemon = True
+            refresher_proc.start()
+            print("[INFO] Waiting for Yahoo FX brackets initial load...")
+            first_ready_event.wait()
+            print("[INFO] FX brackets loaded from Yahoo. Proceeding with ingestion.")
+            # Initial state is built from the initial brackets
+            state = load_initial_state_from_brackets(list(fx_pairs))
+        else:
+            fx_pairs = fetch_fx_pairs_from_yahoo(FX_PAIRS, bracket_pct=1.0)
+            state = load_initial_state_from_brackets(fx_pairs)
 
     pause_event = Event()
     wal_proc = mp.Process(
@@ -766,7 +754,7 @@ def main():
             core_splits = split_event_counts(core_total, args.processes)
             for i in range(args.processes):
                 worker_plans[i].append((market_splits[i], core_splits[i]))
-        open_per_second, close_per_second = precompute_open_close_state(args, start_ns, total_seconds, state)
+        open_per_second, close_per_second = precompute_open_close_state(total_seconds, fx_pairs, state)
         global_states = (open_per_second, close_per_second)
         global_sec_offsets = []
         cum = 0
@@ -790,6 +778,7 @@ def main():
                     start_ns,
                     end_ns,
                     global_states,
+                    fx_pairs,
                     process_idx,
                     args.processes,
                     pause_event,
@@ -810,6 +799,7 @@ def main():
                 start_ns,
                 end_ns,
                 state,  # Only initial state
+                fx_pairs,
                 0,  # process_idx
                 1,  # processes
                 pause_event,
@@ -821,6 +811,10 @@ def main():
 
     wal_proc.terminate()
     wal_proc.join()
+
+    if refresher_proc is not None:
+        refresher_proc.terminate()
+        refresher_proc.join()
 
 if __name__ == "__main__":
     main()

@@ -34,5 +34,6 @@ ENV TOKEN=""
 ENV TOKEN_X=""
 ENV TOKEN_Y=""
 ENV ILP_USER=admin
+ENV YAHOO_REFRESH_SECS=30
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
