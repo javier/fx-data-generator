@@ -1,3 +1,4 @@
 questdb[dataframe]==3.0.0
 psycopg[binary]==3.1.6
 numpy==2.0.2
+yfinance==0.2.65

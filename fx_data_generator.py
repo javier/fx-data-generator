@@ -1,6 +1,7 @@
 import argparse
 import time
 import sys
+import math
 import random
 import multiprocessing as mp
 from multiprocessing import Event
@@ -8,6 +9,7 @@ import numpy as np
 import datetime
 from questdb.ingress import Sender, TimestampNanos
 import psycopg as pg
+import yfinance as yf
 
 FX_PAIRS = [
     ("EURUSD", 1.05, 1.10, 5, 0.0001),
@@ -222,6 +224,70 @@ def load_initial_state(args, suffix):
             }
     return state
 
+def update_fx_pairs_bracket(symbol, new_mid, bracket_pct=1.0):
+    """Update FX_PAIRS tuple for symbol, setting low/high to ±bracket_pct around new_mid."""
+    global FX_PAIRS
+    out = []
+    pct = bracket_pct / 100.0
+    found = False
+    for s, _low, _high, prec, pip in FX_PAIRS:
+        if s == symbol:
+            low = new_mid * (1 - pct)
+            high = new_mid * (1 + pct)
+            out.append((s, low, high, prec, pip))
+            found = True
+        else:
+            out.append((s, _low, _high, prec, pip))
+    if not found:
+        raise ValueError(f"Symbol {symbol} not in FX_PAIRS!")
+    FX_PAIRS = out
+
+def load_initial_state_from_yahoo(fx_pairs, fallback_state, bracket_pct=1.0):
+    """
+    For each FX pair, fetch the most recent 'Close' from Yahoo,
+    set a ±bracket_pct percent window as min/max in FX_PAIRS,
+    and update current state.
+    """
+    state = {}
+    for symbol, old_low, old_high, precision, pip in fx_pairs:
+        ysym = symbol + "=X"
+        try:
+            bars = yf.Ticker(ysym).history(period="1d", interval="1m")
+            if not bars.empty:
+                mid = float(bars["Close"].iloc[-1])
+                if math.isnan(mid) or mid == 0.0:
+                    print(f"[YF] {symbol}: DataFrame non-empty, but got NaN or zero as price! Fallback used.")
+                    raise ValueError("Yahoo price NaN/zero")
+                else:
+                    print(f"[YF] {symbol}: Got {mid}")
+                # --- Update FX_PAIRS in-place for this symbol! ---
+                update_fx_pairs_bracket(symbol, mid, bracket_pct)
+            else:
+                print(f"[YF] {symbol}: DataFrame EMPTY. Fallback used.")
+                raise ValueError("No data from Yahoo")
+        except Exception:
+            # fallback to last known prices
+            old = fallback_state[symbol]
+            state[symbol] = {
+                "bid_price": old["bid_price"],
+                "ask_price": old["ask_price"],
+                "spread":    old["spread"],
+                "indicator1": old["indicator1"],
+                "indicator2": old["indicator2"],
+            }
+            continue
+
+        spread = pip
+        state[symbol] = {
+            "bid_price": quantize_to_pip(mid - spread/2, pip),
+            "ask_price": quantize_to_pip(mid + spread/2, pip),
+            "spread": spread,
+            "indicator1": 0.2,
+            "indicator2": 0.5
+        }
+    print(state)
+    return state
+
 def quantize_to_pip(price, pip):
     decimals = abs(int(round(np.log10(pip))))
     return round(round(price / pip) * pip, decimals)
@@ -393,7 +459,7 @@ def ingest_worker(
     process_idx,
     processes,
     pause_event,
-    global_sec_idx_offset
+    global_sec_idx_offset # only meaningful in faster-than-life
 ):
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
@@ -429,7 +495,7 @@ def ingest_worker(
                 ts += int(1e9)
                 sent += market_total
 
-        else:
+        elif args.mode=="real-time":
             # Real-time mode: infinite, build state as we go
             # Start with global_states as initial state (can be state or initial state dict)
             if isinstance(global_states, list):
@@ -438,11 +504,24 @@ def ingest_worker(
                 current_state = {k: v.copy() for k, v in global_states.items()}
             sec_idx = 0
             wall_start = time.time()
+            last_refresh = time.time()
 
             while not (end_ns and ts >= end_ns) and (sent < total_events):
                 wait_if_paused(pause_event, process_idx)
                 market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
+
+                if time.time() - last_refresh >= args.refresh_interval_secs:
+                    # Pull a fresh “baseline” state from Yahoo
+                    new_state = load_initial_state_from_yahoo(FX_PAIRS, current_state)
+
+                    # Overwrite only the price fields in your current_state
+                    for symbol, data in new_state.items():
+                        current_state[symbol]["bid_price"] = data["bid_price"]
+                        current_state[symbol]["ask_price"] = data["ask_price"]
+                        current_state[symbol]["spread"]    = data["spread"]
+                    last_refresh = time.time()
+
 
                 # At the beginning of the second: capture OPEN state
                 open_state = {k: v.copy() for k, v in current_state.items()}
@@ -555,6 +634,7 @@ def main():
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
     parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
     parser.add_argument("--suffix", type=str, default="")
+    parser.add_argument("--refresh_interval_secs", type=int, default=300)
 
     args = parser.parse_args()
     suffix = args.suffix
@@ -640,7 +720,11 @@ def main():
 
     # Build state
     if args.incremental:
-        state = load_initial_state(args, suffix)
+        if args.mode == "real-time":
+            print(f"[INFO] loading initial FX midpoints from Yahoo Finance…")
+            state = load_initial_state_from_yahoo(FX_PAIRS, FX_PAIRS)
+        else:
+            state = load_initial_state(args, suffix)
     else:
         state = {}
     for symbol, low, high, precision, pip in FX_PAIRS:

@@ -18,4 +18,5 @@ exec python fx_data_generator.py \
   --token_x "${TOKEN_X}" \
   --token_y "${TOKEN_Y}" \
   --ilp_user "${ILP_USER}" \
+  --refresh_interval_secs 300 \
   "$@"
