@@ -44,7 +44,11 @@ FX_PAIRS = [
     ("CADJPY", 110.0, 115.0, 3, 0.01)
 ]
 
-VOLUME_LADDER = [1_000_000, 10_000_000, 30_000_000, 50_000_000, 100_000_000, 150_000_000, 200_000_000, 300_000_000, 500_000_000, 1_000_000_000]
+
+def make_ladder(levels=50, v_min=100_000, v_max=1_000_000_000):
+    step = (math.log10(v_max) - math.log10(v_min)) / (levels - 1)
+    return [int(round(10 ** (math.log10(v_min) + i * step))) for i in range(levels)]
+
 
 def table_name(name, suffix):
     return name + suffix if suffix else name
@@ -293,21 +297,21 @@ def evolve_indicator(value, drift=0.01, shock_prob=0.01):
         value += random.uniform(-0.2, 0.2)
     return max(0.0, min(1.0, value))
 
-def get_random_volume_for_level(level_idx):
+def get_random_volume_for_level(level_idx, ladder):
     if level_idx == 0:
-        return random.randint(VOLUME_LADDER[0] // 2, VOLUME_LADDER[0])
-    lower = VOLUME_LADDER[level_idx - 1]
-    upper = VOLUME_LADDER[level_idx]
+        return random.randint(ladder[0] // 2, ladder[0])
+    lower = ladder[level_idx - 1]
+    upper = ladder[level_idx]
     return random.randint(lower, upper)
 
-def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask, precision, pip):
+def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask, precision, pip, ladder):
     for i in range(levels):
         price_bid = quantize_to_pip(best_bid - i * pip, pip)
         price_ask = quantize_to_pip(best_ask + i * pip, pip)
         prebuilt_bids[0][i] = price_bid
-        prebuilt_bids[1][i] = get_random_volume_for_level(i)
+        prebuilt_bids[1][i] = get_random_volume_for_level(i, ladder)
         prebuilt_asks[0][i] = price_ask
-        prebuilt_asks[1][i] = get_random_volume_for_level(i)
+        prebuilt_asks[1][i] = get_random_volume_for_level(i, ladder)
     return prebuilt_bids, prebuilt_asks
 
 def evolve_state_one_tick(prev_state, fx_pairs, drift=5.0):
@@ -348,6 +352,7 @@ def generate_events_for_second(
     open_state_for_second,
     close_state_for_second,
     sender,
+    ladder,
     min_levels,
     max_levels,
     prebuilt_bid_arrays,
@@ -391,7 +396,7 @@ def generate_events_for_second(
                     "indicator2": open_state_for_second[symbol]["indicator2"],
                 }
 
-            generate_bids_asks(bids, asks, levels, state["bid_price"], state["ask_price"], precision, pip)
+            generate_bids_asks(bids, asks, levels, state["bid_price"], state["ask_price"], precision, pip, ladder)
             row_ts = ts + offset
             if end_ns is not None and row_ts >= end_ns:
                 continue
@@ -418,7 +423,7 @@ def generate_events_for_second(
         if end_ns is not None and row_ts >= end_ns:
             continue
         lvl = random.randint(0, levels - 1)
-        generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip)
+        generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip, ladder)
         sender.row(
             table_name('core_price', suffix),
             symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
@@ -451,15 +456,21 @@ def ingest_worker(
     pause_event,
     global_sec_idx_offset # only meaningful in faster-than-life
 ):
-    if args.protocol == "http":
-        conf = f"http::addr={args.host}:9000;" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;"
+    if args.mode=="real-time":
+        auto_flush_interval=150
     else:
-        conf = f"tcp::addr={args.host}:9009;protocol_version=2;" if not args.token else f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;"
+        auto_flush_interval=10000
+
+    if args.protocol == "http":
+        conf = f"http::addr={args.host}:9000;auto_flush_interval={auto_flush_interval};" if not args.token else f"https::addr={args.host}:9000;username={args.ilp_user};token={args.token};tls_verify=unsafe_off;auto_flush_interval={auto_flush_interval};"
+    else:
+        conf = f"tcp::addr={args.host}:9009;protocol_version=2;auto_flush_interval={auto_flush_interval};" if not args.token else f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;auto_flush_interval={auto_flush_interval};"
 
     prebuilt_bids = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
     prebuilt_asks = [np.zeros((2, lvl), dtype=np.float64) for lvl in range(1, args.max_levels + 1)]
     ts = start_ns
     sent = 0
+    ladder = make_ladder(args.max_levels)
 
     # <-- NEW: Track last close per symbol for continuity
     last_close_per_symbol = {}
@@ -477,7 +488,7 @@ def ingest_worker(
                 close_state = close_per_second[sec_idx]
                 generate_events_for_second(
                     ts, market_total, core_total, fx_pairs,
-                    open_state, close_state, sender,
+                    open_state, close_state, sender, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
                     end_ns, args.suffix
@@ -510,7 +521,7 @@ def ingest_worker(
 
                 generate_events_for_second(
                     ts, market_total, core_total, fx_pairs_snapshot,
-                    open_state, close_state, sender,
+                    open_state, close_state, sender, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
                     end_ns, args.suffix
@@ -608,8 +619,8 @@ def main():
     parser.add_argument("--start_ts", type=str)
     parser.add_argument("--end_ts", type=str)
     parser.add_argument("--processes", type=int, default=1)
-    parser.add_argument("--min_levels", type=int, default=5)
-    parser.add_argument("--max_levels", type=int, default=5)
+    parser.add_argument("--min_levels", type=int, default=40)
+    parser.add_argument("--max_levels", type=int, default=50)
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
     parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
