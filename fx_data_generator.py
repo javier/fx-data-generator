@@ -457,7 +457,7 @@ def ingest_worker(
     global_sec_idx_offset # only meaningful in faster-than-life
 ):
     if args.mode=="real-time":
-        auto_flush_interval=150
+        auto_flush_interval=1000
     else:
         auto_flush_interval=10000
 
