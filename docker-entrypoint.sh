@@ -9,6 +9,7 @@ exec python fx_data_generator.py \
   --market_data_max_eps "${MARKET_DATA_MAX_EPS}" \
   --core_min_eps "${CORE_MIN_EPS}" \
   --core_max_eps "${CORE_MAX_EPS}" \
+  --total_market_data_events "${TOTAL_MARKET_DATA_EVENTS}" \
   --protocol "${PROTOCOL}" \
   --host "${HOST}" \
   --user "${PG_USER}" \

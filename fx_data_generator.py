@@ -358,7 +358,8 @@ def generate_events_for_second(
     prebuilt_bid_arrays,
     prebuilt_ask_arrays,
     end_ns=None,
-    suffix=""
+    suffix="",
+    real_time=True
 ):
     # Prepare offsets and symbol picks
     offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
@@ -400,11 +401,15 @@ def generate_events_for_second(
             row_ts = ts + offset
             if end_ns is not None and row_ts >= end_ns:
                 continue
+            if real_time:
+                at = TimestampNanos.now()
+            else:
+                TimestampNanos(row_ts)
             sender.row(
                 table_name('market_data', suffix),
                 symbols={"symbol": symbol},
                 columns={"bids": bids, "asks": asks},
-                at=TimestampNanos(row_ts)
+                at=at
             )
 
     # --- Core price events: use open state (or close, your call) ---
@@ -424,6 +429,10 @@ def generate_events_for_second(
             continue
         lvl = random.randint(0, levels - 1)
         generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip, ladder)
+        if real_time:
+                at = TimestampNanos.now()
+        else:
+            TimestampNanos(row_ts)
         sender.row(
             table_name('core_price', suffix),
             symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
@@ -435,7 +444,7 @@ def generate_events_for_second(
                 "indicator1": float(round(indicators["indicator1"], 3)),
                 "indicator2": float(round(indicators["indicator2"], 3))
             },
-            at=TimestampNanos(row_ts)
+            at=at
         )
 
 def wait_if_paused(pause_event, process_idx):
@@ -491,7 +500,7 @@ def ingest_worker(
                     open_state, close_state, sender, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
-                    end_ns, args.suffix
+                    end_ns, args.suffix, False
                 )
                 ts += int(1e9)
                 sent += market_total
@@ -507,7 +516,7 @@ def ingest_worker(
             wall_start = time.time()
             last_refresh = time.time()
 
-            while not (end_ns and ts >= end_ns) and (sent < total_events):
+            while not (end_ns and ts >= end_ns) and (total_events == 0 or sent < total_events):
                 fx_pairs_snapshot = list(fx_pairs)
                 wait_if_paused(pause_event, process_idx)
                 market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
@@ -524,7 +533,7 @@ def ingest_worker(
                     open_state, close_state, sender, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
-                    end_ns, args.suffix
+                    end_ns, args.suffix, True
                 )
                 current_state = close_state
                 sent += market_total
@@ -620,7 +629,7 @@ def main():
     parser.add_argument("--end_ts", type=str)
     parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--min_levels", type=int, default=40)
-    parser.add_argument("--max_levels", type=int, default=50)
+    parser.add_argument("--max_levels", type=int, default=40)
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
     parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
