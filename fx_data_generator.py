@@ -361,6 +361,11 @@ def generate_events_for_second(
     suffix="",
     real_time=True
 ):
+    # in real_time, we always ingest a couple of seconds ahead, to account for wal apply time, so dashboards look more
+    # dynamic in real-time
+    if real_time:
+        ts = int((datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9) + 2*1e9)
+
     # Prepare offsets and symbol picks
     offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
     symbol_choices = random.choices(fx_pairs, k=market_event_count)
@@ -401,15 +406,12 @@ def generate_events_for_second(
             row_ts = ts + offset
             if end_ns is not None and row_ts >= end_ns:
                 continue
-            if real_time:
-                at = TimestampNanos.now()
-            else:
-                TimestampNanos(row_ts)
+
             sender.row(
                 table_name('market_data', suffix),
                 symbols={"symbol": symbol},
                 columns={"bids": bids, "asks": asks},
-                at=at
+                at=row_ts
             )
 
     # --- Core price events: use open state (or close, your call) ---
