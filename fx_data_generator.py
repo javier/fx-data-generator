@@ -411,7 +411,7 @@ def generate_events_for_second(
                 table_name('market_data', suffix),
                 symbols={"symbol": symbol},
                 columns={"bids": bids, "asks": asks},
-                at=row_ts
+                at=TimestampNanos(row_ts)
             )
 
     # --- Core price events: use open state (or close, your call) ---
