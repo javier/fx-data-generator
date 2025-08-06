@@ -431,10 +431,7 @@ def generate_events_for_second(
             continue
         lvl = random.randint(0, levels - 1)
         generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip, ladder)
-        if real_time:
-                at = TimestampNanos.now()
-        else:
-            TimestampNanos(row_ts)
+
         sender.row(
             table_name('core_price', suffix),
             symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
@@ -446,7 +443,7 @@ def generate_events_for_second(
                 "indicator1": float(round(indicators["indicator1"], 3)),
                 "indicator2": float(round(indicators["indicator2"], 3))
             },
-            at=at
+            at=TimestampNanos(row_ts)
         )
 
 def wait_if_paused(pause_event, process_idx):
