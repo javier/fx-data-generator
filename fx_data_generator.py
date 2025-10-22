@@ -185,7 +185,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1m
-        ) PARTITION BY HOUR TTL 1 DAY;
+        ) PARTITION BY HOUR {'TTL 1 DAY' if short_ttl else ''};
         """)
 
         conn.execute(f"""
@@ -199,7 +199,7 @@ def ensure_materialized_views_exist(args, suffix):
 
             FROM {table_name('market_data_ohlc_1m', suffix)}
             SAMPLE BY 15m
-        ) PARTITION BY HOUR TTL 2 DAYS;
+        ) PARTITION BY HOUR {'TTL 2 DAYS' if short_ttl else ''};
         """)
 
         conn.execute(f"""
