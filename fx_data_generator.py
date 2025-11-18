@@ -392,7 +392,26 @@ def evolve_state_one_tick(prev_state, fx_pairs, drift=5.0):
         prev_mid = (prev_state[symbol]["bid_price"] + prev_state[symbol]["ask_price"]) / 2
         prev_spread = prev_state[symbol]["spread"]
         new_mid = evolve_mid_price(prev_mid, low, high, precision, pip, drift=drift)
-        new_spread = quantize_to_pip(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), pip)
+
+        # Work in pips to avoid the tiny deltas disappearing on quantize
+        spread_pips = int(round(prev_spread / pip))
+
+        # Small random walk in pips, mostly flat, sometimes tighter or wider
+        spread_pips += random.choice([-1, 0, 0, 0, 1])
+
+        # Rare stress widening
+        if random.random() < 0.0005:  # tweak this probability for more or less frequency
+            spread_pips += random.randint(3, 10)
+
+        # Keep spreads in a sane range per pair
+        # Majors: 1 to 8 pips
+        min_pips = 1
+        max_pips = 8
+        spread_pips = max(min_pips, min(max_pips, spread_pips))
+
+        new_spread = spread_pips * pip
+
+        # new_spread = quantize_to_pip(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), pip)
         next_state[symbol] = {
             "bid_price": quantize_to_pip(new_mid - new_spread / 2, pip),
             "ask_price": quantize_to_pip(new_mid + new_spread / 2, pip),
