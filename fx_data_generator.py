@@ -53,6 +53,78 @@ def make_ladder(levels=50, v_min=100_000, v_max=1_000_000_000):
 def table_name(name, suffix):
     return name + suffix if suffix else name
 
+class SortedEmitter:
+    """
+    Buffers rows for market_data and core_price, sorts them by timestamp,
+    and writes them out in order.
+    """
+
+    def __init__(self, sender, buffer_limit, suffix):
+        self.sender = sender
+        self.buffer_limit = buffer_limit
+        self.suffix = suffix
+        self._md = []   # market_data buffer
+        self._cp = []   # core_price buffer
+
+    # --- Market data rows --- #
+    def emit_market(self, ts_ns, symbol, bids, asks):
+        self._md.append({
+            "ts": ts_ns,
+            "symbol": symbol,
+            "bids": bids.copy(),   # numpy copy
+            "asks": asks.copy()
+        })
+        if len(self._md) >= self.buffer_limit:
+            self._flush_md()
+
+    # --- Core price rows --- #
+    def emit_core(self, ts_ns, symbol, ecn, reason, columns):
+        self._cp.append({
+            "ts": ts_ns,
+            "symbol": symbol,
+            "ecn": ecn,
+            "reason": reason,
+            "columns": columns,
+        })
+        if len(self._cp) >= self.buffer_limit:
+            self._flush_cp()
+
+    # --- Flush methods --- #
+    def _flush_md(self):
+        if not self._md:
+            return
+        self._md.sort(key=lambda r: r["ts"])
+        tbl = table_name("market_data", self.suffix)
+        for r in self._md:
+            self.sender.row(
+                tbl,
+                symbols={"symbol": r["symbol"]},
+                columns={"bids": r["bids"], "asks": r["asks"]},
+                at=TimestampNanos(r["ts"])
+            )
+        self.sender.flush()
+        self._md.clear()
+
+    def _flush_cp(self):
+        if not self._cp:
+            return
+        self._cp.sort(key=lambda r: r["ts"])
+        tbl = table_name("core_price", self.suffix)
+        for r in self._cp:
+            self.sender.row(
+                tbl,
+                symbols={"symbol": r["symbol"], "ecn": r["ecn"], "reason": r["reason"]},
+                columns=r["columns"],
+                at=TimestampNanos(r["ts"])
+            )
+        self.sender.flush()
+        self._cp.clear()
+
+    # --- flush both before exit --- #
+    def flush_all(self):
+        self._flush_md()
+        self._flush_cp()
+
 
 def get_latest_timestamp_ns(conn, table):
     cur = conn.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp DESC LIMIT 1")
@@ -320,7 +392,26 @@ def evolve_state_one_tick(prev_state, fx_pairs, drift=5.0):
         prev_mid = (prev_state[symbol]["bid_price"] + prev_state[symbol]["ask_price"]) / 2
         prev_spread = prev_state[symbol]["spread"]
         new_mid = evolve_mid_price(prev_mid, low, high, precision, pip, drift=drift)
-        new_spread = quantize_to_pip(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), pip)
+
+        # Work in pips to avoid the tiny deltas disappearing on quantize
+        spread_pips = int(round(prev_spread / pip))
+
+        # Small random walk in pips, mostly flat, sometimes tighter or wider
+        spread_pips += random.choice([-1, 0, 0, 0, 1])
+
+        # Rare stress widening
+        if random.random() < 0.0005:  # tweak this probability for more or less frequency
+            spread_pips += random.randint(3, 10)
+
+        # Keep spreads in a sane range per pair
+        # Majors: 1 to 8 pips
+        min_pips = 1
+        max_pips = 8
+        spread_pips = max(min_pips, min(max_pips, spread_pips))
+
+        new_spread = spread_pips * pip
+
+        # new_spread = quantize_to_pip(max(pip, prev_spread + random.uniform(-0.2 * pip, 0.2 * pip)), pip)
         next_state[symbol] = {
             "bid_price": quantize_to_pip(new_mid - new_spread / 2, pip),
             "ask_price": quantize_to_pip(new_mid + new_spread / 2, pip),
@@ -351,7 +442,7 @@ def generate_events_for_second(
     fx_pairs,
     open_state_for_second,
     close_state_for_second,
-    sender,
+    emitter,
     ladder,
     min_levels,
     max_levels,
@@ -407,12 +498,7 @@ def generate_events_for_second(
             if end_ns is not None and row_ts >= end_ns:
                 continue
 
-            sender.row(
-                table_name('market_data', suffix),
-                symbols={"symbol": symbol},
-                columns={"bids": bids, "asks": asks},
-                at=TimestampNanos(row_ts)
-            )
+            emitter.emit_market(row_ts, symbol, bids, asks)
 
     # --- Core price events: use open state (or close, your call) ---
     offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
@@ -432,18 +518,19 @@ def generate_events_for_second(
         lvl = random.randint(0, levels - 1)
         generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip, ladder)
 
-        sender.row(
-            table_name('core_price', suffix),
-            symbols={"symbol": symbol, "ecn": ecn, "reason": reason},
-            columns={
+        emitter.emit_core(
+            row_ts,
+            symbol,
+            ecn,
+            reason,
+            {
                 "bid_price": float(bids[0][lvl]),
                 "bid_volume": int(bids[1][lvl]),
                 "ask_price": float(asks[0][lvl]),
                 "ask_volume": int(asks[1][lvl]),
                 "indicator1": float(round(indicators["indicator1"], 3)),
                 "indicator2": float(round(indicators["indicator2"], 3))
-            },
-            at=TimestampNanos(row_ts)
+            }
         )
 
 def wait_if_paused(pause_event, process_idx):
@@ -465,9 +552,11 @@ def ingest_worker(
     global_sec_idx_offset # only meaningful in faster-than-life
 ):
     if args.mode=="real-time":
-        auto_flush_interval=1000
+        buffer_limit=1000
     else:
-        auto_flush_interval=10000
+        buffer_limit=10000
+
+    auto_flush_interval = buffer_limit * 2  # safety net in the ILP client
 
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;auto_flush_interval={auto_flush_interval};" if not args.token else f"https::addr={args.host}:9000;token={args.token};tls_verify=unsafe_off;auto_flush_interval={auto_flush_interval};"
@@ -484,25 +573,31 @@ def ingest_worker(
     last_close_per_symbol = {}
 
     with Sender.from_conf(conf) as sender:
+        emitter = SortedEmitter(sender, buffer_limit=buffer_limit, suffix=args.suffix)
         wall_start = None  # for real-time alignment
 
         if args.mode == "faster-than-life":
             open_per_second, close_per_second = global_states
             for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
                 wait_if_paused(pause_event, process_idx)
-                if (end_ns and ts >= end_ns) or (sent >= total_events):
-                    break
+
                 open_state = open_per_second[sec_idx]
                 close_state = close_per_second[sec_idx]
                 generate_events_for_second(
                     ts, market_total, core_total, fx_pairs,
-                    open_state, close_state, sender, ladder,
+                    open_state, close_state, emitter, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
                     end_ns, args.suffix, False
                 )
-                ts += int(1e9)
                 sent += market_total
+
+                if (end_ns and ts >= end_ns) or (sent >= total_events):
+                    emitter.flush_all()
+                    break
+
+                ts += int(1e9)
+
 
         elif args.mode=="real-time":
             # Real-time mode: infinite, build state as we go
@@ -529,7 +624,7 @@ def ingest_worker(
 
                 generate_events_for_second(
                     ts, market_total, core_total, fx_pairs_snapshot,
-                    open_state, close_state, sender, ladder,
+                    open_state, close_state, emitter, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
                     end_ns, args.suffix, True
@@ -545,8 +640,10 @@ def ingest_worker(
                 sleep_for = next_tick - now
                 if sleep_for > 0:
                     time.sleep(sleep_for)
+            emitter.flush_all()
 
     # ... main event loop ends here ...
+
     # Print reason for exit
     if end_ns is not None and ts >= end_ns:
         print(f"[WORKER {process_idx}] Finished. Exiting because end_ts ({ns_to_iso(end_ns)}) was reached (last ts: {ns_to_iso(ts)}). Events sent from worker {sent} ")
@@ -719,15 +816,20 @@ def main():
 
     # Build state
     manager = mp.Manager()
-    fx_pairs = manager.list(FX_PAIRS)
     refresher_proc = None
+    if args.mode == "real-time":
+        # Real-time uses a shared Manager list updated by Yahoo refresher
+        fx_pairs = manager.list(FX_PAIRS)
+    else:
+        # Faster-than-life uses a plain list (no Manager, no refresher)
+        fx_pairs = list(FX_PAIRS)
+
 
     if args.incremental:
         if args.mode == "real-time":
             print(f"[ERROR] Incremental load not allowed in real-time, as real-time syncs from yahoo finance.")
             exit(1)
         else:
-            fx_pairs = FX_PAIRS
             state = load_initial_state(args, suffix)
     else:
         if args.mode == "real-time":
