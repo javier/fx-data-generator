@@ -22,4 +22,7 @@ python fx_data_generator.py \
   --max_levels 3 \
   --create_views false \
   --short_ttl false \
-  --incremental false
+  --incremental false \
+  --trades_min_per_sec 5 \
+  --trades_max_per_sec 30 \
+  --lei_pool_size 2000

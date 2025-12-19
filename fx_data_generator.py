@@ -10,38 +10,43 @@ import datetime
 from questdb.ingress import Sender, TimestampNanos
 import psycopg as pg
 import yfinance as yf
+import hashlib
+import uuid
 
 FX_PAIRS = [
-    ("EURUSD", 1.05, 1.10, 5, 0.0001),
-    ("GBPUSD", 1.25, 1.30, 5, 0.0001),
-    ("USDJPY", 150.0, 155.0, 3, 0.01),
-    ("USDCHF", 0.90, 0.95, 4, 0.0001),
-    ("AUDUSD", 0.65, 0.70, 5, 0.0001),
-    ("NZDUSD", 0.60, 0.65, 5, 0.0001),
-    ("USDCAD", 1.35, 1.40, 5, 0.0001),
-    ("EURGBP", 0.85, 0.88, 5, 0.0001),
-    ("EURJPY", 160.0, 165.0, 3, 0.01),
-    ("GBPJPY", 180.0, 185.0, 3, 0.01),
-    ("EURCHF", 0.95, 1.00, 4, 0.0001),
-    ("EURAUD", 1.55, 1.60, 5, 0.0001),
-    ("GBPCHF", 1.10, 1.15, 4, 0.0001),
-    ("AUDJPY", 100.0, 105.0, 3, 0.01),
-    ("NZDJPY", 95.0, 100.0, 3, 0.01),
-    ("USDSEK", 10.0, 11.0, 4, 0.0001),
-    ("USDNOK", 10.0, 11.0, 4, 0.0001),
-    ("USDMXN", 17.0, 18.0, 4, 0.0001),
-    ("USDSGD", 1.35, 1.40, 5, 0.0001),
-    ("USDHKD", 7.75, 7.85, 4, 0.0001),
-    ("USDZAR", 18.0, 19.0, 4, 0.0001),
-    ("USDTRY", 27.0, 28.0, 4, 0.0001),
-    ("EURCAD", 1.45, 1.50, 5, 0.0001),
-    ("EURNZD", 1.70, 1.75, 5, 0.0001),
-    ("GBPAUD", 1.85, 1.90, 5, 0.0001),
-    ("GBPNZD", 2.00, 2.05, 5, 0.0001),
-    ("AUDCAD", 0.85, 0.90, 5, 0.0001),
-    ("AUDNZD", 1.05, 1.10, 5, 0.0001),
-    ("NZDCAD", 0.80, 0.85, 5, 0.0001),
-    ("CADJPY", 110.0, 115.0, 3, 0.01)
+    # (symbol, low, high, precision, pip, rank)
+    # Rank 1-9: Most liquid pairs, Rank 10: Others
+    ("EURUSD", 1.05, 1.10, 5, 0.0001, 1),   # Most liquid
+    ("USDJPY", 150.0, 155.0, 3, 0.01, 2),
+    ("GBPUSD", 1.25, 1.30, 5, 0.0001, 3),   # "Cable"
+    ("USDCHF", 0.90, 0.95, 4, 0.0001, 4),   # "Swissy"
+    ("AUDUSD", 0.65, 0.70, 5, 0.0001, 5),   # Commodity currency
+    ("USDCAD", 1.35, 1.40, 5, 0.0001, 6),   # Oil-linked
+    ("EURGBP", 0.85, 0.88, 5, 0.0001, 7),   # Major cross
+    ("EURJPY", 160.0, 165.0, 3, 0.01, 8),   # Popular cross
+    ("NZDUSD", 0.60, 0.65, 5, 0.0001, 9),   # Commodity-linked
+    # Less liquid pairs (rank 10)
+    ("GBPJPY", 180.0, 185.0, 3, 0.01, 10),
+    ("EURCHF", 0.95, 1.00, 4, 0.0001, 10),
+    ("EURAUD", 1.55, 1.60, 5, 0.0001, 10),
+    ("GBPCHF", 1.10, 1.15, 4, 0.0001, 10),
+    ("AUDJPY", 100.0, 105.0, 3, 0.01, 10),
+    ("NZDJPY", 95.0, 100.0, 3, 0.01, 10),
+    ("USDSEK", 10.0, 11.0, 4, 0.0001, 10),
+    ("USDNOK", 10.0, 11.0, 4, 0.0001, 10),
+    ("USDMXN", 17.0, 18.0, 4, 0.0001, 10),
+    ("USDSGD", 1.35, 1.40, 5, 0.0001, 10),
+    ("USDHKD", 7.75, 7.85, 4, 0.0001, 10),
+    ("USDZAR", 18.0, 19.0, 4, 0.0001, 10),
+    ("USDTRY", 27.0, 28.0, 4, 0.0001, 10),
+    ("EURCAD", 1.45, 1.50, 5, 0.0001, 10),
+    ("EURNZD", 1.70, 1.75, 5, 0.0001, 10),
+    ("GBPAUD", 1.85, 1.90, 5, 0.0001, 10),
+    ("GBPNZD", 2.00, 2.05, 5, 0.0001, 10),
+    ("AUDCAD", 0.85, 0.90, 5, 0.0001, 10),
+    ("AUDNZD", 1.05, 1.10, 5, 0.0001, 10),
+    ("NZDCAD", 0.80, 0.85, 5, 0.0001, 10),
+    ("CADJPY", 110.0, 115.0, 3, 0.01, 10)
 ]
 
 
@@ -53,9 +58,167 @@ def make_ladder(levels=50, v_min=100_000, v_max=1_000_000_000):
 def table_name(name, suffix):
     return name + suffix if suffix else name
 
+
+def generate_lei_pool(count):
+    """
+    Generate deterministic fake LEIs with realistic format.
+    LEI format: 20 alphanumeric characters.
+    Using hash-based generation for realism while maintaining determinism.
+    Same count always produces same LEIs; expanding count preserves existing LEIs.
+    """
+    leis = []
+    for i in range(count):
+        # Create deterministic hash from index
+        hash_input = f"LEI_SEED_{i:010d}".encode('utf-8')
+        hash_hex = hashlib.sha256(hash_input).hexdigest()
+        # Take first 18 chars of hex, add "00" prefix for structure
+        lei = "00" + hash_hex[:18].upper()
+        leis.append(lei)
+    return leis
+
+
+def generate_trade_size_lognormal(min_size=100_000, median_size=500_000, max_size=100_000_000):
+    """
+    Generate realistic trade sizes using log-normal distribution.
+    Many small trades, few large trades.
+    """
+    # Log-normal parameters to hit our targets
+    mu = math.log(median_size)
+    sigma = 1.2  # Controls spread
+
+    size = random.lognormvariate(mu, sigma)
+    # Clamp to realistic bounds
+    return int(max(min_size, min(max_size, size)))
+
+
+def generate_order(symbol, best_bid, best_ask, pip, rank, ecn):
+    """
+    Generate a realistic order with rank-weighted probability.
+
+    Args:
+        symbol: FX pair symbol
+        best_bid: Current best bid price
+        best_ask: Current best ask price
+        pip: Pip size for the symbol
+        rank: Liquidity rank (1=most liquid, 10=least liquid)
+        ecn: ECN/venue where order is placed (LMAX, EBS, Hotspot, Currenex)
+
+    Returns:
+        dict with order_id, symbol, side, quantity, limit_price, passive, ecn
+    """
+    order_id = str(uuid.uuid4())
+
+    # Side: 50/50 buy vs sell
+    side = random.choice(["buy", "sell"])
+
+    # Passive: ~40% of orders are passive (resting limit orders)
+    passive = random.random() < 0.4
+
+    # Quantity: log-normal distribution
+    quantity = generate_trade_size_lognormal()
+
+    # Limit price depends on passive vs aggressive
+    if passive:
+        # Passive orders: limit price inside spread (may not execute)
+        if side == "buy":
+            # Passive buy: bid slightly below best bid
+            limit_price = best_bid - random.randint(0, 3) * pip
+        else:
+            # Passive sell: ask slightly above best ask
+            limit_price = best_ask + random.randint(0, 3) * pip
+    else:
+        # Aggressive orders: willing to walk the book
+        if side == "buy":
+            # Aggressive buy: willing to pay up to N pips above ask
+            max_slippage = random.randint(3, 10)
+            limit_price = best_ask + max_slippage * pip
+        else:
+            # Aggressive sell: willing to hit down to N pips below bid
+            max_slippage = random.randint(3, 10)
+            limit_price = best_bid - max_slippage * pip
+
+    return {
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "limit_price": limit_price,
+        "passive": passive,
+        "ecn": ecn
+    }
+
+
+def execute_order_against_orderbook(order, bids, asks, levels, pip):
+    """
+    Execute an order against the orderbook, generating trades.
+
+    Args:
+        order: dict with keys: order_id, symbol, side, quantity, limit_price, passive
+        bids: numpy array [prices, volumes] for bid side
+        asks: numpy array [prices, volumes] for ask side
+        levels: number of levels in the book
+        pip: pip size for the symbol
+
+    Returns:
+        list of trade dicts, each with: order_id, side, price, quantity, passive
+    """
+    trades = []
+    remaining = order["quantity"]
+    side = order["side"]
+    limit_price = order["limit_price"]
+    passive = order["passive"]
+
+    if side == "buy":
+        # Buy order: execute against asks (walk up the ask side)
+        for lvl in range(levels):
+            if remaining <= 0:
+                break
+            ask_price = asks[0][lvl]
+            ask_volume = asks[1][lvl]
+
+            # Check limit price constraint
+            if ask_price > limit_price:
+                break
+
+            # Execute what we can at this level
+            trade_qty = min(remaining, ask_volume)
+            trades.append({
+                "order_id": order["order_id"],
+                "side": side,
+                "price": float(ask_price),
+                "quantity": float(trade_qty),
+                "passive": passive
+            })
+            remaining -= trade_qty
+
+    else:  # side == "sell"
+        # Sell order: execute against bids (walk down the bid side)
+        for lvl in range(levels):
+            if remaining <= 0:
+                break
+            bid_price = bids[0][lvl]
+            bid_volume = bids[1][lvl]
+
+            # Check limit price constraint
+            if bid_price < limit_price:
+                break
+
+            # Execute what we can at this level
+            trade_qty = min(remaining, bid_volume)
+            trades.append({
+                "order_id": order["order_id"],
+                "side": side,
+                "price": float(bid_price),
+                "quantity": float(trade_qty),
+                "passive": passive
+            })
+            remaining -= trade_qty
+
+    return trades
+
 class SortedEmitter:
     """
-    Buffers rows for market_data and core_price, sorts them by timestamp,
+    Buffers rows for market_data, core_price, and fx_trades, sorts them by timestamp,
     and writes them out in order.
     """
 
@@ -65,6 +228,7 @@ class SortedEmitter:
         self.suffix = suffix
         self._md = []   # market_data buffer
         self._cp = []   # core_price buffer
+        self._tr = []   # fx_trades buffer
 
     # --- Market data rows --- #
     def emit_market(self, ts_ns, symbol, bids, asks):
@@ -88,6 +252,23 @@ class SortedEmitter:
         })
         if len(self._cp) >= self.buffer_limit:
             self._flush_cp()
+
+    # --- Trade rows --- #
+    def emit_trade(self, ts_ns, symbol, ecn, trade_id, side, passive, price, quantity, counterparty, order_id):
+        self._tr.append({
+            "ts": ts_ns,
+            "symbol": symbol,
+            "ecn": ecn,
+            "trade_id": trade_id,
+            "side": side,
+            "passive": passive,
+            "price": price,
+            "quantity": quantity,
+            "counterparty": counterparty,
+            "order_id": order_id,
+        })
+        if len(self._tr) >= self.buffer_limit:
+            self._flush_tr()
 
     # --- Flush methods --- #
     def _flush_md(self):
@@ -120,10 +301,32 @@ class SortedEmitter:
         self.sender.flush()
         self._cp.clear()
 
-    # --- flush both before exit --- #
+    def _flush_tr(self):
+        if not self._tr:
+            return
+        self._tr.sort(key=lambda r: r["ts"])
+        tbl = table_name("fx_trades", self.suffix)
+        for r in self._tr:
+            self.sender.row(
+                tbl,
+                symbols={"symbol": r["symbol"], "ecn": r["ecn"], "side": r["side"], "counterparty": r["counterparty"]},
+                columns={
+                    "trade_id": r["trade_id"],
+                    "passive": r["passive"],
+                    "price": r["price"],
+                    "quantity": r["quantity"],
+                    "order_id": r["order_id"],
+                },
+                at=TimestampNanos(r["ts"])
+            )
+        self.sender.flush()
+        self._tr.clear()
+
+    # --- flush all before exit --- #
     def flush_all(self):
         self._flush_md()
         self._flush_cp()
+        self._flush_tr()
 
 
 def get_latest_timestamp_ns(conn, table):
@@ -165,6 +368,20 @@ def ensure_tables_exist(args, suffix):
             indicator1 DOUBLE,
             indicator2 DOUBLE
         ) timestamp(timestamp) PARTITION BY HOUR {'TTL 3 DAYS' if short_ttl else ''};
+        """)
+        conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_name('fx_trades', suffix)} (
+            timestamp TIMESTAMP_NS,
+            symbol SYMBOL CAPACITY 15000,
+            ecn SYMBOL,
+            trade_id UUID,
+            side SYMBOL,
+            passive BOOLEAN,
+            price DOUBLE,
+            quantity DOUBLE,
+            counterparty SYMBOL,
+            order_id UUID
+        ) timestamp(timestamp) PARTITION BY HOUR WAL {'TTL 1 MONTH' if short_ttl else ''} DEDUP UPSERT KEYS(timestamp, trade_id);
         """)
 
 def ensure_materialized_views_exist(args, suffix):
@@ -303,7 +520,7 @@ def load_initial_state(args, suffix):
 
 def load_initial_state_from_brackets(fx_pairs):
     state = {}
-    for symbol, low, high, precision, pip in fx_pairs:
+    for symbol, low, high, precision, pip, rank in fx_pairs:
         mid = (low + high) / 2
         spread = quantize_to_pip(0.0004, pip)
         state[symbol] = {
@@ -319,7 +536,7 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
     out = []
     pct = bracket_pct / 100.0
     print("[INFO] Refreshing reference data from Yahoo Finance.", flush=True)
-    for symbol, _low, _high, precision, pip in fx_pairs_template:
+    for symbol, _low, _high, precision, pip, rank in fx_pairs_template:
         ysym = symbol + "=X"
         try:
             bars = yf.Ticker(ysym).history(period="1d", interval="1m")
@@ -340,7 +557,7 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
             low = _low
             high = _high
             print(f"[YF] {symbol}: Fallback to template low/high: {low}, {high}", flush=True)
-        out.append((symbol, low, high, precision, pip))
+        out.append((symbol, low, high, precision, pip, rank))
     return out
 
 def fx_pairs_refresher(shared_fx_pairs, interval=300, bracket_pct=1.0, first_ready_event=None):
@@ -388,7 +605,7 @@ def generate_bids_asks(prebuilt_bids, prebuilt_asks, levels, best_bid, best_ask,
 
 def evolve_state_one_tick(prev_state, fx_pairs, drift=5.0):
     next_state = {}
-    for symbol, low, high, precision, pip in fx_pairs:
+    for symbol, low, high, precision, pip, rank in fx_pairs:
         prev_mid = (prev_state[symbol]["bid_price"] + prev_state[symbol]["ask_price"]) / 2
         prev_spread = prev_state[symbol]["spread"]
         new_mid = evolve_mid_price(prev_mid, low, high, precision, pip, drift=drift)
@@ -437,7 +654,7 @@ def precompute_open_close_state(total_seconds, fx_pairs, state_template):
 
 def generate_events_for_second(
     ts,
-    market_event_count,
+    market_event_count,  # NOTE: Kept for backward compatibility, but now controlled by core_count (1:1 relationship)
     core_count,
     fx_pairs,
     open_state_for_second,
@@ -450,88 +667,175 @@ def generate_events_for_second(
     prebuilt_ask_arrays,
     end_ns=None,
     suffix="",
-    real_time=True
+    real_time=True,
+    trades_count=0,
+    lei_pool=None
 ):
+    """
+    Generate events for a single second with FULL DATA CONSISTENCY:
+
+    Architecture:
+    - core_price events DRIVE everything (single source of truth)
+    - Each core_price generates exactly 1 market_data event
+    - Each core_price probabilistically generates 0-N trades
+
+    Guarantees:
+    1. Temporal: core_price.ts <= market_data.ts <= trades.ts
+    2. Price consistency: core_price.bid_price == market_data.bids[0][0]
+    3. Price consistency: core_price.ask_price == market_data.asks[0][0]
+    4. Trade prices: All trade prices come from actual orderbook levels
+    5. ECN consistency: Same ECN for core_price, market_data, and all trades from same order
+    6. ASOF joins: Always find matching core_price/market_data before any trade
+
+    Note: market_event_count parameter is now unused (kept for compatibility).
+          Number of market_data events = core_count (1:1 relationship).
+    """
     # in real_time, we always ingest a couple of seconds ahead, to account for wal apply time, so dashboards look more
     # dynamic in real-time
     if real_time:
         ts = int((datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9) + 2*1e9)
 
-    # Prepare offsets and symbol picks
-    offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
-    symbol_choices = random.choices(fx_pairs, k=market_event_count)
+    # ECN pool
+    ecn_pool = ["LMAX", "EBS", "Hotspot", "Currenex"]
 
-    # Track how many events we generate per symbol for this second
-    symbol_event_indices = {symbol: [] for symbol, *_ in fx_pairs}
-    for i, (symbol, *_ ) in enumerate(symbol_choices):
-        symbol_event_indices[symbol].append(i)
-
-    for symbol, indices in symbol_event_indices.items():
-        n_events = len(indices)
-        if n_events == 0:
-            continue
-        for j, i in enumerate(indices):
-            offset = offsets_market[i]
-            _, low, high, precision, pip = [v for v in fx_pairs if v[0] == symbol][0]
-            levels = random.randint(min_levels, max_levels)
-            bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-
-            if j == 0:
-                # First event = open
-                state = open_state_for_second[symbol]
-            elif j == n_events - 1:
-                # Last event = close
-                state = close_state_for_second[symbol]
-            else:
-                # Linear interpolate between open and close
-                frac = j / (n_events - 1)
-                state = {
-                    "bid_price": open_state_for_second[symbol]["bid_price"] + frac * (close_state_for_second[symbol]["bid_price"] - open_state_for_second[symbol]["bid_price"]),
-                    "ask_price": open_state_for_second[symbol]["ask_price"] + frac * (close_state_for_second[symbol]["ask_price"] - open_state_for_second[symbol]["ask_price"]),
-                    "spread": open_state_for_second[symbol]["spread"],  # could interpolate if desired
-                    "indicator1": open_state_for_second[symbol]["indicator1"],  # or interpolate
-                    "indicator2": open_state_for_second[symbol]["indicator2"],
-                }
-
-            generate_bids_asks(bids, asks, levels, state["bid_price"], state["ask_price"], precision, pip, ladder)
-            row_ts = ts + offset
-            if end_ns is not None and row_ts >= end_ns:
-                continue
-
-            emitter.emit_market(row_ts, symbol, bids, asks)
-
-    # --- Core price events: use open state (or close, your call) ---
+    # --- Core price events DRIVE everything ---
+    # Generate core_price events with timestamps, orderbooks, and optionally trades
     offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
     symbol_choices_core = random.choices(fx_pairs, k=core_count)
+
+    # Track symbol event counts for interpolation
+    symbol_event_counts = {}
+    for symbol_tuple in symbol_choices_core:
+        symbol = symbol_tuple[0]
+        symbol_event_counts[symbol] = symbol_event_counts.get(symbol, 0) + 1
+
+    symbol_event_indices = {}
+    for symbol in symbol_event_counts:
+        symbol_event_indices[symbol] = 0
+
     for i, offset in enumerate(offsets_core):
-        symbol, low, high, precision, pip = symbol_choices_core[i]
-        levels = random.randint(min_levels, max_levels)
-        bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-        indicators = open_state_for_second[symbol]
-        bid_price = open_state_for_second[symbol]["bid_price"]
-        ask_price = open_state_for_second[symbol]["ask_price"]
+        symbol, low, high, precision, pip, rank = symbol_choices_core[i]
+
+        # Interpolate state for this event
+        n_events_for_symbol = symbol_event_counts[symbol]
+        event_idx_for_symbol = symbol_event_indices[symbol]
+        symbol_event_indices[symbol] += 1
+
+        if n_events_for_symbol == 1:
+            # Only one event: use open state
+            state = open_state_for_second[symbol]
+        elif event_idx_for_symbol == 0:
+            # First event: use open state
+            state = open_state_for_second[symbol]
+        elif event_idx_for_symbol == n_events_for_symbol - 1:
+            # Last event: use close state
+            state = close_state_for_second[symbol]
+        else:
+            # Interpolate between open and close
+            frac = event_idx_for_symbol / (n_events_for_symbol - 1)
+            state = {
+                "bid_price": open_state_for_second[symbol]["bid_price"] + frac * (close_state_for_second[symbol]["bid_price"] - open_state_for_second[symbol]["bid_price"]),
+                "ask_price": open_state_for_second[symbol]["ask_price"] + frac * (close_state_for_second[symbol]["ask_price"] - open_state_for_second[symbol]["ask_price"]),
+                "spread": open_state_for_second[symbol]["spread"],
+                "indicator1": open_state_for_second[symbol]["indicator1"],
+                "indicator2": open_state_for_second[symbol]["indicator2"],
+            }
+
+        bid_price = state["bid_price"]
+        ask_price = state["ask_price"]
+        indicators = state
+
+        # Select ECN and reason for this core_price event
+        ecn = random.choice(ecn_pool)
         reason = random.choice(["normal", "news_event", "liquidity_event"])
-        ecn = random.choice(["LMAX", "EBS", "Hotspot", "Currenex"])
-        row_ts = ts + offset
-        if end_ns is not None and row_ts >= end_ns:
-            continue
-        lvl = random.randint(0, levels - 1)
+
+        # Generate orderbook levels (market_data)
+        levels = random.randint(min_levels, max_levels)
+        bids = prebuilt_bid_arrays[levels - 1]
+        asks = prebuilt_ask_arrays[levels - 1]
         generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip, ladder)
 
+        # Core price timestamp
+        core_ts = ts + offset
+        if end_ns is not None and core_ts >= end_ns:
+            continue
+
+        # Emit core_price (always uses level 0 from orderbook)
         emitter.emit_core(
-            row_ts,
+            core_ts,
             symbol,
             ecn,
             reason,
             {
-                "bid_price": float(bids[0][lvl]),
-                "bid_volume": int(bids[1][lvl]),
-                "ask_price": float(asks[0][lvl]),
-                "ask_volume": int(asks[1][lvl]),
+                "bid_price": float(bids[0][0]),  # Level 0 bid
+                "bid_volume": int(bids[1][0]),
+                "ask_price": float(asks[0][0]),  # Level 0 ask
+                "ask_volume": int(asks[1][0]),
                 "indicator1": float(round(indicators["indicator1"], 3)),
                 "indicator2": float(round(indicators["indicator2"], 3))
             }
         )
+
+        # Emit market_data (same timestamp or slightly after core_price)
+        market_ts = core_ts + random.randint(0, 1000)  # 0-1 microsecond after core_price
+        if end_ns is None or market_ts < end_ns:
+            emitter.emit_market(market_ts, symbol, bids, asks)
+
+        # Probabilistically generate trades for this core_price event
+        # Trade probability: higher for liquid pairs, calibrated to hit target trades_count
+        if trades_count > 0 and lei_pool:
+            # Probability of generating a trade for this core_price event
+            # Calibrated so we hit approximately trades_count trades per second
+            # With more core_price events, each has lower probability
+            base_prob = trades_count / core_count if core_count > 0 else 0
+
+            # Adjust probability by rank (more liquid pairs trade more)
+            rank_multiplier = (11 - rank) / 5.5  # rank 1 gets 10/5.5 = 1.82x, rank 10 gets 1/5.5 = 0.18x
+            trade_prob = min(1.0, base_prob * rank_multiplier)
+
+            if random.random() < trade_prob:
+                # Generate an order for this ECN/symbol
+                order = generate_order(
+                    symbol,
+                    float(bids[0][0]),  # Best bid from this orderbook
+                    float(asks[0][0]),  # Best ask from this orderbook
+                    pip,
+                    rank,
+                    ecn
+                )
+
+                # Execute order against this orderbook
+                trades = execute_order_against_orderbook(
+                    order,
+                    bids,
+                    asks,
+                    levels,
+                    pip
+                )
+
+                # Emit trades with timestamps after core_price and market_data
+                for trade in trades:
+                    # Trade timestamp: 1-1000 microseconds after market_data
+                    trade_ts = market_ts + random.randint(1_000, 1_000_000)
+
+                    if end_ns is not None and trade_ts >= end_ns:
+                        continue
+
+                    # Pick random LEI counterparty
+                    counterparty = random.choice(lei_pool)
+
+                    emitter.emit_trade(
+                        trade_ts,
+                        symbol,
+                        ecn,  # Same ECN as core_price
+                        str(uuid.uuid4()),  # trade_id
+                        trade["side"],
+                        trade["passive"],
+                        trade["price"],
+                        trade["quantity"],
+                        counterparty,
+                        trade["order_id"]
+                    )
 
 def wait_if_paused(pause_event, process_idx):
     while pause_event.is_set():
@@ -549,7 +853,8 @@ def ingest_worker(
     process_idx,
     processes,
     pause_event,
-    global_sec_idx_offset # only meaningful in faster-than-life
+    global_sec_idx_offset, # only meaningful in faster-than-life
+    lei_pool
 ):
     if args.mode=="real-time":
         buffer_limit=1000
@@ -583,12 +888,14 @@ def ingest_worker(
 
                 open_state = open_per_second[sec_idx]
                 close_state = close_per_second[sec_idx]
+                trades_total = random.randint(args.trades_min_per_sec, args.trades_max_per_sec)
                 generate_events_for_second(
                     ts, market_total, core_total, fx_pairs,
                     open_state, close_state, emitter, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
-                    end_ns, args.suffix, False
+                    end_ns, args.suffix, False,
+                    trades_total, lei_pool
                 )
                 sent += market_total
 
@@ -615,6 +922,7 @@ def ingest_worker(
                 wait_if_paused(pause_event, process_idx)
                 market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
+                trades_total = random.randint(args.trades_min_per_sec, args.trades_max_per_sec)
 
 
                 # At the beginning of the second: capture OPEN state
@@ -627,7 +935,8 @@ def ingest_worker(
                     open_state, close_state, emitter, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
-                    end_ns, args.suffix, True
+                    end_ns, args.suffix, True,
+                    trades_total, lei_pool
                 )
                 current_state = close_state
                 sent += market_total
@@ -731,6 +1040,9 @@ def main():
     parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--yahoo_refresh_secs", type=int, default=300)
+    parser.add_argument("--trades_min_per_sec", type=int, default=5)
+    parser.add_argument("--trades_max_per_sec", type=int, default=30)
+    parser.add_argument("--lei_pool_size", type=int, default=2000)
 
     args = parser.parse_args()
     suffix = args.suffix
@@ -824,6 +1136,10 @@ def main():
         # Faster-than-life uses a plain list (no Manager, no refresher)
         fx_pairs = list(FX_PAIRS)
 
+    # Generate LEI pool for counterparties (deterministic and reusable)
+    lei_pool = generate_lei_pool(args.lei_pool_size)
+    print(f"[INFO] Generated {len(lei_pool)} LEIs for counterparties.")
+
 
     if args.incremental:
         if args.mode == "real-time":
@@ -903,7 +1219,8 @@ def main():
                     process_idx,
                     args.processes,
                     pause_event,
-                    global_sec_offsets[process_idx]
+                    global_sec_offsets[process_idx],
+                    lei_pool
                 )
             )
             p.start()
@@ -924,7 +1241,8 @@ def main():
                 0,  # process_idx
                 1,  # processes
                 pause_event,
-                0 # not needed for real-time
+                0,  # not needed for real-time
+                lei_pool
             )
         )
         p.start()

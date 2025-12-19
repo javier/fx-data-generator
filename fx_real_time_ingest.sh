@@ -18,4 +18,7 @@ python fx_data_generator.py \
   --processes 1 \
   --total_market_data_events 800_000_000 \
   --create_views false \
-  --incremental false
+  --incremental false \
+  --trades_min_per_sec 5 \
+  --trades_max_per_sec 30 \
+  --lei_pool_size 2000
