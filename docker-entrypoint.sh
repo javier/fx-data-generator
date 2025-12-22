@@ -20,7 +20,7 @@ exec python fx_data_generator.py \
   --token_y "${TOKEN_Y}" \
   --ilp_user "${ILP_USER}" \
   --yahoo_refresh_secs "${YAHOO_REFRESH_SECS}" \
-  --trades_min_per_sec "${TRADES_MIN_PER_SEC}" \
-  --trades_max_per_sec "${TRADES_MAX_PER_SEC}" \
+  --orders_min_per_sec "${ORDERS_MIN_PER_SEC}" \
+  --orders_max_per_sec "${ORDERS_MAX_PER_SEC}" \
   --lei_pool_size "${LEI_POOL_SIZE}" \
   "$@"

@@ -119,21 +119,21 @@ def generate_order(symbol, best_bid, best_ask, pip, rank, ecn):
 
     # Limit price depends on passive vs aggressive
     if passive:
-        # Passive orders: limit price inside spread (may not execute)
+        # Passive orders: crosses spread but with limited slippage
         if side == "buy":
-            # Passive buy: bid slightly below best bid
-            limit_price = best_bid - random.randint(0, 3) * pip
+            # Passive buy: willing to pay slightly above best ask
+            limit_price = best_ask + random.randint(0, 2) * pip
         else:
-            # Passive sell: ask slightly above best ask
-            limit_price = best_ask + random.randint(0, 3) * pip
+            # Passive sell: willing to accept slightly below best bid
+            limit_price = best_bid - random.randint(0, 2) * pip
     else:
-        # Aggressive orders: willing to walk the book
+        # Aggressive orders: willing to walk deeper into the book
         if side == "buy":
-            # Aggressive buy: willing to pay up to N pips above ask
+            # Aggressive buy: willing to pay much more above ask
             max_slippage = random.randint(3, 10)
             limit_price = best_ask + max_slippage * pip
         else:
-            # Aggressive sell: willing to hit down to N pips below bid
+            # Aggressive sell: willing to accept much less below bid
             max_slippage = random.randint(3, 10)
             limit_price = best_bid - max_slippage * pip
 
@@ -504,6 +504,33 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
         """)
 
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('fx_trades_ohlc_1m', suffix)} AS (
+            SELECT timestamp, symbol,
+                first(price) AS open,
+                max(price) AS high,
+                min(price) AS low,
+                last(price) AS close,
+                SUM(quantity) AS total_volume
+            FROM {table_name('fx_trades', suffix)}
+            SAMPLE BY 1m
+        ) PARTITION BY HOUR {'TTL 2 DAYS' if short_ttl else ''};
+        """)
+
+        conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('fx_trades_ohlc_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+            SELECT timestamp, symbol,
+                first(open) AS open,
+                max(high) AS high,
+                min(low) AS low,
+                last(close) AS close,
+                SUM(total_volume) AS total_volume
+            FROM {table_name('fx_trades_ohlc_1m', suffix)}
+            SAMPLE BY 1d
+       ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
+        """)
+
+
 # used only with incremental mode
 def load_initial_state(args, suffix):
     state = {}
@@ -654,7 +681,7 @@ def precompute_open_close_state(total_seconds, fx_pairs, state_template):
 
 def generate_events_for_second(
     ts,
-    market_event_count,  # NOTE: Kept for backward compatibility, but now controlled by core_count (1:1 relationship)
+    market_event_count,
     core_count,
     fx_pairs,
     open_state_for_second,
@@ -668,27 +695,14 @@ def generate_events_for_second(
     end_ns=None,
     suffix="",
     real_time=True,
-    trades_count=0,
+    orders_count=0,
     lei_pool=None
 ):
     """
-    Generate events for a single second with FULL DATA CONSISTENCY:
-
-    Architecture:
-    - core_price events DRIVE everything (single source of truth)
-    - Each core_price generates exactly 1 market_data event
-    - Each core_price probabilistically generates 0-N trades
-
-    Guarantees:
-    1. Temporal: core_price.ts <= market_data.ts <= trades.ts
-    2. Price consistency: core_price.bid_price == market_data.bids[0][0]
-    3. Price consistency: core_price.ask_price == market_data.asks[0][0]
-    4. Trade prices: All trade prices come from actual orderbook levels
-    5. ECN consistency: Same ECN for core_price, market_data, and all trades from same order
-    6. ASOF joins: Always find matching core_price/market_data before any trade
-
-    Note: market_event_count parameter is now unused (kept for compatibility).
-          Number of market_data events = core_count (1:1 relationship).
+    Generate events for a single second:
+    - market_data: Many events (full depth orderbook updates)
+    - core_price: Fewer events (BBO snapshots with indicators)
+    - fx_trades: Execute against orderbooks, timestamped after corresponding core_price
     """
     # in real_time, we always ingest a couple of seconds ahead, to account for wal apply time, so dashboards look more
     # dynamic in real-time
@@ -698,144 +712,180 @@ def generate_events_for_second(
     # ECN pool
     ecn_pool = ["LMAX", "EBS", "Hotspot", "Currenex"]
 
-    # --- Core price events DRIVE everything ---
-    # Generate core_price events with timestamps, orderbooks, and optionally trades
+    # --- Generate market_data events (LOTS of them - orderbook updates) ---
+    offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
+    symbol_choices_market = random.choices(fx_pairs, k=market_event_count)
+
+    # Track how many events per symbol for interpolation
+    symbol_event_indices = {symbol: [] for symbol, *_ in fx_pairs}
+    for i, (symbol, *_) in enumerate(symbol_choices_market):
+        symbol_event_indices[symbol].append(i)
+
+    for symbol, indices in symbol_event_indices.items():
+        n_events = len(indices)
+        if n_events == 0:
+            continue
+        for j, i in enumerate(indices):
+            offset = offsets_market[i]
+            _, low, high, precision, pip, rank = [v for v in fx_pairs if v[0] == symbol][0]
+            levels = random.randint(min_levels, max_levels)
+            bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
+
+            if j == 0:
+                state = open_state_for_second[symbol]
+            elif j == n_events - 1:
+                state = close_state_for_second[symbol]
+            else:
+                frac = j / (n_events - 1)
+                state = {
+                    "bid_price": open_state_for_second[symbol]["bid_price"] + frac * (close_state_for_second[symbol]["bid_price"] - open_state_for_second[symbol]["bid_price"]),
+                    "ask_price": open_state_for_second[symbol]["ask_price"] + frac * (close_state_for_second[symbol]["ask_price"] - open_state_for_second[symbol]["ask_price"]),
+                    "spread": open_state_for_second[symbol]["spread"],
+                    "indicator1": open_state_for_second[symbol]["indicator1"],
+                    "indicator2": open_state_for_second[symbol]["indicator2"],
+                }
+
+            generate_bids_asks(bids, asks, levels, state["bid_price"], state["ask_price"], precision, pip, ladder)
+            row_ts = ts + offset
+            if end_ns is not None and row_ts >= end_ns:
+                continue
+
+            emitter.emit_market(row_ts, symbol, bids, asks)
+
+    # --- Generate core_price events (FEWER - BBO snapshots with metadata) ---
     offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
     symbol_choices_core = random.choices(fx_pairs, k=core_count)
 
-    # Track symbol event counts for interpolation
-    symbol_event_counts = {}
-    for symbol_tuple in symbol_choices_core:
-        symbol = symbol_tuple[0]
-        symbol_event_counts[symbol] = symbol_event_counts.get(symbol, 0) + 1
+    # Track generated core_price events for trade generation
+    core_price_events = []
 
-    symbol_event_indices = {}
-    for symbol in symbol_event_counts:
-        symbol_event_indices[symbol] = 0
+    # Group core_price events by symbol for interpolation (same as market_data)
+    symbol_core_indices = {symbol: [] for symbol, *_ in fx_pairs}
+    for i, (symbol, *_) in enumerate(symbol_choices_core):
+        symbol_core_indices[symbol].append(i)
 
-    for i, offset in enumerate(offsets_core):
-        symbol, low, high, precision, pip, rank = symbol_choices_core[i]
-
-        # Interpolate state for this event
-        n_events_for_symbol = symbol_event_counts[symbol]
-        event_idx_for_symbol = symbol_event_indices[symbol]
-        symbol_event_indices[symbol] += 1
-
-        if n_events_for_symbol == 1:
-            # Only one event: use open state
-            state = open_state_for_second[symbol]
-        elif event_idx_for_symbol == 0:
-            # First event: use open state
-            state = open_state_for_second[symbol]
-        elif event_idx_for_symbol == n_events_for_symbol - 1:
-            # Last event: use close state
-            state = close_state_for_second[symbol]
-        else:
-            # Interpolate between open and close
-            frac = event_idx_for_symbol / (n_events_for_symbol - 1)
-            state = {
-                "bid_price": open_state_for_second[symbol]["bid_price"] + frac * (close_state_for_second[symbol]["bid_price"] - open_state_for_second[symbol]["bid_price"]),
-                "ask_price": open_state_for_second[symbol]["ask_price"] + frac * (close_state_for_second[symbol]["ask_price"] - open_state_for_second[symbol]["ask_price"]),
-                "spread": open_state_for_second[symbol]["spread"],
-                "indicator1": open_state_for_second[symbol]["indicator1"],
-                "indicator2": open_state_for_second[symbol]["indicator2"],
-            }
-
-        bid_price = state["bid_price"]
-        ask_price = state["ask_price"]
-        indicators = state
-
-        # Select ECN and reason for this core_price event
-        ecn = random.choice(ecn_pool)
-        reason = random.choice(["normal", "news_event", "liquidity_event"])
-
-        # Generate orderbook levels (market_data)
-        levels = random.randint(min_levels, max_levels)
-        bids = prebuilt_bid_arrays[levels - 1]
-        asks = prebuilt_ask_arrays[levels - 1]
-        generate_bids_asks(bids, asks, levels, bid_price, ask_price, precision, pip, ladder)
-
-        # Core price timestamp
-        core_ts = ts + offset
-        if end_ns is not None and core_ts >= end_ns:
+    for symbol, indices in symbol_core_indices.items():
+        n_events = len(indices)
+        if n_events == 0:
             continue
 
-        # Emit core_price (always uses level 0 from orderbook)
-        emitter.emit_core(
-            core_ts,
-            symbol,
-            ecn,
-            reason,
-            {
-                "bid_price": float(bids[0][0]),  # Level 0 bid
-                "bid_volume": int(bids[1][0]),
-                "ask_price": float(asks[0][0]),  # Level 0 ask
-                "ask_volume": int(asks[1][0]),
-                "indicator1": float(round(indicators["indicator1"], 3)),
-                "indicator2": float(round(indicators["indicator2"], 3))
-            }
-        )
+        _, low, high, precision, pip, rank = [v for v in fx_pairs if v[0] == symbol][0]
 
-        # Emit market_data (same timestamp or slightly after core_price)
-        market_ts = core_ts + random.randint(0, 1000)  # 0-1 microsecond after core_price
-        if end_ns is None or market_ts < end_ns:
-            emitter.emit_market(market_ts, symbol, bids, asks)
+        for j, i in enumerate(indices):
+            offset = offsets_core[i]
+            levels = random.randint(min_levels, max_levels)
+            bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
 
-        # Probabilistically generate trades for this core_price event
-        # Trade probability: higher for liquid pairs, calibrated to hit target trades_count
-        if trades_count > 0 and lei_pool:
-            # Probability of generating a trade for this core_price event
-            # Calibrated so we hit approximately trades_count trades per second
-            # With more core_price events, each has lower probability
-            base_prob = trades_count / core_count if core_count > 0 else 0
+            # Interpolate bid/ask prices between open and close states
+            if j == 0:
+                state = open_state_for_second[symbol]
+            elif j == n_events - 1:
+                state = close_state_for_second[symbol]
+            else:
+                frac = j / (n_events - 1)
+                state = {
+                    "bid_price": open_state_for_second[symbol]["bid_price"] + frac * (close_state_for_second[symbol]["bid_price"] - open_state_for_second[symbol]["bid_price"]),
+                    "ask_price": open_state_for_second[symbol]["ask_price"] + frac * (close_state_for_second[symbol]["ask_price"] - open_state_for_second[symbol]["ask_price"]),
+                    "spread": open_state_for_second[symbol]["spread"],
+                    "indicator1": open_state_for_second[symbol]["indicator1"],
+                    "indicator2": open_state_for_second[symbol]["indicator2"],
+                }
 
-            # Adjust probability by rank (more liquid pairs trade more)
-            rank_multiplier = (11 - rank) / 5.5  # rank 1 gets 10/5.5 = 1.82x, rank 10 gets 1/5.5 = 0.18x
-            trade_prob = min(1.0, base_prob * rank_multiplier)
+            reason = random.choice(["normal", "news_event", "liquidity_event"])
+            ecn = random.choice(ecn_pool)
+            row_ts = ts + offset
+            if end_ns is not None and row_ts >= end_ns:
+                continue
 
-            if random.random() < trade_prob:
-                # Generate an order for this ECN/symbol
-                order = generate_order(
-                    symbol,
-                    float(bids[0][0]),  # Best bid from this orderbook
-                    float(asks[0][0]),  # Best ask from this orderbook
-                    pip,
-                    rank,
-                    ecn
+            generate_bids_asks(bids, asks, levels, state["bid_price"], state["ask_price"], precision, pip, ladder)
+
+            # Core price always uses level 0 (best bid/offer)
+            emitter.emit_core(
+                row_ts,
+                symbol,
+                ecn,
+                reason,
+                {
+                    "bid_price": float(bids[0][0]),  # Level 0 = Best bid
+                    "bid_volume": int(bids[1][0]),
+                    "ask_price": float(asks[0][0]),  # Level 0 = Best ask
+                    "ask_volume": int(asks[1][0]),
+                    "indicator1": float(round(state["indicator1"], 3)),
+                    "indicator2": float(round(state["indicator2"], 3))
+                }
+            )
+
+            # Store this core_price event for potential trade generation
+            core_price_events.append({
+                "timestamp": row_ts,
+                "symbol": symbol,
+                "ecn": ecn,
+                "bids": bids.copy(),
+                "asks": asks.copy(),
+                "levels": levels,
+                "pip": pip,
+                "rank": rank
+            })
+
+    # --- Generate trades from core_price events ---
+    if orders_count > 0 and lei_pool and core_price_events:
+        # Cap orders to available core_price events to avoid excessive duplication
+        actual_orders_count = min(orders_count, len(core_price_events))
+
+        # Select exactly actual_orders_count events, weighted by liquidity rank
+        # Lower rank = more liquid = higher weight
+        weights = [(11 - cp_event["rank"]) for cp_event in core_price_events]
+        selected_events = random.choices(core_price_events, weights=weights, k=actual_orders_count)
+
+        for cp_event in selected_events:
+            # Check if we have room for trades within this second
+            offset_within_second = cp_event["timestamp"] % 1_000_000_000
+            max_offset = 999_999_999 - offset_within_second
+
+            # Skip this entire order if too close to second boundary (less than 1 microsecond room)
+            if max_offset < 1_000:
+                continue
+
+            # Generate order for this ECN/symbol
+            order = generate_order(
+                cp_event["symbol"],
+                float(cp_event["bids"][0][0]),
+                float(cp_event["asks"][0][0]),
+                cp_event["pip"],
+                cp_event["rank"],
+                cp_event["ecn"]
+            )
+
+            # Execute order
+            trades = execute_order_against_orderbook(
+                order,
+                cp_event["bids"],
+                cp_event["asks"],
+                cp_event["levels"],
+                cp_event["pip"]
+            )
+
+            # Emit trades with timestamps AFTER the core_price event
+            # but within the same second to maintain temporal ordering
+            for trade in trades:
+                # Generate trade timestamp within same second
+                trade_ts = cp_event["timestamp"] + random.randint(1_000, min(1_000_000, max_offset))
+                if end_ns is not None and trade_ts >= end_ns:
+                    continue
+
+                counterparty = random.choice(lei_pool)
+                emitter.emit_trade(
+                    trade_ts,
+                    cp_event["symbol"],
+                    cp_event["ecn"],
+                    str(uuid.uuid4()),
+                    trade["side"],
+                    trade["passive"],
+                    trade["price"],
+                    trade["quantity"],
+                    counterparty,
+                    trade["order_id"]
                 )
-
-                # Execute order against this orderbook
-                trades = execute_order_against_orderbook(
-                    order,
-                    bids,
-                    asks,
-                    levels,
-                    pip
-                )
-
-                # Emit trades with timestamps after core_price and market_data
-                for trade in trades:
-                    # Trade timestamp: 1-1000 microseconds after market_data
-                    trade_ts = market_ts + random.randint(1_000, 1_000_000)
-
-                    if end_ns is not None and trade_ts >= end_ns:
-                        continue
-
-                    # Pick random LEI counterparty
-                    counterparty = random.choice(lei_pool)
-
-                    emitter.emit_trade(
-                        trade_ts,
-                        symbol,
-                        ecn,  # Same ECN as core_price
-                        str(uuid.uuid4()),  # trade_id
-                        trade["side"],
-                        trade["passive"],
-                        trade["price"],
-                        trade["quantity"],
-                        counterparty,
-                        trade["order_id"]
-                    )
 
 def wait_if_paused(pause_event, process_idx):
     while pause_event.is_set():
@@ -888,14 +938,14 @@ def ingest_worker(
 
                 open_state = open_per_second[sec_idx]
                 close_state = close_per_second[sec_idx]
-                trades_total = random.randint(args.trades_min_per_sec, args.trades_max_per_sec)
+                orders_total = random.randint(args.orders_min_per_sec, args.orders_max_per_sec)
                 generate_events_for_second(
                     ts, market_total, core_total, fx_pairs,
                     open_state, close_state, emitter, ladder,
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
                     end_ns, args.suffix, False,
-                    trades_total, lei_pool
+                    orders_total, lei_pool
                 )
                 sent += market_total
 
@@ -922,7 +972,7 @@ def ingest_worker(
                 wait_if_paused(pause_event, process_idx)
                 market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
-                trades_total = random.randint(args.trades_min_per_sec, args.trades_max_per_sec)
+                orders_total = random.randint(args.orders_min_per_sec, args.orders_max_per_sec)
 
 
                 # At the beginning of the second: capture OPEN state
@@ -936,7 +986,7 @@ def ingest_worker(
                     args.min_levels, args.max_levels,
                     prebuilt_bids, prebuilt_asks,
                     end_ns, args.suffix, True,
-                    trades_total, lei_pool
+                    orders_total, lei_pool
                 )
                 current_state = close_state
                 sent += market_total
@@ -1025,10 +1075,10 @@ def main():
     parser.add_argument("--ilp_user", default="admin")
     parser.add_argument("--protocol", choices=["http", "tcp"], default="http")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
-    parser.add_argument("--market_data_min_eps", type=int, default=1000)
+    parser.add_argument("--market_data_min_eps", type=int, default=1200)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
-    parser.add_argument("--core_min_eps", type=int, default=800)
-    parser.add_argument("--core_max_eps", type=int, default=1100)
+    parser.add_argument("--core_min_eps", type=int, default=700)
+    parser.add_argument("--core_max_eps", type=int, default=1000)
     parser.add_argument("--total_market_data_events", type=int, default=1_000_000)
     parser.add_argument("--start_ts", type=str)
     parser.add_argument("--end_ts", type=str)
@@ -1040,8 +1090,8 @@ def main():
     parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--yahoo_refresh_secs", type=int, default=300)
-    parser.add_argument("--trades_min_per_sec", type=int, default=5)
-    parser.add_argument("--trades_max_per_sec", type=int, default=30)
+    parser.add_argument("--orders_min_per_sec", type=int, default=5)
+    parser.add_argument("--orders_max_per_sec", type=int, default=30)
     parser.add_argument("--lei_pool_size", type=int, default=2000)
 
     args = parser.parse_args()
@@ -1067,6 +1117,16 @@ def main():
         if not args.total_market_data_events or args.total_market_data_events <= 0:
             print("ERROR: --total_market_data_events must be set to a positive integer in faster-than-life mode.")
             exit(1)
+
+    # Validate event rate hierarchy: market_data > core_price > orders
+    if args.market_data_min_eps <= args.core_max_eps:
+        print(f"ERROR: market_data_min_eps ({args.market_data_min_eps}) must be greater than core_max_eps ({args.core_max_eps}).")
+        print("Market data events should always be more frequent than core price events.")
+        exit(1)
+    if args.core_min_eps <= args.orders_max_per_sec:
+        print(f"ERROR: core_min_eps ({args.core_min_eps}) must be greater than orders_max_per_sec ({args.orders_max_per_sec}).")
+        print("Core price events should always be more frequent than orders per second.")
+        exit(1)
 
     ensure_tables_exist(args, suffix)
     if args.create_views:
