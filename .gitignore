@@ -32,3 +32,5 @@ ilp_ingestion.iml
 
 #python
 *.pyc
+
+claude.md
