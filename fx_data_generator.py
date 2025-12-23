@@ -286,6 +286,10 @@ class SortedEmitter:
         self.sender.flush()
         self._md.clear()
 
+        # Also flush core_price and fx_trades to keep all tables synchronized
+        self._flush_cp()
+        self._flush_tr()
+
     def _flush_cp(self):
         if not self._cp:
             return
