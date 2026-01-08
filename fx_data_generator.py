@@ -385,7 +385,7 @@ def ensure_tables_exist(args, suffix):
             quantity DOUBLE,
             counterparty SYMBOL,
             order_id UUID
-        ) timestamp(timestamp) PARTITION BY HOUR WAL {'TTL 1 MONTH' if short_ttl else ''} DEDUP UPSERT KEYS(timestamp, trade_id);
+        ) timestamp(timestamp) PARTITION BY HOUR {'TTL 1 MONTH' if short_ttl else ''} DEDUP UPSERT KEYS(timestamp, trade_id);
         """)
 
 def ensure_materialized_views_exist(args, suffix):
