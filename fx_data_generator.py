@@ -1097,6 +1097,8 @@ def main():
     parser.add_argument("--orders_min_per_sec", type=int, default=5)
     parser.add_argument("--orders_max_per_sec", type=int, default=30)
     parser.add_argument("--lei_pool_size", type=int, default=2000)
+    parser.add_argument("--chunk_seconds", type=int, default=900,
+                        help="Max seconds to precompute at once in faster-than-life mode (default: 900 = 15 min)")
 
     args = parser.parse_args()
     suffix = args.suffix
@@ -1237,60 +1239,115 @@ def main():
     wal_proc.start()
 
     if args.mode == "faster-than-life":
-        per_second_plan = []
+        # Calculate max seconds based on time window to avoid unbounded precomputation
+        max_seconds_from_window = None
+        if end_ns is not None:
+            max_seconds_from_window = (end_ns - start_ns) // 1_000_000_000
+            if max_seconds_from_window <= 0:
+                print(f"[INFO] No work to do: time window is zero or negative.")
+                exit(0)
+
+        # Build full per_second_plan (just tuples - low memory)
+        full_per_second_plan = []
         events_so_far = 0
         while events_so_far < args.total_market_data_events:
+            # Stop if we've hit the time window limit
+            if max_seconds_from_window is not None and len(full_per_second_plan) >= max_seconds_from_window:
+                print(f"[INFO] Reached end_ts limit at {len(full_per_second_plan)} seconds ({events_so_far} events). "
+                      f"Requested {args.total_market_data_events} events but time window only allows {events_so_far}.")
+                break
             market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
             core_total = random.randint(args.core_min_eps, args.core_max_eps)
-            per_second_plan.append((market_total, core_total))
+            full_per_second_plan.append((market_total, core_total))
             events_so_far += market_total
         overage = events_so_far - args.total_market_data_events
-        if overage > 0:
-            market_total, core_total = per_second_plan[-1]
-            per_second_plan[-1] = (market_total - overage, core_total)
-        total_seconds = len(per_second_plan)
-        worker_plans = [[] for _ in range(args.processes)]
-        for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
-            market_splits = split_event_counts(market_total, args.processes)
-            core_splits = split_event_counts(core_total, args.processes)
-            for i in range(args.processes):
-                worker_plans[i].append((market_splits[i], core_splits[i]))
-        open_per_second, close_per_second = precompute_open_close_state(total_seconds, fx_pairs, state)
-        global_states = (open_per_second, close_per_second)
-        global_sec_offsets = []
-        cum = 0
-        for plan in worker_plans:
-            global_sec_offsets.append(cum)
-            cum += len(plan)
+        if overage > 0 and (max_seconds_from_window is None or len(full_per_second_plan) < max_seconds_from_window):
+            market_total, core_total = full_per_second_plan[-1]
+            full_per_second_plan[-1] = (market_total - overage, core_total)
 
-        if end_ns is not None and start_ns >= end_ns:
-            print(f"[INFO] No work to do: start_ts ({ns_to_iso(start_ns)}) >= end_ts ({ns_to_iso(end_ns)})")
-            print("Exiting.")
+        total_seconds = len(full_per_second_plan)
+        if total_seconds == 0:
+            print(f"[INFO] No work to do: zero seconds in plan.")
             exit(0)
 
-        pool = []
-        for process_idx in range(args.processes):
-            p = mp.Process(
-                target=ingest_worker,
-                args=(
-                    args,
-                    worker_plans[process_idx],
-                    sum(market for market, _ in worker_plans[process_idx]),
-                    start_ns,
-                    end_ns,
-                    global_states,
-                    fx_pairs,
-                    process_idx,
-                    args.processes,
-                    pause_event,
-                    global_sec_offsets[process_idx],
-                    lei_pool
-                )
+        # Process in chunks to limit memory usage
+        chunk_size = args.chunk_seconds
+        num_chunks = (total_seconds + chunk_size - 1) // chunk_size
+        print(f"[INFO] Processing {total_seconds} seconds in {num_chunks} chunk(s) of up to {chunk_size} seconds each.")
+
+        carry_forward_state = state  # Initial state for first chunk
+        chunk_start_ns = start_ns
+
+        for chunk_idx in range(num_chunks):
+            chunk_start_sec = chunk_idx * chunk_size
+            chunk_end_sec = min((chunk_idx + 1) * chunk_size, total_seconds)
+            chunk_seconds = chunk_end_sec - chunk_start_sec
+
+            # Slice the plan for this chunk
+            chunk_plan = full_per_second_plan[chunk_start_sec:chunk_end_sec]
+            chunk_events = sum(market for market, _ in chunk_plan)
+
+            print(f"[CHUNK {chunk_idx + 1}/{num_chunks}] Seconds {chunk_start_sec}-{chunk_end_sec - 1}, "
+                  f"{chunk_events} market_data events, starting at {ns_to_iso(chunk_start_ns)}")
+
+            # Precompute state for this chunk only (using carry_forward_state for continuity)
+            open_per_second, close_per_second = precompute_open_close_state(
+                chunk_seconds, fx_pairs, carry_forward_state
             )
-            p.start()
-            pool.append(p)
-        for p in pool:
-            p.join()
+            global_states = (open_per_second, close_per_second)
+
+            # Build worker plans for this chunk
+            worker_plans = [[] for _ in range(args.processes)]
+            for sec_idx, (market_total, core_total) in enumerate(chunk_plan):
+                market_splits = split_event_counts(market_total, args.processes)
+                core_splits = split_event_counts(core_total, args.processes)
+                for i in range(args.processes):
+                    worker_plans[i].append((market_splits[i], core_splits[i]))
+
+            global_sec_offsets = []
+            cum = 0
+            for plan in worker_plans:
+                global_sec_offsets.append(cum)
+                cum += len(plan)
+
+            # Calculate chunk end timestamp
+            chunk_end_ns = chunk_start_ns + chunk_seconds * 1_000_000_000
+            effective_end_ns = min(chunk_end_ns, end_ns) if end_ns else chunk_end_ns
+
+            # Spawn workers for this chunk
+            pool = []
+            for process_idx in range(args.processes):
+                p = mp.Process(
+                    target=ingest_worker,
+                    args=(
+                        args,
+                        worker_plans[process_idx],
+                        sum(market for market, _ in worker_plans[process_idx]),
+                        chunk_start_ns,
+                        effective_end_ns,
+                        global_states,
+                        fx_pairs,
+                        process_idx,
+                        args.processes,
+                        pause_event,
+                        global_sec_offsets[process_idx],
+                        lei_pool
+                    )
+                )
+                p.start()
+                pool.append(p)
+
+            # Wait for all workers to finish this chunk
+            for p in pool:
+                p.join()
+
+            # Carry forward the final close state for continuity with next chunk
+            carry_forward_state = close_per_second[-1]
+
+            # Update start timestamp for next chunk
+            chunk_start_ns = chunk_end_ns
+
+            print(f"[CHUNK {chunk_idx + 1}/{num_chunks}] Completed.")
     elif args.mode == "real-time":
         p = mp.Process(
             target=ingest_worker,
