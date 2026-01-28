@@ -141,6 +141,7 @@ order_id UUID  -- Multiple trades can share same order_id (partial fills)
 | `--total_market_data_events` | int       | `1_000_000`   | Total `market_data` events to generate (faster-than-life mode only)                            |
 | `--start_ts`                 | str       | now (UTC)     | Simulation start time (ISO8601). Not allowed in real-time mode                                 |
 | `--end_ts`                   | str       | None          | Simulation end time (ISO8601)                                                                  |
+| `--chunk_seconds`            | int       | `900`         | Max seconds to precompute per chunk in faster-than-life mode (limits memory usage)             |
 | `--processes`                | int       | `1`           | Number of worker processes (real-time allows only 1)                                           |
 | `--min_levels`               | int       | `40`          | Min orderbook levels                                                                           |
 | `--max_levels`               | int       | `40`          | Max orderbook levels                                                                           |
@@ -176,7 +177,8 @@ Violating these constraints will cause the script to exit with an error message.
 ### Faster-Than-Life Mode (`--mode faster-than-life`)
 
 - Generates data as fast as possible (no wall-clock pacing)
-- Pre-computes all state transitions upfront for maximum speed
+- Processes in chunks (default 15 min) to limit memory usage for long runs
+- Maintains OHLC continuity across chunk boundaries
 - Supports multiprocessing for parallel ingestion
 - Requires `--total_market_data_events` to be set
 - Can use `--start_ts` and `--end_ts` for specific time ranges
