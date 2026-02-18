@@ -280,7 +280,9 @@ class SortedEmitter:
             self.sender.row(
                 tbl,
                 symbols={"symbol": r["symbol"]},
-                columns={"bids": r["bids"], "asks": r["asks"]},
+                columns={"bids": r["bids"], "asks": r["asks"],
+                         "best_bid": float(r["bids"][0][0]),
+                         "best_ask": float(r["asks"][0][0])},
                 at=TimestampNanos(r["ts"])
             )
         self.sender.flush()
@@ -356,7 +358,9 @@ def ensure_tables_exist(args, suffix):
             timestamp TIMESTAMP,
             symbol SYMBOL CAPACITY 15000,
             bids DOUBLE[][],
-            asks DOUBLE[][]
+            asks DOUBLE[][],
+            best_bid DOUBLE,
+            best_ask DOUBLE
         ) timestamp(timestamp) PARTITION BY HOUR {'TTL 3 DAYS' if short_ttl else ''};
         """)
         conn.execute(f"""
@@ -431,8 +435,8 @@ def ensure_materialized_views_exist(args, suffix):
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1s', suffix)} AS (
             SELECT timestamp, symbol,
-                last(bids[1][1]) AS bid,
-                last(asks[1][1]) AS ask
+                last(best_bid) AS bid,
+                last(best_ask) AS ask
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1s
         ) PARTITION BY HOUR  {'TTL 3 DAYS' if short_ttl else ''};
@@ -471,10 +475,10 @@ def ensure_materialized_views_exist(args, suffix):
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1m', suffix)}  AS (
             SELECT timestamp, symbol,
-                first(bids[1][1]) AS open,
-                max(bids[1][1]) AS high,
-                min(bids[1][1]) AS low,
-                last(bids[1][1]) AS close,
+                first(best_bid) AS open,
+                max(best_bid) AS high,
+                min(best_bid) AS low,
+                last(best_bid) AS close,
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1m
@@ -498,10 +502,10 @@ def ensure_materialized_views_exist(args, suffix):
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
-                first(bids[1][1]) AS open,
-                max(bids[1][1]) AS high,
-                min(bids[1][1]) AS low,
-                last(bids[1][1]) AS close,
+                first(best_bid) AS open,
+                max(best_bid) AS high,
+                min(best_bid) AS low,
+                last(best_bid) AS close,
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1d
