@@ -80,6 +80,8 @@ timestamp TIMESTAMP
 symbol SYMBOL
 bids DOUBLE[][]  -- bids[0] = prices, bids[1] = volumes
 asks DOUBLE[][]  -- asks[0] = prices, asks[1] = volumes
+best_bid DOUBLE  -- materialized bids[1][1] for fast queries
+best_ask DOUBLE  -- materialized asks[1][1] for fast queries
 ```
 **Volume:** 1,200-15,000 events/second
 
