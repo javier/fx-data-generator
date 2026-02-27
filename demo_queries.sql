@@ -1,50 +1,49 @@
-show tables;
+tables();
 
-select * from market_data;
+--show tables;
+-- dataset intro
+select * from market_data order by timestamp desc;
 
-select *
-from market_data  where timestamp in '2025-11-12'; --today() order by timestamp desc;
-
-select *
-from market_data  where timestamp in yesterday();
-
-
-select * from core_price where timestamp in today();
+select * from market_data  where timestamp in '$yesterday';
+select * from core_price where timestamp  in '$yesterday';
+select * from fx_trades where timestamp in '$yesterday';
 
 
 select * from market_data
-where symbol in 'GBPUSD' and timestamp in  '2025-11-12'; --today()
+where symbol in 'GBPUSD' and timestamp in  '$today'
 limit -10;
 
+select * from market_data
+where symbol in 'GBPUSD'
+and  timestamp IN '2026-02-24#XNYS';
 
+select first(timestamp), last(timestamp) from fx_trades
+WHERE timestamp IN '2026-02-19#XNYS';
 
 
 select timestamp, symbol,
     bids[1,1] as bprice, bids[2,1] as bvolume,
     asks[1,1] as aprice, asks[2,1] as avolume,
-    bids[1,2999] as bprice2, bids[2,2999] as bvolume2,
-    asks[1,2999] as aprice2, asks[2,2999] as avolume2,
+    bids[1,-1] as bprice2, bids[2,39] as bvolume2,
+    asks[1,-1] as aprice2, asks[2,39] as avolume2,
     array_sum(bids[2]) as total_volume
-from market_data where timestamp in today() limit -20;
+from market_data where timestamp  in '$today' limit -20;
 
 
-
+-- latest on. SQL extensions
 
 select * from core_price latest by symbol;
 
 select * from core_price latest by symbol, ecn;
 
 select * from core_price latest by symbol, ecn
-where timestamp <= '2025-11-13T00:00';
+where timestamp < '2026-02-11';
 
 
-select timestamp, symbol, count(bids[1][1]) from market_data
-        where timestamp in '2025-11-13T00'
-        and   symbol = 'GBPUSD'
-        sample by 10s;
-
+-- parquet
 table_partitions('market_data');
 table_partitions('core_price');
+table_partitions('fx_trades');
 
 
 select timestamp, count(), symbol,
@@ -69,27 +68,28 @@ sample by 1d;
 
 
 -- 15 minutes candles
- select timestamp,
-            first(bids[1][1]) as open,
-            max(bids[1][1]) as high,
-            min(bids[1][1]) as low,
-            last(bids[1][1]) as close,
-            avg(bids[1][1]) as avgr,
+  select timestamp, symbol,
+            first(best_bid) as open,
+            max(best_bid) as high,
+            min(best_bid) as low,
+            last(best_bid) as close,
+            avg(best_bid) as avgr,
             sum(bids[2][1]) as volume
         from market_data
-        where timestamp in '2025-11-12' -- yesterday()
-        and   symbol = 'GBPUSD'
-        sample by 15m
-        order by timestamp desc;
+        where timestamp  in '$today'
+        and   symbol = 'USDJPY'
+        sample by 15m;
 
-CREATE MATERIALIZED VIEW 'market_data_ohlc_1m'
+-- mat views
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'market_data_ohlc_1m'
     WITH BASE 'market_data' REFRESH IMMEDIATE AS (
 
             SELECT timestamp, symbol,
-                first(bids[1][1]) AS open,
-                max(bids[1][1]) AS high,
-                min(bids[1][1]) AS low,
-                last(bids[1][1]) AS close,
+                first(best_bid) AS open,
+                max(best_bid) AS high,
+                min(best_bid) AS low,
+                last(best_bid) AS close,
                 SUM(bids[2][1]) AS total_volume
             FROM market_data
             SAMPLE BY 1m
@@ -99,36 +99,28 @@ OWNED BY 'admin';
 
 
 
-
-
-
-select * from market_data_ohlc_1m where
-symbol = 'GBPUSD' AND timestamp in '2025-11-12'; --yesterday(); --yesterday();
-
-
-
-
-
+ select * from market_data_ohlc_1m where
+symbol = 'GBPUSD' AND timestamp in '$today';
 
 
 select * from market_data_ohlc_1m
-where timestamp in today()
+where timestamp in '$today'
 order by timestamp desc, symbol asc ;
 
 
 
-
-CREATE MATERIALIZED VIEW 'bbo_1s'
+-- TTL and cascading
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1s'
     WITH BASE 'market_data' REFRESH IMMEDIATE AS (
             SELECT timestamp, symbol,
-                last(bids[1][1]) AS bid,
-                last(asks[1][1]) AS ask
+                last(best_bid) AS bid,
+                last(best_ask) AS ask
             FROM market_data
             SAMPLE BY 1s
 ) PARTITION BY HOUR TTL 3 DAYS
 OWNED BY 'admin';
 
-CREATE MATERIALIZED VIEW 'bbo_1m'
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1m'
 WITH BASE 'bbo_1s' REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -139,7 +131,7 @@ WITH BASE 'bbo_1s' REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z'
 OWNED BY 'admin';
 
 
-CREATE MATERIALIZED VIEW 'bbo_1h'
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1h'
 WITH BASE 'bbo_1m' REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -150,24 +142,63 @@ WITH BASE 'bbo_1m' REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z
 OWNED BY 'admin';
 
 
+-- create view with overridable variables
+CREATE OR REPLACE VIEW single_pair AS (
+DECLARE
+  OVERRIDABLE @pair := 'EURUSD' ,
+  OVERRIDABLE @range := '$today'
+select * from market_data where timestamp in @range and symbol = @pair
+);
 
+
+
+SELECT * from single_pair;
+
+
+
+DECLARE
+  OVERRIDABLE @pair := 'GBPUSD' ,
+  OVERRIDABLE @range := '$now-10m..$now'
+  SELECT * from single_pair;
+
+
+
+-- Array dimensions
 select timestamp, symbol,
-    bids[1] as bprices, bids[2] as bsizes,
-    asks[1] as aprices, asks[2] as asizes
+    bids[1] as bprices, bids[2] as bsizes, array_count(bids[1]) as bid_levels,
+    asks[1] as aprices, asks[2] as asizes, array_count(asks[1]) as ask_levels
 from market_data latest by symbol;
 
 
 -- spread
 SELECT timestamp, symbol,
-    asks[1][1] - bids[1][1]
+    best_ask - best_bid
 FROM market_data
 where symbol IN ('GBPUSD', 'EURUSD')
-and timestamp in yesterday(); --today();
+and timestamp in '$today';
+
+-- spread
+SELECT timestamp, symbol,
+    asks[-1][1] - bids[-1][1]
+FROM market_data
+where symbol IN ('GBPUSD', 'EURUSD')
+and timestamp in '$today';
+
+-- moving averages
+select timestamp, symbol, best_bid as l1_bid_price,
+avg(best_bid) over (partition by symbol order by timestamp) as moving_l1_bid_price,
+
+bids[2,1] as l1_bid_volume, sum(bids[2,1]) over (partition by symbol order by timestamp) as moving_l1_bid_volume,
+ sum(bids[2,1]) over (order by timestamp) as moving_l1_total_bid_volume
+from market_data
+where timestamp in '$today'
+and symbol='GBPUSD'
+;
 
 
 -- basic anomaly detection. Ask further from average than a given multiple of stddev
 DECLARE
-    @l1_ask := asks[1,1],
+    @l1_ask := best_ask,
     @low_threshold := 1.9,
     @medium_threshold := 2.0,
     @high_threshold := 2.1
@@ -175,12 +206,12 @@ WITH s AS (
     SELECT avg(@l1_ask) as avg_ask, stddev(@l1_ask ) as stddev_ask
     FROM market_data
     where symbol IN ('GBPUSD')
-    and timestamp >= dateadd('h', -1, now())
+    and timestamp IN '$now-1h..$now'
 ), combined AS (
 SELECT timestamp, @l1_ask as l1_ask, avg_ask, stddev_ask, abs(l1_ask - avg_ask) as delta
 FROM market_data m CROSS JOIN s
 where m.symbol IN ('GBPUSD')
-and m.timestamp >= dateadd('h', -1, now())
+and m.timestamp IN '$now-1h..$now'
 )
 SELECT timestamp, l1_ask, avg_ask, delta,
     CASE
@@ -191,16 +222,6 @@ SELECT timestamp, l1_ask, avg_ask, delta,
  from combined where delta >= stddev_ask * @low_threshold;
 
 
-select timestamp, symbol, bids[1,1] as l1_bid_price,
-avg(bids[1,1]) over (partition by symbol order by timestamp) as moving_l1_bid_price,
-bids[2,1] as l1_bid_volume, sum(bids[2,1]) over (partition by symbol order by timestamp) as moving_l1_bid_volume,
- sum(bids[2,1]) over (order by timestamp) as moving_l1_total_bid_volume
-from market_data
-where timestamp in yesterday(); --today()
---and symbol='GBPUSD'
-;
-
--- select touch(select timestamp, bids from market_data where timestamp in yesterday());
 
 -- Volume is available within 1% of the best price?
 -- How much volume I can capture at a cheap price because of a relatively flat orderbook
@@ -214,13 +235,13 @@ DECLARE
 SELECT timestamp, asks,
      @relevant_volume_levels as volume_levels,
      array_sum(@relevant_volume_levels) as total_volume
-    FROM market_data where symbol = 'GBPUSD' limit -200 ;
+    FROM market_data where timestamp in '$today' AND symbol = 'GBPUSD';
 
 -- Equivalent query without declare. Volume is available within 1% of the best price?
 SELECT asks,
      asks[2, 1:insertion_point(asks[1], 1.01 * asks[1, 1])] volume_levels,
      array_sum(asks[2, 1:insertion_point(asks[1], 1.01 * asks[1, 1])]) total_volume
-    FROM market_data where symbol = 'GBPUSD' limit -100 ;
+    FROM market_data where timestamp in '$today' AND symbol = 'GBPUSD' ;
 
 -- What price level will a buy order for the given volume reach?
 WITH
@@ -228,7 +249,7 @@ WITH
     SELECT timestamp, symbol, asks,
         array_cum_sum(asks[2]) cum_volumes
     FROM market_data
-    where symbol = 'GBPUSD' and timestamp in today()),
+    where symbol = 'GBPUSD' and timestamp in '$today'),
     q2 AS (
     SELECT timestamp, symbol,
         asks, cum_volumes,
@@ -240,8 +261,99 @@ FROM q2;
 
 
 select * from core_price asof join market_data on symbol
-where core_price.symbol = 'GBPUSD'  and core_price.timestamp in '2025-11-12'; --yesterday(); --today();
+where core_price.symbol = 'GBPUSD'  and core_price.timestamp in '$today';
 
+select * from fx_trades asof join core_price on symbol asof join market_data on symbol
+where fx_trades.symbol = 'GBPUSD'  and fx_trades.timestamp in '$today';
+
+-- Use ASOF JOIN to pair each trade with the most recent order book snapshot, then calculate slippage in basis points
+SELECT
+    t.timestamp,
+    t.symbol,
+    t.ecn,
+    t.counterparty,
+    t.side,
+    t.passive,
+    t.price,
+    t.quantity,
+    m.best_bid,
+    m.best_ask,
+    (m.best_bid + m.best_ask) / 2 AS mid,
+    (m.best_ask - m.best_bid) AS spread,
+    CASE t.side
+        WHEN 'buy'  THEN (t.price - (m.best_bid + m.best_ask) / 2)
+                         / ((m.best_bid + m.best_ask) / 2) * 10000
+        WHEN 'sell' THEN ((m.best_bid + m.best_ask) / 2 - t.price)
+                         / ((m.best_bid + m.best_ask) / 2) * 10000
+    END AS slippage_bps,
+    CASE t.side
+        WHEN 'buy'  THEN (t.price - m.best_ask) / m.best_ask * 10000
+        WHEN 'sell' THEN (m.best_bid - t.price) / m.best_bid * 10000
+    END AS slippage_vs_tob_bps
+FROM fx_trades t
+ASOF JOIN market_data m ON (symbol)
+WHERE t.timestamp IN '$yesterday'
+ORDER BY t.timestamp;
+
+
+/* Find the minimum ask and maximum bid in
+the 10 seconds before and after each trade
+*/
+SELECT
+    t.symbol,
+    t.timestamp,
+    t.side,
+    t.price,
+    min(p.ask_price) AS min_ask,
+    max(p.bid_price) AS max_bid
+FROM fx_trades t
+WINDOW JOIN core_price p
+    ON (symbol)
+    RANGE BETWEEN 10 seconds PRECEDING AND 10 seconds FOLLOWING
+    EXCLUDE PREVAILING
+WHERE t.timestamp IN '$today';
+
+-- fixed horizons
+SELECT
+    t.symbol,
+    t.counterparty,
+    h.offset / 1000000000 AS horizon_sec,
+    count() AS n,
+    avg(((m.best_bid + m.best_ask) / 2 - t.price) / t.price * 10000) AS avg_markout_bps,
+    sum(t.quantity) AS total_volume
+FROM fx_trades t
+HORIZON JOIN market_data m ON (symbol)
+    LIST (0, 1s, 5s, 10s,
+          30s, 1m, 5m) AS h
+WHERE t.side = 'buy'
+    AND t.timestamp IN '$yesterday'
+GROUP BY t.symbol, t.counterparty, horizon_sec
+ORDER BY t.symbol, t.counterparty, horizon_sec;
+
+
+
+-- horizon at 30s for 10 minutes
+SELECT
+    t.symbol,
+    h.offset / 1000000000 AS horizon_sec,
+    count() AS n,
+    avg(((m.best_bid + m.best_ask) / 2 - t.price) / t.price * 10000) AS avg_markout_bps,
+    sum(((m.best_bid + m.best_ask) / 2 - t.price) * t.quantity) AS total_pnl
+FROM fx_trades t
+HORIZON JOIN market_data m ON (symbol)
+    RANGE FROM 0s TO 10m STEP 30s AS h
+WHERE t.side = 'buy'
+  AND t.timestamp IN '$yesterday'
+GROUP BY t.symbol, horizon_sec
+ORDER BY t.symbol, horizon_sec;
+
+
+--------------------------------------------
+-- demo end --
+--------------------------------------------------
+
+
+-- just another asof join
 
 with p as (
         select * from core_price
@@ -253,182 +365,26 @@ select bids[1][insertion_point(bids[2], bid_volume)],
         insertion_point(bids[2], bid_volume), *
 from p asof join market_data on symbol TOLERANCE 1s;
 
-
-
-
-
-
 select * from _query_trace;
 
 --------------------------------------------
 -- demo end --
 --------------------------------------------------
 
-wal_tables();
-materialized_views();
-
-table_partitions('market_data') where name like '2025-07-09%';
-select view_name, base_table_name, view_status, last_refresh_start_timestamp,last_refresh_finish_timestamp,refresh_base_table_txn, base_table_txn from materialized_views() order by view_status;
-
-select * from (table_storage()) order by tableName;
-
-(show parameters) where value_source <> 'default';
-
-show partitions from market_data;
-table_partitions('market_data');
-
-wal_tables() where name ilike '%core%' or name ilike '%bbo%' or name ilike '%market%';
+-- select touch(select timestamp, bids from market_data where timestamp in yesterday());
 
 
----- XXX
+--wal_tables();
+--materialized_views();
 
---alter table market_data convert partition to parquet where timestamp < '2025-08-08';
+--table_partitions('market_data') where name like '2025-07-09%';
+--select view_name, base_table_name, view_status, last_refresh_start_timestamp,last_refresh_finish_timestamp,refresh_base_table_txn, base_table_txn from materialized_views() order by view_status;
 
+--select * from (table_storage()) order by tableName;
 
+--(show parameters) where value_source <> 'default';
 
--- refresh materialized view bbo_1s full;
--- refresh materialized view bbo_1m full;
--- refresh materialized view bbo_1h full;
--- refresh materialized view bbo_1d full;
--- refresh materialized view core_price_1s full;
--- refresh materialized view core_price_1d full;
--- refresh materialized view market_data_ohlc_1m full;
--- refresh materialized view market_data_ohlc_15m full;
--- refresh materialized view market_data_ohlc_1d full;
+--show partitions from market_data;
+--table_partitions('market_data');
 
-
---drop table market_data;
---drop table core_price;
---drop materialized view bbo_1s;
---drop materialized view bbo_1m;
---drop materialized view bbo_1h;
---drop materialized view bbo_1d;
---drop materialized view core_price_1s;
---drop materialized view core_price_1d;
---drop materialized view market_data_ohlc_1m;
---drop materialized view market_data_ohlc_15m;
---drop materialized view market_data_ohlc_1d;
-
---alter table market_data squash partitions;
---alter table core_price squash partitions;
-
---alter table market_data drop partition where timestamp >= '2025-07-11';
---alter table core_price drop partition where timestamp >= '2025-07-11';
-
---alter table market_data set type bypass wal;
---alter table market_data set type  wal;
---alter table core_price set type bypass wal;
---alter table core_price set type  wal;
-
-
-
---rename table core_price to ORIG_core_price;
---rename table market_data to ORIG_market_data;
---create TABLE market_data(like ORIG_market_data);
---create TABLE core_price(like ORIG_core_price);
-
---INSERT BATCH 100_000_000 INTO core_price
---SELECT dateadd('d',7,timestamp) as timestamp, symbol, ecn, bid_price, bid_volume, ask_price, ask_volume, reason, indicator1, indicator2 from ORIG_core_price;
-
-
---INSERT BATCH 100_000_000 INTO market_data
---SELECT dateadd('d',7,timestamp) as timestamp, symbol, bids, asks from ORIG_market_data;
-
-
---rename table ORIG_core_price to core_price;
---rename table ORIG_market_data to market_data;
-
--- SELECT touch(SELECT * from market_data where timestamp in '2025-07-04');
-
--- SELECT *, transpose(bids) from market_data where timestamp in '2025-07-04';
-
-
-
-/**
-CREATE MATERIALIZED VIEW IF NOT EXISTS core_price_1s AS (
-        SELECT
-            timestamp,
-            symbol,
-            first((bid_price + ask_price) / 2) AS open_mid,
-            max((bid_price + ask_price) / 2) AS high_mid,
-            min((bid_price + ask_price) / 2) AS low_mid,
-            last((bid_price + ask_price) / 2) AS close_mid,
-            last(ask_price) - last(bid_price) AS last_spread,
-            max(bid_price) AS max_bid,
-            min(bid_price) AS min_bid,
-            avg(bid_price) AS avg_bid,
-            max(ask_price) AS max_ask,
-            min(ask_price) AS min_ask,
-            avg(ask_price) AS avg_ask
-        FROM core_price
-        SAMPLE BY 1s
-    ) PARTITION BY HOUR TTL 4 HOURS;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS bbo_1s AS (
-        select timestamp, symbol,
-            last(bids[1][1]) as bid,
-            last(asks[1][1]) as ask
-        from market_data
-        sample by 1s
-    ) PARTITION BY HOUR;
-
- CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_15m AS (
-        select timestamp, symbol,
-            first((bids[1][1]+asks[1][1])/2) as open,
-            max((bids[1][1]+asks[1][1])/2) as high,
-            min((bids[1][1]+asks[1][1])/2) as low,
-            last((bids[1][1]+asks[1][1])/2) as close
-        from market_data
-        sample by 15m
-
-    ) PARTITION BY HOUR TTL 2 DAYS;
-
-select timestamp, symbol,
-            first((bids[1][1]+asks[1][1])/2) as open,
-            max((bids[1][1]+asks[1][1])/2) as high,
-            min((bids[1][1]+asks[1][1])/2) as low,
-            last((bids[1][1]+asks[1][1])/2) as close
-        from market_data
-        where timestamp in '2025-07-03'
-        sample by 15m;
-
-explain select timestamp,
-            first(bids[1][1]) as open,
-            max(bids[1][1]) as high,
-            min(bids[1][1]) as low,
-            last(bids[1][1]) as close
-        from market_data
-        where timestamp in '2025-07-02' and symbol = 'GBPJPY'
-        sample by 15m;
-
-
-
-
-
-     CREATE MATERIALIZED VIEW IF NOT EXISTS market_data_ohlc_1d REFRESH START '2025-06-01T00:00:00.000000Z' EVERY 1h AS (
-        select timestamp, symbol,
-            first(open) as open,
-            max(high) as high,
-            min(low) as low,
-            last(close) as close
-        from market_data_ohlc_15m
-        sample by 1d
-    ) PARTITION BY DAY;
-
-select * from core_price;
-
-
-CREATE MATERIALIZED VIEW 'market_data_ohlc_1d' WITH BASE 'market_data_ohlc_15m' REFRESH INCREMENTAL AS (
-
-            SELECT timestamp, symbol,
-                first(open) AS open,
-                max(high) AS high,
-                min(low) AS low,
-                last(close) AS close
-            FROM market_data_ohlc_15m
-            SAMPLE BY 1d
-
-) PARTITION BY MONTH
-OWNED BY 'admin';
-
-**/
+--wal_tables() where name ilike '%core%' or name ilike '%bbo%' or name ilike '%market%';
