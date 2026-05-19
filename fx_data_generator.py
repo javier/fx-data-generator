@@ -367,40 +367,40 @@ def ensure_tables_exist(args, suffix):
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
-            timestamp TIMESTAMP,
-            symbol SYMBOL CAPACITY 15000,
-            bids DOUBLE[][],
-            asks DOUBLE[][],
-            best_bid DOUBLE,
-            best_ask DOUBLE
+            timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            bids DOUBLE[][] PARQUET(default, zstd(4)),
+            asks DOUBLE[][] PARQUET(default, zstd(4)),
+            best_bid DOUBLE PARQUET(default, zstd(4)),
+            best_ask DOUBLE PARQUET(default, zstd(4))
         ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
         """)
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('core_price', suffix)} (
-            timestamp TIMESTAMP,
-            symbol SYMBOL CAPACITY 15000,
-            ecn SYMBOL,
-            bid_price DOUBLE,
-            bid_volume LONG,
-            ask_price DOUBLE,
-            ask_volume LONG,
-            reason SYMBOL,
-            indicator1 DOUBLE,
-            indicator2 DOUBLE
+            timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            ecn SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            bid_price DOUBLE PARQUET(default, zstd(4)),
+            bid_volume LONG PARQUET(default, zstd(4)),
+            ask_price DOUBLE PARQUET(default, zstd(4)),
+            ask_volume LONG PARQUET(default, zstd(4)),
+            reason SYMBOL PARQUET(rle_dictionary, zstd(4)),
+            indicator1 DOUBLE PARQUET(default, zstd(4)),
+            indicator2 DOUBLE PARQUET(default, zstd(4))
         ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
         """)
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('fx_trades', suffix)} (
-            timestamp TIMESTAMP_NS,
-            symbol SYMBOL CAPACITY 15000,
-            ecn SYMBOL,
-            trade_id UUID,
-            side SYMBOL,
-            passive BOOLEAN,
-            price DOUBLE,
-            quantity DOUBLE,
-            counterparty SYMBOL,
-            order_id UUID
+            timestamp TIMESTAMP_NS PARQUET(delta_binary_packed, zstd(4)),
+            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            ecn SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            trade_id UUID PARQUET(default, zstd(4)),
+            side SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            passive BOOLEAN PARQUET(default, zstd(4)),
+            price DOUBLE PARQUET(default, zstd(4)),
+            quantity DOUBLE PARQUET(default, zstd(4)),
+            counterparty SYMBOL PARQUET(rle_dictionary, zstd(4)),
+            order_id UUID PARQUET(default, zstd(4))
         ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '1 MONTH', TABLE_ENTERPRISE_POLICY)} DEDUP UPSERT KEYS(timestamp, trade_id);
         """)
 
