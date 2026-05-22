@@ -349,52 +349,66 @@ def get_latest_timestamp_ns(conn, table):
     else:
         return None
 
+def retention_clause(short_ttl, enterprise, oss_ttl, enterprise_policy):
+    if not short_ttl:
+        return ''
+    if enterprise:
+        return f'STORAGE POLICY({enterprise_policy})'
+    return f'TTL {oss_ttl}'
+
+
+TABLE_ENTERPRISE_POLICY = 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 3 months'
+
+
 def ensure_tables_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     short_ttl = args.short_ttl
+    enterprise = args.enterprise
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
-            timestamp TIMESTAMP,
-            symbol SYMBOL CAPACITY 15000,
-            bids DOUBLE[][],
-            asks DOUBLE[][],
-            best_bid DOUBLE,
-            best_ask DOUBLE
-        ) timestamp(timestamp) PARTITION BY HOUR {'TTL 3 DAYS' if short_ttl else ''};
+            timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            bids DOUBLE[][] PARQUET(default, zstd(4)),
+            asks DOUBLE[][] PARQUET(default, zstd(4)),
+            best_bid DOUBLE PARQUET(default, zstd(4)),
+            best_ask DOUBLE PARQUET(default, zstd(4))
+        ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
         """)
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('core_price', suffix)} (
-            timestamp TIMESTAMP,
-            symbol SYMBOL CAPACITY 15000,
-            ecn SYMBOL,
-            bid_price DOUBLE,
-            bid_volume LONG,
-            ask_price DOUBLE,
-            ask_volume LONG,
-            reason SYMBOL,
-            indicator1 DOUBLE,
-            indicator2 DOUBLE
-        ) timestamp(timestamp) PARTITION BY HOUR {'TTL 3 DAYS' if short_ttl else ''};
+            timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            ecn SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            bid_price DOUBLE PARQUET(default, zstd(4)),
+            bid_volume LONG PARQUET(default, zstd(4)),
+            ask_price DOUBLE PARQUET(default, zstd(4)),
+            ask_volume LONG PARQUET(default, zstd(4)),
+            reason SYMBOL PARQUET(rle_dictionary, zstd(4)),
+            indicator1 DOUBLE PARQUET(default, zstd(4)),
+            indicator2 DOUBLE PARQUET(default, zstd(4))
+        ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
         """)
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('fx_trades', suffix)} (
-            timestamp TIMESTAMP_NS,
-            symbol SYMBOL CAPACITY 15000,
-            ecn SYMBOL,
-            trade_id UUID,
-            side SYMBOL,
-            passive BOOLEAN,
-            price DOUBLE,
-            quantity DOUBLE,
-            counterparty SYMBOL,
-            order_id UUID
-        ) timestamp(timestamp) PARTITION BY HOUR {'TTL 1 MONTH' if short_ttl else ''} DEDUP UPSERT KEYS(timestamp, trade_id);
+            timestamp TIMESTAMP_NS PARQUET(delta_binary_packed, zstd(4)),
+            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            ecn SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            trade_id UUID PARQUET(default, zstd(4)),
+            side SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+            passive BOOLEAN PARQUET(default, zstd(4)),
+            price DOUBLE PARQUET(default, zstd(4)),
+            quantity DOUBLE PARQUET(default, zstd(4)),
+            counterparty SYMBOL PARQUET(rle_dictionary, zstd(4)),
+            order_id UUID PARQUET(default, zstd(4))
+        ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '1 MONTH', TABLE_ENTERPRISE_POLICY)} DEDUP UPSERT KEYS(timestamp, trade_id);
         """)
 
 def ensure_materialized_views_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     short_ttl = args.short_ttl
+    enterprise = args.enterprise
+    rc = lambda oss_ttl, ep: retention_clause(short_ttl, enterprise, oss_ttl, ep)
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1s', suffix)}  AS (
@@ -412,7 +426,7 @@ def ensure_materialized_views_exist(args, suffix):
                 avg(ask_price) AS avg_ask
             FROM {table_name('core_price', suffix)}
             SAMPLE BY 1s
-        ) PARTITION BY HOUR TTL 4 HOURS;
+        ) PARTITION BY HOUR {rc('4 HOURS', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
         """)
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
@@ -430,7 +444,7 @@ def ensure_materialized_views_exist(args, suffix):
                 avg(ask_price) AS avg_ask
             FROM {table_name('core_price', suffix)}
             SAMPLE BY 1d
-        ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
         """)
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1s', suffix)} AS (
@@ -439,7 +453,7 @@ def ensure_materialized_views_exist(args, suffix):
                 last(best_ask) AS ask
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1s
-        ) PARTITION BY HOUR  {'TTL 3 DAYS' if short_ttl else ''};
+        ) PARTITION BY HOUR {rc('3 DAYS', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -449,7 +463,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM {table_name('bbo_1s', suffix)}
             SAMPLE BY 1m
-        ) PARTITION BY DAY {'TTL 3 DAYS' if short_ttl else ''};
+        ) PARTITION BY DAY {rc('3 DAYS', 'TO parquet 1 day, DROP NATIVE 7 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -459,7 +473,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM  {table_name('bbo_1m', suffix)}
             SAMPLE BY 1h
-        ) PARTITION BY MONTH {'TTL 1 MONTH' if short_ttl else ''};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -469,7 +483,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM {table_name('bbo_1h', suffix)}
             SAMPLE BY 1d
-        ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -482,7 +496,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1m
-        ) PARTITION BY HOUR {'TTL 1 DAY' if short_ttl else ''};
+        ) PARTITION BY HOUR {rc('1 DAY', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -496,7 +510,7 @@ def ensure_materialized_views_exist(args, suffix):
 
             FROM {table_name('market_data_ohlc_1m', suffix)}
             SAMPLE BY 15m
-        ) PARTITION BY HOUR {'TTL 2 DAYS' if short_ttl else ''};
+        ) PARTITION BY HOUR {rc('2 DAYS', 'TO parquet 1 days, DROP NATIVE 7 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -509,7 +523,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1d
-        ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -522,7 +536,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(quantity) AS total_volume
             FROM {table_name('fx_trades', suffix)}
             SAMPLE BY 1m
-        ) PARTITION BY HOUR {'TTL 2 DAYS' if short_ttl else ''};
+        ) PARTITION BY HOUR {rc('2 DAYS', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -535,7 +549,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(total_volume) AS total_volume
             FROM {table_name('fx_trades_ohlc_1m', suffix)}
             SAMPLE BY 1d
-       ) PARTITION BY MONTH  {'TTL 1 MONTH' if short_ttl else ''};
+       ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
         """)
 
 
@@ -1096,6 +1110,7 @@ def main():
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)
     parser.add_argument("--create_views", type=lambda x: str(x).lower() != 'false', default=True)
     parser.add_argument("--short_ttl", type=lambda x: str(x).lower() == 'true', default=False)
+    parser.add_argument("--enterprise", type=lambda x: str(x).lower() == 'true', default=False)
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--yahoo_refresh_secs", type=int, default=300)
     parser.add_argument("--orders_min_per_sec", type=int, default=5)
