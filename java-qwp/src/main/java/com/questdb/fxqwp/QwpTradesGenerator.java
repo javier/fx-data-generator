@@ -5,13 +5,17 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -20,9 +24,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Single-worker synthetic FX trade generator that ingests into QuestDB over QWP
- * (WebSocket), with HA failover across a fleet of hosts that share one credential
- * set and one TLS setting.
+ * Synthetic FX trade generator that ingests into QuestDB over QWP (WebSocket),
+ * with HA failover across a fleet of hosts that share one credential set and one
+ * TLS setting.
  *
  * <p>This is the simplified, trades-only sibling of the Python FX data generator.
  * It produces rows for a single {@code qwp_trades} table whose schema is identical
@@ -33,6 +37,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * pair's mid follows a controlled pip random walk inside a Yahoo-anchored bracket,
  * and trades within a second are interpolated between the open and close states so
  * {@code close(t) == open(t+1)} holds across seconds.
+ *
+ * <p><b>Parallelism.</b> {@code --processes N} runs N worker threads (Java has no
+ * GIL, so threads, not OS processes). Symbols are split across workers by a
+ * popularity "snake draft" from both ends of the liquidity ranking: pick k goes to
+ * worker {@code k % N} and takes one symbol from the most-popular end and one from
+ * the least-popular end, so each worker gets a balanced mix. A worker owns its
+ * symbols end-to-end (own state, own {@link Sender}), so per-symbol price
+ * continuity is preserved and no two workers ever touch the same symbol. The global
+ * {@code --total_market_data_events} cap is shared via an atomic counter. A
+ * Python-style WAL monitor pauses all workers when the table's sequencer gets ahead
+ * of the writer, and resumes when it has caught up.
  */
 public final class QwpTradesGenerator {
 
@@ -45,15 +60,17 @@ public final class QwpTradesGenerator {
     private final List<FxPair> pairs = FxUniverse.defaultPairs();
     private final String[] leiPool;
 
-    // Per-pair price state, indexed in lockstep with `pairs`.
+    // Shared per-pair price state, indexed in lockstep with `pairs`. Each worker
+    // only reads/writes the indices it owns, so the disjoint partition makes this
+    // safe without locking. The Yahoo refresher only touches FxPair.low/high (volatile).
     private final double[] mids;
     private final int[] spreadPips;
-    // Cumulative liquidity weights for symbol selection (weight = 11 - rank).
-    private final int[] cumWeights;
-    private final int totalWeight;
+    private final int totalAllWeight; // sum of (11 - rank) across all pairs
 
     private final AtomicBoolean running = new AtomicBoolean(true);
-    private long emitted = 0;
+    private final AtomicBoolean paused = new AtomicBoolean(false);
+    private final AtomicLong emitted = new AtomicLong(0);
+    private final AtomicLong lastReport = new AtomicLong(0);
 
     private QwpTradesGenerator(Cli cfg) {
         this.cfg = cfg;
@@ -61,16 +78,14 @@ public final class QwpTradesGenerator {
         int n = pairs.size();
         this.mids = new double[n];
         this.spreadPips = new int[n];
-        this.cumWeights = new int[n];
         int acc = 0;
         for (int i = 0; i < n; i++) {
             FxPair p = pairs.get(i);
             this.mids[i] = FxUniverse.quantizeToPip(p.midOfBracket(), p.pip, p.precision);
             this.spreadPips[i] = 4; // start at 4 pips, like load_initial_state_from_brackets
             acc += (11 - p.rank);
-            this.cumWeights[i] = acc;
         }
-        this.totalWeight = acc;
+        this.totalAllWeight = acc;
     }
 
     public static void main(String[] args) throws Exception {
@@ -86,14 +101,14 @@ public final class QwpTradesGenerator {
 
     private void run() throws Exception {
         System.out.println("=== qwp-fx-trades generator ===");
-        System.out.printf("mode=%s  hosts=%s  tls=%s  table=%s%n",
-                cfg.mode, cfg.hosts, cfg.tls, cfg.tableName());
+        System.out.printf("mode=%s  hosts=%s  tls=%s  table=%s  processes=%d%n",
+                cfg.mode, cfg.hosts, cfg.tls, cfg.tableName(), cfg.processes);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> running.set(false)));
 
-        // 1) Reference data. Incremental continues from the last stored prices
-        // (and skips Yahoo, like the Python --incremental path); otherwise we anchor
-        // brackets on live Yahoo mids (unless --no-yahoo) and start at the bracket mid.
+        // 1) Reference data. Incremental continues from the last stored prices (and
+        // skips Yahoo, like the Python --incremental path); otherwise we anchor
+        // brackets on live Yahoo mids (unless --no_yahoo) and start at the bracket mid.
         if (cfg.incremental) {
             seedStateFromDb();
         } else {
@@ -113,130 +128,268 @@ public final class QwpTradesGenerator {
         long startNs = resolveStartNanos();
         Long endNs = cfg.endTs == null ? null : isoToNanos(cfg.endTs);
         if (endNs != null && endNs <= startNs) {
-            System.err.printf("[ERROR] --end-ts (%s) is not after the start point (%s). Aborting.%n",
+            System.err.printf("[ERROR] --end_ts (%s) is not after the start point (%s). Aborting.%n",
                     cfg.endTs, Instant.ofEpochSecond(0, startNs));
             return;
         }
 
-        // 4) Build the HA sender and ingest.
-        // Timing spans the ingest loop + final flush only (the flush blocks on the
-        // server ack), so the reported rate is end-to-end client->server throughput,
-        // excluding JVM startup, Yahoo, and DDL.
+        // 4) Partition symbols across workers, then run the worker fleet.
+        List<List<Integer>> assignment = snakeDraft(cfg.processes);
+        logAssignment(assignment);
+
+        Thread walMonitor = startWalMonitor();
+        boolean realtime = "real-time".equals(cfg.mode);
+        Thread yahooRefresher = (realtime && !cfg.noYahoo && !cfg.incremental)
+                ? startYahooRefresher() : null;
+
+        long wallStartMs = System.currentTimeMillis();
         long t0 = System.nanoTime();
-        try (Sender sender = buildSender()) {
-            if ("real-time".equals(cfg.mode)) {
-                runRealTime(sender, startNs, endNs);
-            } else {
-                runFasterThanLife(sender, startNs, endNs);
-            }
-            sender.flush();
+
+        List<Thread> workers = new ArrayList<>();
+        for (int w = 0; w < cfg.processes; w++) {
+            Thread th = new Thread(new Worker(w, assignment.get(w), startNs, endNs, wallStartMs),
+                    "qwp-worker-" + w);
+            workers.add(th);
+            th.start();
         }
+        for (Thread th : workers) {
+            th.join();
+        }
+
+        // Stop the background helpers and wrap up.
+        running.set(false);
+        if (yahooRefresher != null) {
+            yahooRefresher.interrupt();
+        }
+        if (walMonitor != null) {
+            walMonitor.join(2000);
+        }
+
         double secs = (System.nanoTime() - t0) / 1e9;
-        System.out.printf("[DONE] emitted %d trades in %.2fs = %,.0f trades/sec.%n",
-                emitted, secs, secs > 0 ? emitted / secs : 0.0);
+        long total = emitted.get();
+        System.out.printf("[DONE] emitted %d trades in %.2fs = %,.0f trades/sec (%d workers).%n",
+                total, secs, secs > 0 ? total / secs : 0.0, cfg.processes);
     }
 
-    // ---------------------------------------------------------------- ingest loops
+    // ---------------------------------------------------------------- worker fleet
 
-    private void runRealTime(Sender sender, long startNs, Long endNs) throws InterruptedException {
-        System.out.println("[INFO] real-time mode: wall-clock aligned, Ctrl+C to stop.");
-        long lastYahoo = System.currentTimeMillis();
-        long wallStart = System.currentTimeMillis();
-        long secIdx = 0;
+    /**
+     * Split pair indices across {@code p} workers via a popularity snake draft from
+     * both ends. Pick k (worker {@code k % p}) takes the next most-popular and the
+     * next least-popular symbol, balancing trade-weight load across workers.
+     */
+    private List<List<Integer>> snakeDraft(int p) {
+        int n = pairs.size();
+        Integer[] order = new Integer[n];
+        for (int i = 0; i < n; i++) {
+            order[i] = i;
+        }
+        // Most popular first: lower rank first, ties keep original order.
+        Arrays.sort(order, Comparator.comparingInt((Integer i) -> pairs.get(i).rank)
+                .thenComparingInt(i -> i));
 
-        // Align the data clock to the start point, then advance one second per wall second.
-        long secondStartNs = alignToSecond(startNs);
+        List<List<Integer>> res = new ArrayList<>();
+        for (int w = 0; w < p; w++) {
+            res.add(new ArrayList<>());
+        }
+        int top = 0, bottom = n - 1, k = 0;
+        while (top <= bottom) {
+            List<Integer> bucket = res.get(k % p);
+            bucket.add(order[top++]);          // most-popular end
+            if (top <= bottom) {
+                bucket.add(order[bottom--]);   // least-popular end
+            }
+            k++;
+        }
+        return res;
+    }
 
-        while (running.get() && !budgetReached() && !pastEnd(secondStartNs, endNs)) {
-            int nTrades = ThreadLocalRandom.current().nextInt(cfg.tradesMinPerSec, cfg.tradesMaxPerSec + 1);
-            emitSecond(sender, secondStartNs, nTrades, endNs, 7.0);
-            sender.flush();
+    private void logAssignment(List<List<Integer>> assignment) {
+        if (cfg.processes == 1) {
+            return;
+        }
+        for (int w = 0; w < assignment.size(); w++) {
+            StringBuilder sb = new StringBuilder();
+            for (int idx : assignment.get(w)) {
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append(pairs.get(idx).symbol);
+            }
+            System.out.printf("[INFO] worker %d owns %d symbols: %s%n",
+                    w, assignment.get(w).size(), sb);
+        }
+    }
 
-            // Periodic Yahoo refresh without blocking the data clock for long.
-            if (!cfg.noYahoo && (System.currentTimeMillis() - lastYahoo) >= cfg.yahooRefreshSecs * 1000L) {
-                new YahooFinance().refreshBrackets(pairs, 1.0);
-                lastYahoo = System.currentTimeMillis();
+    /** One ingest worker thread: owns a disjoint symbol set and its own QWP sender. */
+    private final class Worker implements Runnable {
+        private final int id;
+        private final int[] owned;       // global pair indices this worker owns
+        private final int[] cumW;        // cumulative weights over owned
+        private final int totalW;
+        private final int wMin;          // per-second trade floor for this worker
+        private final int wMax;          // per-second trade ceiling for this worker
+        private final long startNs;
+        private final Long endNs;
+        private final long wallStartMs;
+        // reusable per-second buffers (indexed by position within `owned`)
+        private final double[] oMid;
+        private final double[] cMid;
+        private final int[] oSp;
+        private final int[] cSp;
+        private boolean stop = false;
+
+        Worker(int id, List<Integer> ownedList, long startNs, Long endNs, long wallStartMs) {
+            this.id = id;
+            this.startNs = startNs;
+            this.endNs = endNs;
+            this.wallStartMs = wallStartMs;
+            this.owned = ownedList.stream().mapToInt(Integer::intValue).toArray();
+            this.cumW = new int[owned.length];
+            int acc = 0;
+            for (int j = 0; j < owned.length; j++) {
+                acc += (11 - pairs.get(owned[j]).rank);
+                cumW[j] = acc;
+            }
+            this.totalW = acc;
+            // This worker's slice of the global per-second throughput, by weight share.
+            double share = totalAllWeight > 0 ? (double) totalW / totalAllWeight : 1.0;
+            this.wMin = Math.max(1, (int) Math.round(cfg.tradesMinPerSec * share));
+            this.wMax = Math.max(wMin, (int) Math.round(cfg.tradesMaxPerSec * share));
+            this.oMid = new double[owned.length];
+            this.cMid = new double[owned.length];
+            this.oSp = new int[owned.length];
+            this.cSp = new int[owned.length];
+        }
+
+        @Override
+        public void run() {
+            try (Sender sender = buildSender(id)) {
+                boolean realtime = "real-time".equals(cfg.mode);
+                long secondStartNs = alignToSecond(startNs);
+                long secIdx = 0;
+                while (running.get() && !stop && !budgetReached() && !pastEnd(secondStartNs, endNs)) {
+                    waitWhilePaused();
+                    if (!running.get()) {
+                        break;
+                    }
+                    int n = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
+                    emitSecond(sender, secondStartNs, n, realtime ? 7.0 : 5.0);
+                    secondStartNs += NANOS_PER_SEC;
+
+                    if (realtime) {
+                        sender.flush();
+                        secIdx++;
+                        long sleepMs = (wallStartMs + secIdx * 1000L) - System.currentTimeMillis();
+                        if (sleepMs > 0) {
+                            Thread.sleep(sleepMs);
+                        }
+                    } else if (id == 0) {
+                        reportProgress(secondStartNs);
+                    }
+                }
+                sender.flush();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                System.err.printf("[worker %d] FATAL: %s%n", id, e.getMessage());
+            }
+        }
+
+        private void emitSecond(Sender sender, long secondStartNs, int nTrades, double driftPips) {
+            for (int j = 0; j < owned.length; j++) {
+                int idx = owned[j];
+                FxPair p = pairs.get(idx);
+                oMid[j] = mids[idx];
+                oSp[j] = spreadPips[idx];
+                cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips);
+                cSp[j] = FxUniverse.evolveSpreadPips(oSp[j]);
             }
 
-            secIdx++;
-            secondStartNs += NANOS_PER_SEC;
+            long[] offsets = new long[nTrades];
+            for (int k = 0; k < nTrades; k++) {
+                offsets[k] = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
+            }
+            Arrays.sort(offsets);
 
-            // Sleep until the next wall-clock second boundary.
-            long nextTickMs = wallStart + secIdx * 1000L;
-            long sleepMs = nextTickMs - System.currentTimeMillis();
-            if (sleepMs > 0) {
-                Thread.sleep(sleepMs);
+            for (long offset : offsets) {
+                long ts = secondStartNs + offset;
+                if (endNs != null && ts >= endNs) {
+                    break;
+                }
+                if (!claimSlot()) {
+                    stop = true;
+                    break;
+                }
+                int j = pickOwned();
+                int idx = owned[j];
+                FxPair p = pairs.get(idx);
+                double f = (double) offset / NANOS_PER_SEC;
+                double mid = FxUniverse.quantizeToPip(oMid[j] + (cMid[j] - oMid[j]) * f, p.pip, p.precision);
+                int sp = (int) Math.round(oSp[j] + (cSp[j] - oSp[j]) * f);
+                sp = Math.max(1, Math.min(8, sp));
+                double bid = FxUniverse.quantizeToPip(mid - sp * p.pip / 2.0, p.pip, p.precision);
+                double ask = FxUniverse.quantizeToPip(mid + sp * p.pip / 2.0, p.pip, p.precision);
+                emitTrade(sender, ts, p, bid, ask);
+            }
+
+            // Carry close state forward as the next second's open state (per owned symbol).
+            for (int j = 0; j < owned.length; j++) {
+                mids[owned[j]] = cMid[j];
+                spreadPips[owned[j]] = cSp[j];
+            }
+        }
+
+        private int pickOwned() {
+            int r = ThreadLocalRandom.current().nextInt(totalW);
+            for (int j = 0; j < cumW.length; j++) {
+                if (r < cumW[j]) {
+                    return j;
+                }
+            }
+            return cumW.length - 1;
+        }
+
+        private void waitWhilePaused() throws InterruptedException {
+            while (paused.get() && running.get()) {
+                Thread.sleep(5000);
             }
         }
     }
 
-    private void runFasterThanLife(Sender sender, long startNs, Long endNs) {
-        System.out.println("[INFO] faster-than-life mode: no wall-clock wait, bounded by --total-trades/--end-ts.");
-        long secondStartNs = alignToSecond(startNs);
-        long lastReport = 0;
-
-        while (running.get() && !budgetReached() && !pastEnd(secondStartNs, endNs)) {
-            int nTrades = ThreadLocalRandom.current().nextInt(cfg.tradesMinPerSec, cfg.tradesMaxPerSec + 1);
-            emitSecond(sender, secondStartNs, nTrades, endNs, 5.0);
-            secondStartNs += NANOS_PER_SEC;
-
-            if (emitted - lastReport >= 100_000) {
-                System.out.printf("[ft-life] %d trades emitted (data clock %s)%n",
-                        emitted, Instant.ofEpochSecond(0, secondStartNs));
-                lastReport = emitted;
-            }
+    private void reportProgress(long secondStartNs) {
+        long e = emitted.get();
+        if (e - lastReport.get() >= 1_000_000) {
+            lastReport.set(e);
+            System.out.printf("[ft-life] %d trades emitted (data clock %s)%n",
+                    e, Instant.ofEpochSecond(0, secondStartNs));
         }
     }
 
     /**
-     * Generate and emit one second's worth of trades. The mid is interpolated
-     * between the open state (start of second) and the evolved close state, so the
-     * series stays continuous across the second boundary.
+     * Claim one slot against the global total. Returns false once the cap is hit so
+     * the calling worker stops. The decrement keeps the final emitted count exact
+     * even with multiple workers racing.
      */
-    private void emitSecond(Sender sender, long secondStartNs, int nTrades, Long endNs, double driftPips) {
-        int n = pairs.size();
-        double[] openMid = Arrays.copyOf(mids, n);
-        int[] openSp = Arrays.copyOf(spreadPips, n);
-        double[] closeMid = new double[n];
-        int[] closeSp = new int[n];
-        for (int i = 0; i < n; i++) {
-            closeMid[i] = FxUniverse.evolveMid(openMid[i], pairs.get(i), driftPips);
-            closeSp[i] = FxUniverse.evolveSpreadPips(openSp[i]);
+    private boolean claimSlot() {
+        if (cfg.totalTrades <= 0) {
+            emitted.incrementAndGet();
+            return true;
         }
-
-        // Trade offsets within the second, sorted so timestamps ascend.
-        long[] offsets = new long[nTrades];
-        for (int k = 0; k < nTrades; k++) {
-            offsets[k] = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
+        long s = emitted.getAndIncrement();
+        if (s >= cfg.totalTrades) {
+            emitted.decrementAndGet();
+            return false;
         }
-        Arrays.sort(offsets);
+        return true;
+    }
 
-        for (long offset : offsets) {
-            long ts = secondStartNs + offset;
-            if (endNs != null && ts >= endNs) {
-                break;
-            }
-            if (budgetReached()) {
-                break;
-            }
-            int idx = pickPairIndex();
-            FxPair p = pairs.get(idx);
-            double f = (double) offset / NANOS_PER_SEC;
+    private boolean budgetReached() {
+        return cfg.totalTrades > 0 && emitted.get() >= cfg.totalTrades;
+    }
 
-            double mid = FxUniverse.quantizeToPip(openMid[idx] + (closeMid[idx] - openMid[idx]) * f,
-                    p.pip, p.precision);
-            int sp = (int) Math.round(openSp[idx] + (closeSp[idx] - openSp[idx]) * f);
-            sp = Math.max(1, Math.min(8, sp));
-            double bid = FxUniverse.quantizeToPip(mid - sp * p.pip / 2.0, p.pip, p.precision);
-            double ask = FxUniverse.quantizeToPip(mid + sp * p.pip / 2.0, p.pip, p.precision);
-
-            emitTrade(sender, ts, p, bid, ask);
-            emitted++;
-        }
-
-        // Carry the close state forward as the next second's open state.
-        System.arraycopy(closeMid, 0, mids, 0, n);
-        System.arraycopy(closeSp, 0, spreadPips, 0, n);
+    private boolean pastEnd(long secondStartNs, Long endNs) {
+        return endNs != null && secondStartNs >= endNs;
     }
 
     private void emitTrade(Sender sender, long ts, FxPair p, double bid, double ask) {
@@ -270,27 +423,9 @@ public final class QwpTradesGenerator {
                 .at(ts, ChronoUnit.NANOS);
     }
 
-    private int pickPairIndex() {
-        int r = ThreadLocalRandom.current().nextInt(totalWeight);
-        for (int i = 0; i < cumWeights.length; i++) {
-            if (r < cumWeights[i]) {
-                return i;
-            }
-        }
-        return cumWeights.length - 1;
-    }
-
-    private boolean budgetReached() {
-        return cfg.totalTrades > 0 && emitted >= cfg.totalTrades;
-    }
-
-    private boolean pastEnd(long secondStartNs, Long endNs) {
-        return endNs != null && secondStartNs >= endNs;
-    }
-
     // ---------------------------------------------------------------- transport / DDL
 
-    private Sender buildSender() {
+    private Sender buildSender(int workerId) {
         Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET);
         for (String host : cfg.hosts) {
             b.address(host);
@@ -306,18 +441,45 @@ public final class QwpTradesGenerator {
         } else if (cfg.user != null) {
             b.httpUsernamePassword(cfg.user, cfg.password);
         }
-        b.storeAndForwardDir(cfg.sfDir)
-                .senderId(cfg.senderId)
+        // Each worker needs its own store-and-forward dir and sender id. The sender
+        // does not mkdir -p its parent, so we create the full path up front.
+        String sfPath = cfg.sfDir + "/w" + workerId;
+        try {
+            Files.createDirectories(Paths.get(sfPath));
+        } catch (Exception e) {
+            System.err.printf("[w%d] WARN: could not pre-create sf dir %s: %s%n",
+                    workerId, sfPath, e.getMessage());
+        }
+
+        // Auto-flush is bounded by BYTES, not rows, so every WebSocket frame stays
+        // safely under the QWP server's frame cap (~1MB) regardless of how wide the
+        // rows are. This removes the "1009 Message Too Big" failure class at the
+        // source (an oversized frame can never be produced, so nothing oversized can
+        // spill to store-and-forward and poison later runs). The high row cap is a
+        // non-binding safety net; the byte threshold always trips first.
+        final AtomicLong lastConnLogMs = new AtomicLong(0);
+        b.storeAndForwardDir(sfPath)
+                .senderId(cfg.senderId + "-" + workerId)
                 .reconnectMaxDurationMillis(300_000)
                 .reconnectInitialBackoffMillis(100)
                 .reconnectMaxBackoffMillis(5_000)
-                .autoFlushRows(10_000)
+                .autoFlushBytes(cfg.autoFlushBytes)
+                .autoFlushRows(1_000_000)
                 .autoFlushIntervalMillis(1_000)
-                .errorHandler(error -> System.err.printf("[%s] BATCH ERROR: category=%s table=%s msg=%s%n",
-                        LocalDateTime.now().format(FMT), error.getCategory(),
+                .errorHandler(error -> System.err.printf("[w%d %s] BATCH ERROR: category=%s table=%s msg=%s%n",
+                        workerId, LocalDateTime.now().format(FMT), error.getCategory(),
                         error.getTableName(), error.getServerMessage()))
-                .connectionListener(event -> System.out.printf("[%s] CONNECTION: %s host=%s:%d%n",
-                        LocalDateTime.now().format(FMT), event.getKind(), event.getHost(), event.getPort()));
+                .connectionListener(event -> {
+                    // Throttle connection logging to at most once/second per worker so a
+                    // transient reconnect blip cannot flood the output.
+                    long now = System.currentTimeMillis();
+                    long prev = lastConnLogMs.get();
+                    if (now - prev >= 1000 && lastConnLogMs.compareAndSet(prev, now)) {
+                        System.out.printf("[w%d %s] CONNECTION: %s host=%s:%d%n",
+                                workerId, LocalDateTime.now().format(FMT), event.getKind(),
+                                event.getHost(), event.getPort());
+                    }
+                });
         return b.build();
     }
 
@@ -367,10 +529,99 @@ public final class QwpTradesGenerator {
         }
     }
 
+    // ---------------------------------------------------------------- WAL backpressure
+
+    /**
+     * Python-style WAL backpressure: poll {@code wal_tables()} every 5s; if the
+     * sequencer gets more than {@code 3 * processes} transactions ahead of the
+     * writer, pause all workers, and resume only once the writer has fully caught up.
+     */
+    private Thread startWalMonitor() {
+        final int threshold = 3 * cfg.processes;
+        Thread t = new Thread(() -> {
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
+                client.connect();
+                while (running.get()) {
+                    long[] lag = queryWalLag(client);
+                    if (lag != null) {
+                        long diff = lag[0] - lag[1]; // sequencerTxn - writerTxn
+                        if (diff > threshold && paused.compareAndSet(false, true)) {
+                            System.out.printf("[wal] lag %d > %d, pausing ingestion%n", diff, threshold);
+                        } else if (lag[0] == lag[1] && paused.compareAndSet(true, false)) {
+                            System.out.println("[wal] caught up, resuming ingestion");
+                        }
+                    }
+                    for (int s = 0; s < 5 && running.get(); s++) {
+                        Thread.sleep(1000);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                System.err.println("[wal] monitor stopped: " + e.getMessage());
+            }
+        }, "qwp-wal-monitor");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    private long[] queryWalLag(QwpQueryClient client) {
+        final long[] out = {Long.MIN_VALUE, Long.MIN_VALUE};
+        try {
+            client.execute("SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '"
+                            + cfg.tableName() + "'",
+                    new QwpColumnBatchHandler() {
+                        @Override
+                        public void onBatch(QwpColumnBatch batch) {
+                            batch.forEachRow(row -> {
+                                out[0] = row.getLongValue(0);
+                                out[1] = row.getLongValue(1);
+                            });
+                        }
+
+                        @Override
+                        public void onEnd(long totalRows) {
+                        }
+
+                        @Override
+                        public void onError(byte status, String message) {
+                        }
+                    });
+        } catch (Exception e) {
+            return null;
+        }
+        return out[0] == Long.MIN_VALUE ? null : out;
+    }
+
+    private Thread startYahooRefresher() {
+        Thread t = new Thread(() -> {
+            YahooFinance yf = new YahooFinance();
+            try {
+                while (running.get()) {
+                    for (int s = 0; s < cfg.yahooRefreshSecs && running.get(); s++) {
+                        Thread.sleep(1000);
+                    }
+                    if (!running.get()) {
+                        break;
+                    }
+                    yf.refreshBrackets(pairs, 1.0);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "qwp-yahoo-refresher");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    // ---------------------------------------------------------------- start / helpers
+
     /**
      * Decide where to start the data clock. We continue strictly after the latest
      * row already in the table to keep the series continuous and avoid clobbering
-     * existing data; an explicit --start-ts (faster-than-life) wins when provided.
+     * existing data; an explicit --start_ts (faster-than-life) wins when provided.
      */
     private long resolveStartNanos() {
         if ("faster-than-life".equals(cfg.mode) && cfg.startTs != null) {

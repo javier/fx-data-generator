@@ -153,6 +153,7 @@ Option names accept **either** the Python underscore form (`--start_ts`,
 | `--user` + `--password` | none | OR HTTP basic auth, shared across hosts |
 | `--sf_dir <dir>` | `/tmp/qwp_trades_sf` | store-and-forward spill directory |
 | `--sender_id <id>` | `qwp-fx-trades` | store-and-forward sender id |
+| `--auto_flush_bytes <n>` | 524288 | QWP auto-flush size in bytes (keep under the ~1MB WS frame) |
 
 ### Trades / volume / time
 

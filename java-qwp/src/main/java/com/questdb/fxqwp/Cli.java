@@ -32,6 +32,7 @@ public final class Cli {
     public String password = null;
     public String sfDir = "/tmp/qwp_trades_sf";
     public String senderId = "qwp-fx-trades";
+    public int autoFlushBytes = 524288;   // QWP sender auto-flush size (bytes); 512 KiB, safely under the ~1MB WS frame cap
 
     // --- mode / volume / time ------------------------------------------------
     public String mode = null;                 // real-time | faster-than-life (required)
@@ -88,6 +89,10 @@ public final class Cli {
                 case "sender_id":
                     c.senderId = req(args, ++i, raw);
                     break;
+                case "auto_flush_bytes":
+                case "autoflush_bytes":
+                    c.autoFlushBytes = Integer.parseInt(req(args, ++i, raw));
+                    break;
 
                 // ---- mode / volume / time ----
                 case "mode":
@@ -112,15 +117,9 @@ public final class Cli {
                 case "end_ts":
                     c.endTs = req(args, ++i, raw);
                     break;
-                case "processes": {
+                case "processes":
                     c.processes = Integer.parseInt(req(args, ++i, raw));
-                    if (c.processes != 1) {
-                        notes.add("--processes " + c.processes
-                                + " ignored: qwp-fx-trades is single-worker (one QWP sender).");
-                        c.processes = 1;
-                    }
                     break;
-                }
 
                 // ---- reference data / schema ----
                 case "yahoo_refresh_secs":
@@ -186,6 +185,16 @@ public final class Cli {
         }
         if (leiPoolSize <= 0) {
             fail("--lei_pool_size must be > 0");
+        }
+        if (processes < 1 || processes > 30) {
+            fail("--processes must be between 1 and 30 (one worker thread per disjoint symbol set)");
+        }
+        if (autoFlushBytes < 1024) {
+            fail("--auto_flush_bytes must be >= 1024");
+        }
+        if (autoFlushBytes > 900_000) {
+            System.out.println("[note] --auto_flush_bytes " + autoFlushBytes
+                    + " is near/above the QWP WebSocket frame cap (~1MB); large frames risk a 1009 rejection.");
         }
         if ("faster-than-life".equals(mode) && totalTrades <= 0 && endTs == null) {
             fail("faster-than-life requires a bound: set --total_market_data_events > 0 or --end_ts");
@@ -298,6 +307,7 @@ public final class Cli {
                 "  --user <u> --password <p>         OR HTTP basic auth",
                 "  --sf_dir <dir>                    store-and-forward dir (default /tmp/qwp_trades_sf)",
                 "  --sender_id <id>                  store-and-forward sender id (default qwp-fx-trades)",
+                "  --auto_flush_bytes <n>            QWP sender auto-flush size in bytes (default 524288 = 512 KiB)",
                 "",
                 "Volume / time:",
                 "  --orders_min_per_sec <n>          throughput floor, events/sec (default 50)",
@@ -305,7 +315,7 @@ public final class Cli {
                 "  --total_market_data_events <n>    max events; 0 = unlimited (default 1000000)",
                 "  --start_ts <iso>                  faster-than-life start (default: after last row / now)",
                 "  --end_ts <iso>                    max timestamp / upper bound",
-                "  --processes <n>                   single-worker only (n>1 noted and ignored)",
+                "  --processes <n>                   worker threads, 1-30 (default 1); by-symbol split",
                 "",
                 "Reference data / schema:",
                 "  --yahoo_refresh_secs <n>          real-time Yahoo refresh interval (default 300)",
