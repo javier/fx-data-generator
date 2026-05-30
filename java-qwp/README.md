@@ -1,0 +1,203 @@
+# qwp-fx-trades
+
+A single-worker synthetic **FX trade** generator that ingests into QuestDB over
+**QWP** (the WebSocket binary protocol of the QuestDB Java client), with **HA
+failover** across a fleet of hosts.
+
+It is the simplified, trades-only sibling of the Python FX data generator
+(`../fx_data_generator.py`). Differences by design:
+
+- **One table only:** `qwp_trades`, with a schema **identical** to the Python
+  `fx_trades` table (same columns, types, PARQUET encodings, `PARTITION BY HOUR`,
+  and `DEDUP UPSERT KEYS(timestamp, trade_id)`).
+- **No** order book, `core_price`, or `market_data` tables.
+- **No** materialized views.
+- **Single worker** using the QWP `Sender`.
+
+Price realism is kept the same way as the Python generator: each pair's mid
+follows a controlled pip random walk inside a Yahoo-anchored bracket, and trades
+within a second are interpolated between the open and evolved close states so the
+series is continuous across second boundaries (`close(t) == open(t+1)`).
+
+## Table schema
+
+```sql
+CREATE TABLE IF NOT EXISTS qwp_trades (
+    timestamp    TIMESTAMP_NS PARQUET(delta_binary_packed, zstd(4)),
+    symbol       SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+    ecn          SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+    trade_id     UUID PARQUET(default, zstd(4)),
+    side         SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
+    passive      BOOLEAN PARQUET(default, zstd(4)),
+    price        DOUBLE PARQUET(default, zstd(4)),
+    quantity     DOUBLE PARQUET(default, zstd(4)),
+    counterparty SYMBOL PARQUET(rle_dictionary, zstd(4)),
+    order_id     UUID PARQUET(default, zstd(4))
+) TIMESTAMP(timestamp) PARTITION BY HOUR DEDUP UPSERT KEYS(timestamp, trade_id);
+```
+
+The generator creates this table itself (over QWP) if it does not exist.
+Retention is attached only with `--short_ttl` (`TTL 1 MONTH`, or
+`STORAGE POLICY(...)` when combined with `--enterprise`), matching the Python
+generator's `fx_trades` retention behaviour.
+
+## Prerequisites
+
+- **Java 17+** and **Maven 3+**.
+- A running **QuestDB** that speaks **QWP over WebSocket** (a build
+  protocol-compatible with client `1.3.2`). QWP listens on the same port as the
+  HTTP endpoint (default `9000`).
+- The **`org.questdb:questdb-client:1.3.2`** artifact in your local Maven cache.
+  Build and install it from the client repo:
+
+  ```bash
+  cd /Users/j/prj/questdb/java-questdb-client
+  mvn clean install -DskipTests
+  ```
+
+## Build
+
+```bash
+cd /Users/j/prj/python/fx/java-qwp
+mvn -q clean package
+```
+
+## Run
+
+Helper scripts (set `HOSTS` to your fleet; defaults to `127.0.0.1:9000`):
+
+```bash
+# Real-time: wall-clock aligned, periodic Yahoo refresh, runs until Ctrl+C
+HOSTS=127.0.0.1:9000 ./run_realtime.sh
+
+# Faster-than-life backfill / stress test: no waiting, bounded by TOTAL
+HOSTS=127.0.0.1:9000 TOTAL=1000000 ./run_backfill.sh
+```
+
+Or invoke directly with `mvn exec:java` (see the full parameter list below):
+
+```bash
+mvn -q exec:java -Dexec.args="--mode real-time --hosts h1:9000,h2:9000,h3:9000 \
+    --tls_insecure --token <TOKEN> --total_market_data_events 0"
+```
+
+Show all options:
+
+```bash
+mvn -q exec:java -Dexec.args="--help"
+```
+
+## Example: how we run it
+
+A 20M-row faster-than-life backfill into a local QuestDB, offline (no Yahoo), at a
+steady 1000 events/sec of data-clock density:
+
+```bash
+mvn -q exec:java -Dexec.args="--mode faster-than-life --no_yahoo \
+    --hosts 127.0.0.1:9000 \
+    --total_market_data_events 20000000 \
+    --orders_min_per_sec 1000 --orders_max_per_sec 1000"
+```
+
+The run ends with a throughput line, e.g.:
+
+```
+[DONE] emitted 20000000 trades in 12.23s = 1,634,846 trades/sec.
+```
+
+Verify what landed (HTTP query endpoint):
+
+```bash
+curl -s "http://localhost:9000/exec?query=SELECT%20count()%20rows,%20count_distinct(trade_id)%20ids,%20min(timestamp)%20first_ts,%20max(timestamp)%20last_ts%20FROM%20qwp_trades"
+```
+
+A realistic HA + TLS + token backfill against an enterprise cluster:
+
+```bash
+mvn -q exec:java -Dexec.args="--mode faster-than-life \
+    --hosts primary:9000,replica1:9000,replica2:9000 \
+    --tls_insecure --token <TOKEN> \
+    --total_market_data_events 5000000 \
+    --orders_min_per_sec 100 --orders_max_per_sec 500 \
+    --start_ts 2026-05-29T00:00:00"
+```
+
+## HA / connection model
+
+All hosts share **one** credential set and **one** transport scheme:
+
+- `--hosts h1:9000,h2:9000,h3:9000` — the failover fleet (`--host` for a single host).
+- `--tls` — use `wss` for every host. `--tls_insecure` also disables certificate
+  validation (self-signed clusters).
+- `--token <t>` **or** `--user <u> --password <p>` — applied to all hosts.
+- Store-and-forward is **on** (`--sf_dir`, default `/tmp/qwp_trades_sf`) so a
+  failover mid-batch does not drop unacknowledged trades; the sender reconnects
+  with backoff and replays from the spill directory.
+
+Connection and batch-error events are logged, so you can see which node took over
+during a failover.
+
+## Parameters
+
+Option names accept **either** the Python underscore form (`--start_ts`,
+`--total_market_data_events`) **or** kebab form (`--start-ts`, `--total-trades`).
+
+### General / connection
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--mode` | _(required)_ | `real-time` or `faster-than-life` |
+| `--hosts` (`--host`) | `127.0.0.1:9000` | comma-separated HA fleet |
+| `--tls` / `--tls_insecure` | off | `wss` for all hosts (insecure = skip cert check) |
+| `--token` | none | QWP/bearer token (enterprise), shared across hosts |
+| `--user` + `--password` | none | OR HTTP basic auth, shared across hosts |
+| `--sf_dir <dir>` | `/tmp/qwp_trades_sf` | store-and-forward spill directory |
+| `--sender_id <id>` | `qwp-fx-trades` | store-and-forward sender id |
+
+### Trades / volume / time
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--orders_min_per_sec` / `--orders_max_per_sec` | 50 / 200 | throughput, events/sec |
+| `--total_market_data_events` | 1000000 | max events; `0` = unlimited (real-time) |
+| `--start_ts <iso>` | after last row / now | start of data clock (faster-than-life) |
+| `--end_ts <iso>` | none | max timestamp / upper bound |
+
+### Reference data / schema
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--yahoo_refresh_secs <n>` | 300 | real-time Yahoo refresh interval |
+| `--no_yahoo` | off | skip Yahoo, use template brackets (offline) |
+| `--incremental [true\|false]` | false | seed prices from last stored row, skip Yahoo |
+| `--short_ttl [true\|false]` | off | attach retention to the table |
+| `--enterprise [true\|false]` | off | with `--short_ttl`, use STORAGE POLICY instead of TTL |
+| `--suffix <s>` | none | table becomes `qwp_trades<s>` |
+| `--lei_pool_size <n>` | 2000 | distinct counterparties |
+
+### Accepted but currently unused
+
+`--processes` (single-worker only; `n>1` is noted and ignored) and
+`--chunk_seconds` (state is streamed per-second, so there is no upfront precompute
+to chunk) are accepted but have no effect yet — each prints a `[note]`.
+
+ILP/PG-transport flags (`--protocol`, `--pg_port`, `--ilp_user`, `--token_x`,
+`--token_y`) and the order-book / `market_data` / `core_price` / materialized-view
+flags (`--market_data_*_eps`, `--core_*_eps`, `--min_levels`, `--max_levels`,
+`--create_views`) are **not supported** — this is a trades-only QWP generator, so
+passing them is an error.
+
+## Notes
+
+- **Timestamp safety:** the generator reads `max(timestamp)` from `qwp_trades` and
+  continues strictly after it, so reruns extend the series rather than overlapping
+  it. `--start_ts` overrides this in faster-than-life mode. On an empty table it
+  starts at "now".
+- **Modes:** real-time advances the data clock one second per wall-clock second
+  (and refreshes Yahoo periodically); faster-than-life runs as fast as possible
+  with no wall-clock wait, bounded by `--total_market_data_events` and/or `--end_ts`.
+- **Protocol compatibility:** QWP is a development wire protocol. The running
+  QuestDB server must be protocol-compatible with client `1.3.2`; a mismatch
+  surfaces as a version/role exception at connect time.
+- Java uses its own truststore, so there is no macOS certifi workaround to apply
+  (unlike the Python pipeline).
