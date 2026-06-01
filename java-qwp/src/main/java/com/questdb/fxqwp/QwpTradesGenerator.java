@@ -1,6 +1,7 @@
 package com.questdb.fxqwp;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
@@ -19,70 +20,67 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.SplittableRandom;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Synthetic FX trade generator that ingests into QuestDB over QWP (WebSocket),
- * with HA failover across a fleet of hosts that share one credential set and one
- * TLS setting.
+ * Synthetic FX generator that ingests into QuestDB over QWP (WebSocket), HA-aware.
  *
- * <p>This is the simplified, trades-only sibling of the Python FX data generator.
- * It produces rows for a single {@code qwp_trades} table whose schema is identical
- * to the Python {@code fx_trades} table. There are no order books, no
- * {@code core_price}, and no materialized views.
+ * <p>Two independent worker pools, one per table:
+ * <ul>
+ *   <li>{@code --trades_processes} workers → {@code qwp_trades} (trade prints), and
+ *   <li>{@code --market_data_processes} workers → {@code qwp_market_data} (order books).
+ * </ul>
+ * Each pool snake-drafts the symbols across its own threads, so you can give a table
+ * its own degree of parallelism (e.g. 1 for trades, 2 for market_data). Separate
+ * tables get separate WAL writers, and fewer workers per table means less data-clock
+ * divergence, so out-of-order apply pressure stays low per table.
  *
- * <p>Price realism is preserved the same way the Python generator does it: each
- * pair's mid follows a controlled pip random walk inside a Yahoo-anchored bracket,
- * and trades within a second are interpolated between the open and close states so
- * {@code close(t) == open(t+1)} holds across seconds.
- *
- * <p><b>Parallelism.</b> {@code --processes N} runs N worker threads (Java has no
- * GIL, so threads, not OS processes). Symbols are split across workers by a
- * popularity "snake draft" from both ends of the liquidity ranking: pick k goes to
- * worker {@code k % N} and takes one symbol from the most-popular end and one from
- * the least-popular end, so each worker gets a balanced mix. A worker owns its
- * symbols end-to-end (own state, own {@link Sender}), so per-symbol price
- * continuity is preserved and no two workers ever touch the same symbol. The global
- * {@code --total_market_data_events} cap is shared via an atomic counter. A
- * Python-style WAL monitor pauses all workers when the table's sequencer gets ahead
- * of the writer, and resumes when it has caught up.
+ * <p><b>Cross-table price consistency.</b> Each symbol's mid/spread walk is
+ * <b>deterministic</b> (seeded by the symbol), so a trades worker and a market_data
+ * worker that both own a symbol compute the identical top-of-book for the same
+ * (symbol, second) — with no shared state and no coordination. Trades then
+ * <b>execute against the reconstructed book</b> (walk levels), so every trade prints
+ * at a real book-level price consistent with the published snapshot. Per-row noise
+ * (order side/size, book volumes, ids) stays fast {@link ThreadLocalRandom}.
  */
 public final class QwpTradesGenerator {
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
     private static final long NANOS_PER_SEC = 1_000_000_000L;
+    private static final long WALK_SEED_BASE = 0xF1A7C0DEL;
+    private static final long GOLDEN = 0x9E3779B97F4A7C15L;
     private static final String ENTERPRISE_POLICY =
             "TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 3 months";
+
+    private enum Kind { TRADES, MARKET_DATA }
 
     private final Cli cfg;
     private final List<FxPair> pairs = FxUniverse.defaultPairs();
     private final String[] leiPool;
+    private final long[] ladder = FxUniverse.makeVolumeLadder();
 
-    // Shared per-pair price state, indexed in lockstep with `pairs`. Each worker
-    // only reads/writes the indices it owns, so the disjoint partition makes this
-    // safe without locking. The Yahoo refresher only touches FxPair.low/high (volatile).
-    private final double[] mids;
-    private final int[] spreadPips;
+    // Read-only initial mid per global pair index (computed once from Yahoo/template/
+    // incremental). Both pools seed their deterministic walk from the same values.
+    private final double[] initialMid;
     private final int totalAllWeight; // sum of (11 - rank) across all pairs
 
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final AtomicBoolean paused = new AtomicBoolean(false);
-    private final AtomicLong emitted = new AtomicLong(0);
+    private final AtomicLong emitted = new AtomicLong(0);     // combined row cap counter
+    private final AtomicLong tradesRows = new AtomicLong(0);
+    private final AtomicLong mdRows = new AtomicLong(0);
 
     private QwpTradesGenerator(Cli cfg) {
         this.cfg = cfg;
         this.leiPool = FxUniverse.generateLeiPool(cfg.leiPoolSize);
         int n = pairs.size();
-        this.mids = new double[n];
-        this.spreadPips = new int[n];
+        this.initialMid = new double[n];
         int acc = 0;
         for (int i = 0; i < n; i++) {
-            FxPair p = pairs.get(i);
-            this.mids[i] = FxUniverse.quantizeToPip(p.midOfBracket(), p.pip, p.precision);
-            this.spreadPips[i] = 4; // start at 4 pips, like load_initial_state_from_brackets
-            acc += (11 - p.rank);
+            acc += (11 - pairs.get(i).rank);
         }
         this.totalAllWeight = acc;
     }
@@ -98,10 +96,6 @@ public final class QwpTradesGenerator {
         try {
             new QwpTradesGenerator(cfg).run();
         } catch (Exception e) {
-            // Print a readable failure instead of letting the exception propagate as
-            // an opaque "exception occurred while executing the Java class" from the
-            // Maven exec plugin. Common causes: host unreachable, TLS/auth, or a
-            // client/server QWP protocol-version mismatch.
             System.err.printf("[FATAL] %s: %s%n", e.getClass().getSimpleName(), e.getMessage());
             for (Throwable c = e.getCause(); c != null && c != c.getCause(); c = c.getCause()) {
                 System.err.printf("[FATAL]   caused by %s: %s%n", c.getClass().getSimpleName(), c.getMessage());
@@ -111,70 +105,57 @@ public final class QwpTradesGenerator {
     }
 
     private void run() throws Exception {
-        System.out.println("=== qwp-fx-trades generator ===");
-        System.out.printf("mode=%s  hosts=%s  tls=%s  table=%s  processes=%d%n",
-                cfg.mode, cfg.hosts, cfg.tls, cfg.tableName(), cfg.processes);
+        System.out.println("=== qwp-fx generator ===");
+        System.out.printf("mode=%s  hosts=%s  tls=%s  trades_processes=%d  market_data_processes=%d%n",
+                cfg.mode, cfg.hosts, cfg.tls, cfg.tradesProcesses, cfg.marketDataProcesses);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> running.set(false)));
 
-        // 1) Reference data. Incremental continues from the last stored prices (and
-        // skips Yahoo, like the Python --incremental path); otherwise we anchor
-        // brackets on live Yahoo mids (unless --no_yahoo) and start at the bracket mid.
+        // 1) Reference data → initial mid per symbol (shared, read-only).
         if (cfg.incremental) {
-            seedStateFromDb();
-        } else {
-            if (!cfg.noYahoo) {
-                new YahooFinance().refreshBrackets(pairs, 1.0);
-            }
-            for (int i = 0; i < pairs.size(); i++) {
-                FxPair p = pairs.get(i);
-                mids[i] = FxUniverse.quantizeToPip(p.midOfBracket(), p.pip, p.precision);
+            seedInitialMidFromDb();
+        } else if (!cfg.noYahoo) {
+            new YahooFinance().refreshBrackets(pairs, 1.0);
+        }
+        for (int i = 0; i < pairs.size(); i++) {
+            FxPair p = pairs.get(i);
+            if (initialMid[i] <= 0) {
+                initialMid[i] = FxUniverse.quantizeToPip(p.midOfBracket(), p.pip, p.precision);
             }
         }
 
-        // 2) Schema (DDL over QWP query client, failover-aware).
-        createTable();
+        // 2) Schema for each enabled table.
+        createTables();
 
-        // 3) Timestamp safety: continue strictly after the last row already stored.
+        // 3) Start point (data clock).
         long startNs = resolveStartNanos();
         Long endNs = cfg.endTs == null ? null : isoToNanos(cfg.endTs);
         if (endNs != null && endNs <= startNs) {
-            System.err.printf("[ERROR] --end_ts (%s) is not after the start point (%s). Aborting.%n",
-                    cfg.endTs, Instant.ofEpochSecond(0, startNs));
+            System.err.printf("[ERROR] --end_ts (%s) is not after the start point. Aborting.%n", cfg.endTs);
             return;
         }
 
-        // 4) Partition symbols across workers, then run the worker fleet.
-        List<List<Integer>> assignment = snakeDraft(cfg.processes);
-        logAssignment(assignment);
-
-        Thread walMonitor = startWalMonitor();
+        // 4) Build the two pools and run them.
         boolean realtime = "real-time".equals(cfg.mode);
-        Thread yahooRefresher = (realtime && !cfg.noYahoo && !cfg.incremental)
-                ? startYahooRefresher() : null;
-
         long wallStartMs = System.currentTimeMillis();
         long t0 = System.nanoTime();
 
-        // Per-second throughput sampling is only enabled with --run_secs (a bounded
-        // throughput test); otherwise we just report total elapsed time at the end.
-        // Both the sampler and the wall-clock cap hang off --run_secs.
         List<Long> perSecond = new ArrayList<>();
         Thread sampler = cfg.runSecs > 0 ? startThroughputSampler(perSecond) : null;
         Thread deadline = cfg.runSecs > 0 ? startDeadline(cfg.runSecs) : null;
+        Thread walMonitor = startWalMonitor();
+        Thread yahooRefresher = (realtime && !cfg.noYahoo && !cfg.incremental)
+                ? startYahooRefresher() : null;
 
         List<Thread> workers = new ArrayList<>();
-        for (int w = 0; w < cfg.processes; w++) {
-            Thread th = new Thread(new Worker(w, assignment.get(w), startNs, endNs, wallStartMs),
-                    "qwp-worker-" + w);
-            workers.add(th);
-            th.start();
-        }
+        workers.addAll(spawnPool(Kind.TRADES, cfg.tradesProcesses, cfg.tradesMinPerSec,
+                cfg.tradesMaxPerSec, startNs, endNs, wallStartMs));
+        workers.addAll(spawnPool(Kind.MARKET_DATA, cfg.marketDataProcesses, cfg.marketDataMinEps,
+                cfg.marketDataMaxEps, startNs, endNs, wallStartMs));
         for (Thread th : workers) {
             th.join();
         }
 
-        // Stop the background helpers and wrap up.
         running.set(false);
         if (yahooRefresher != null) {
             yahooRefresher.interrupt();
@@ -192,29 +173,44 @@ public final class QwpTradesGenerator {
         }
 
         double secs = (System.nanoTime() - t0) / 1e9;
-        long total = emitted.get();
         printThroughputSummary(perSecond);
-        System.out.printf("[DONE] emitted %d trades in %.2fs = %,.0f trades/sec (%d workers).%n",
-                total, secs, secs > 0 ? total / secs : 0.0, cfg.processes);
+        System.out.printf("[DONE] in %.2fs: trades=%,d (%,.0f/s), market_data=%,d (%,.0f/s)%n",
+                secs, tradesRows.get(), secs > 0 ? tradesRows.get() / secs : 0.0,
+                mdRows.get(), secs > 0 ? mdRows.get() / secs : 0.0);
+    }
+
+    private List<Thread> spawnPool(Kind kind, int processes, int poolMin, int poolMax,
+                                   long startNs, Long endNs, long wallStartMs) {
+        List<Thread> threads = new ArrayList<>();
+        if (processes <= 0) {
+            return threads;
+        }
+        List<List<Integer>> assignment = snakeDraft(processes);
+        logAssignment(kind, assignment);
+        for (int w = 0; w < processes; w++) {
+            Worker worker = new Worker(kind, w, assignment.get(w), poolMin, poolMax,
+                    startNs, endNs, wallStartMs);
+            Thread th = new Thread(worker, "qwp-" + tag(kind) + "-" + w);
+            threads.add(th);
+            th.start();
+        }
+        return threads;
+    }
+
+    private static String tag(Kind kind) {
+        return kind == Kind.TRADES ? "t" : "md";
     }
 
     // ---------------------------------------------------------------- worker fleet
 
-    /**
-     * Split pair indices across {@code p} workers via a popularity snake draft from
-     * both ends. Pick k (worker {@code k % p}) takes the next most-popular and the
-     * next least-popular symbol, balancing trade-weight load across workers.
-     */
     private List<List<Integer>> snakeDraft(int p) {
         int n = pairs.size();
         Integer[] order = new Integer[n];
         for (int i = 0; i < n; i++) {
             order[i] = i;
         }
-        // Most popular first: lower rank first, ties keep original order.
         Arrays.sort(order, Comparator.comparingInt((Integer i) -> pairs.get(i).rank)
                 .thenComparingInt(i -> i));
-
         List<List<Integer>> res = new ArrayList<>();
         for (int w = 0; w < p; w++) {
             res.add(new ArrayList<>());
@@ -222,17 +218,17 @@ public final class QwpTradesGenerator {
         int top = 0, bottom = n - 1, k = 0;
         while (top <= bottom) {
             List<Integer> bucket = res.get(k % p);
-            bucket.add(order[top++]);          // most-popular end
+            bucket.add(order[top++]);
             if (top <= bottom) {
-                bucket.add(order[bottom--]);   // least-popular end
+                bucket.add(order[bottom--]);
             }
             k++;
         }
         return res;
     }
 
-    private void logAssignment(List<List<Integer>> assignment) {
-        if (cfg.processes == 1) {
+    private void logAssignment(Kind kind, List<List<Integer>> assignment) {
+        if (assignment.size() == 1) {
             return;
         }
         for (int w = 0; w < assignment.size(); w++) {
@@ -243,30 +239,41 @@ public final class QwpTradesGenerator {
                 }
                 sb.append(pairs.get(idx).symbol);
             }
-            System.out.printf("[INFO] worker %d owns %d symbols: %s%n",
-                    w, assignment.get(w).size(), sb);
+            System.out.printf("[INFO] %s worker %d owns %d symbols: %s%n",
+                    tag(kind), w, assignment.get(w).size(), sb);
         }
     }
 
-    /** One ingest worker thread: owns a disjoint symbol set and its own QWP sender. */
+    /** One ingest worker: a pool kind, a disjoint symbol set, its own QWP sender. */
     private final class Worker implements Runnable {
+        private final Kind kind;
         private final int id;
-        private final int[] owned;       // global pair indices this worker owns
-        private final int[] cumW;        // cumulative weights over owned
+        private final int[] owned;
+        private final int[] cumW;
         private final int totalW;
-        private final int wMin;          // per-second trade floor for this worker
-        private final int wMax;          // per-second trade ceiling for this worker
+        private final int wMin;
+        private final int wMax;
         private final long startNs;
         private final Long endNs;
         private final long wallStartMs;
-        // reusable per-second buffers (indexed by position within `owned`)
+
+        // Deterministic per-owned-symbol walk state (indexed by position in `owned`).
+        private final SplittableRandom[] walkRng;
+        private final double[] walkMid;
+        private final int[] walkSp;
+        // per-second open/close snapshots
         private final double[] oMid;
         private final double[] cMid;
         private final int[] oSp;
         private final int[] cSp;
+        // market_data: reusable DoubleArrays keyed by level count
+        private final Map<Integer, DoubleArray> bidArrays = new HashMap<>();
+        private final Map<Integer, DoubleArray> askArrays = new HashMap<>();
         private boolean stop = false;
 
-        Worker(int id, List<Integer> ownedList, long startNs, Long endNs, long wallStartMs) {
+        Worker(Kind kind, int id, List<Integer> ownedList, int poolMin, int poolMax,
+               long startNs, Long endNs, long wallStartMs) {
+            this.kind = kind;
             this.id = id;
             this.startNs = startNs;
             this.endNs = endNs;
@@ -279,20 +286,29 @@ public final class QwpTradesGenerator {
                 cumW[j] = acc;
             }
             this.totalW = acc;
-            // This worker's slice of the global per-second throughput, by weight share.
             double share = totalAllWeight > 0 ? (double) totalW / totalAllWeight : 1.0;
-            this.wMin = Math.max(1, (int) Math.round(cfg.tradesMinPerSec * share));
-            this.wMax = Math.max(wMin, (int) Math.round(cfg.tradesMaxPerSec * share));
+            this.wMin = Math.max(1, (int) Math.round(poolMin * share));
+            this.wMax = Math.max(wMin, (int) Math.round(poolMax * share));
+            this.walkRng = new SplittableRandom[owned.length];
+            this.walkMid = new double[owned.length];
+            this.walkSp = new int[owned.length];
             this.oMid = new double[owned.length];
             this.cMid = new double[owned.length];
             this.oSp = new int[owned.length];
             this.cSp = new int[owned.length];
+            for (int j = 0; j < owned.length; j++) {
+                int g = owned[j];
+                walkRng[j] = new SplittableRandom(WALK_SEED_BASE + GOLDEN * g);
+                walkMid[j] = initialMid[g];
+                walkSp[j] = 4;
+            }
         }
 
         @Override
         public void run() {
-            try (Sender sender = buildSender(id)) {
-                boolean realtime = "real-time".equals(cfg.mode);
+            String table = kind == Kind.TRADES ? cfg.tradesTable() : cfg.marketDataTable();
+            boolean realtime = "real-time".equals(cfg.mode);
+            try (Sender sender = buildSender(kind, id)) {
                 long secondStartNs = alignToSecond(startNs);
                 long secIdx = 0;
                 long lastCommitMs = System.currentTimeMillis();
@@ -301,18 +317,14 @@ public final class QwpTradesGenerator {
                     if (!running.get()) {
                         break;
                     }
-                    int n = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
-                    emitSecond(sender, secondStartNs, n, realtime ? 7.0 : 5.0);
+                    emitSecond(sender, table, secondStartNs, realtime ? 7.0 : 5.0);
                     secondStartNs += NANOS_PER_SEC;
 
-                    // Commit (transactional flush) on the configured cadence. Deferred
-                    // frames have been streaming via auto-flush; this is the commit point.
                     long nowMs = System.currentTimeMillis();
                     if (nowMs - lastCommitMs >= cfg.commitIntervalMs) {
                         sender.flush();
                         lastCommitMs = nowMs;
                     }
-
                     if (realtime) {
                         secIdx++;
                         long sleepMs = (wallStartMs + secIdx * 1000L) - System.currentTimeMillis();
@@ -321,26 +333,31 @@ public final class QwpTradesGenerator {
                         }
                     }
                 }
-                sender.flush(); // final commit of any deferred rows
+                sender.flush();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
-                System.err.printf("[worker %d] FATAL: %s%n", id, e.getMessage());
+                System.err.printf("[%s worker %d] FATAL: %s%n", tag(kind), id, e.getMessage());
+            } finally {
+                bidArrays.values().forEach(DoubleArray::close);
+                askArrays.values().forEach(DoubleArray::close);
             }
         }
 
-        private void emitSecond(Sender sender, long secondStartNs, int nTrades, double driftPips) {
+        private void emitSecond(Sender sender, String table, long secondStartNs, double driftPips) {
+            // Advance the deterministic walk once per owned symbol this second (keeps the
+            // two pools in lockstep regardless of which events land on which symbol).
             for (int j = 0; j < owned.length; j++) {
-                int idx = owned[j];
-                FxPair p = pairs.get(idx);
-                oMid[j] = mids[idx];
-                oSp[j] = spreadPips[idx];
-                cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips);
-                cSp[j] = FxUniverse.evolveSpreadPips(oSp[j]);
+                FxPair p = pairs.get(owned[j]);
+                oMid[j] = walkMid[j];
+                oSp[j] = walkSp[j];
+                cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips, walkRng[j]);
+                cSp[j] = FxUniverse.evolveSpreadPips(oSp[j], walkRng[j]);
             }
 
-            long[] offsets = new long[nTrades];
-            for (int k = 0; k < nTrades; k++) {
+            int nEvents = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
+            long[] offsets = new long[nEvents];
+            for (int k = 0; k < nEvents; k++) {
                 offsets[k] = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
             }
             Arrays.sort(offsets);
@@ -350,27 +367,112 @@ public final class QwpTradesGenerator {
                 if (endNs != null && ts >= endNs) {
                     break;
                 }
-                if (!claimSlot()) {
-                    stop = true;
-                    break;
-                }
                 int j = pickOwned();
-                int idx = owned[j];
-                FxPair p = pairs.get(idx);
+                FxPair p = pairs.get(owned[j]);
                 double f = (double) offset / NANOS_PER_SEC;
                 double mid = FxUniverse.quantizeToPip(oMid[j] + (cMid[j] - oMid[j]) * f, p.pip, p.precision);
-                int sp = (int) Math.round(oSp[j] + (cSp[j] - oSp[j]) * f);
-                sp = Math.max(1, Math.min(8, sp));
+                int sp = Math.max(1, Math.min(8, (int) Math.round(oSp[j] + (cSp[j] - oSp[j]) * f)));
                 double bid = FxUniverse.quantizeToPip(mid - sp * p.pip / 2.0, p.pip, p.precision);
                 double ask = FxUniverse.quantizeToPip(mid + sp * p.pip / 2.0, p.pip, p.precision);
-                emitTrade(sender, ts, p, bid, ask);
+
+                if (kind == Kind.TRADES) {
+                    if (!emitOrder(sender, table, ts, p, bid, ask)) {
+                        stop = true;
+                        break;
+                    }
+                } else {
+                    if (!claimSlot()) {
+                        stop = true;
+                        break;
+                    }
+                    emitSnapshot(sender, table, ts, p, bid, ask);
+                    mdRows.incrementAndGet();
+                }
             }
 
-            // Carry close state forward as the next second's open state (per owned symbol).
             for (int j = 0; j < owned.length; j++) {
-                mids[owned[j]] = cMid[j];
-                spreadPips[owned[j]] = cSp[j];
+                walkMid[j] = cMid[j];
+                walkSp[j] = cSp[j];
             }
+        }
+
+        /**
+         * Generate an order and execute it against the reconstructed book (walk levels),
+         * emitting one trade per fill at the real level price. Returns false if the
+         * global row cap was hit mid-order.
+         */
+        private boolean emitOrder(Sender sender, String table, long base, FxPair p, double bid, double ask) {
+            ThreadLocalRandom rnd = ThreadLocalRandom.current();
+            boolean buy = rnd.nextBoolean();
+            boolean passive = rnd.nextDouble() < 0.4;
+            double remaining = FxUniverse.tradeSizeLognormal();
+            double limit = passive
+                    ? (buy ? ask + rnd.nextInt(0, 3) * p.pip : bid - rnd.nextInt(0, 3) * p.pip)
+                    : (buy ? ask + rnd.nextInt(3, 11) * p.pip : bid - rnd.nextInt(3, 11) * p.pip);
+            String ecn = FxUniverse.ECNS[rnd.nextInt(FxUniverse.ECNS.length)];
+            long orderLo = rnd.nextLong();
+            long orderHi = rnd.nextLong();
+
+            int fill = 0;
+            for (int lvl = 0; lvl < cfg.maxLevels && remaining > 0; lvl++) {
+                double price = buy
+                        ? FxUniverse.quantizeToPip(ask + lvl * p.pip, p.pip, p.precision)
+                        : FxUniverse.quantizeToPip(bid - lvl * p.pip, p.pip, p.precision);
+                if (buy ? price > limit : price < limit) {
+                    break;
+                }
+                double lvlVol = FxUniverse.volumeForLevel(lvl, ladder);
+                double qty = Math.min(remaining, lvlVol);
+                remaining -= qty;
+                if (!claimSlot()) {
+                    return false;
+                }
+                String counterparty = leiPool[rnd.nextInt(leiPool.length)];
+                sender.table(table)
+                        .symbol("symbol", p.symbol)
+                        .symbol("ecn", ecn)
+                        .symbol("side", buy ? "buy" : "sell")
+                        .symbol("counterparty", counterparty)
+                        .boolColumn("passive", passive)
+                        .doubleColumn("price", price)
+                        .doubleColumn("quantity", qty)
+                        .uuidColumn("trade_id", rnd.nextLong(), rnd.nextLong())
+                        .uuidColumn("order_id", orderLo, orderHi)
+                        .at(base + fill, ChronoUnit.NANOS);
+                tradesRows.incrementAndGet();
+                fill++;
+            }
+            return true;
+        }
+
+        /** Emit one order-book snapshot: bids/asks as DOUBLE[][] of shape [2][levels]. */
+        private void emitSnapshot(Sender sender, String table, long ts, FxPair p, double bid, double ask) {
+            int levels = ThreadLocalRandom.current().nextInt(cfg.minLevels, cfg.maxLevels + 1);
+            DoubleArray bids = bidArrays.computeIfAbsent(levels, L -> new DoubleArray(2, L));
+            DoubleArray asks = askArrays.computeIfAbsent(levels, L -> new DoubleArray(2, L));
+            bids.clear();
+            asks.clear();
+            // row 0 = prices
+            for (int i = 0; i < levels; i++) {
+                bids.append(FxUniverse.quantizeToPip(bid - i * p.pip, p.pip, p.precision));
+            }
+            for (int i = 0; i < levels; i++) {
+                asks.append(FxUniverse.quantizeToPip(ask + i * p.pip, p.pip, p.precision));
+            }
+            // row 1 = volumes
+            for (int i = 0; i < levels; i++) {
+                bids.append((double) FxUniverse.volumeForLevel(i, ladder));
+            }
+            for (int i = 0; i < levels; i++) {
+                asks.append((double) FxUniverse.volumeForLevel(i, ladder));
+            }
+            sender.table(table)
+                    .symbol("symbol", p.symbol)
+                    .doubleArray("bids", bids)
+                    .doubleArray("asks", asks)
+                    .doubleColumn("best_bid", bid)
+                    .doubleColumn("best_ask", ask)
+                    .at(ts, ChronoUnit.NANOS);
         }
 
         private int pickOwned() {
@@ -390,25 +492,21 @@ public final class QwpTradesGenerator {
         }
     }
 
-    /**
-     * Per-second throughput sampler: every wall-clock second, print rows/sec and
-     * record it. Gives a per-second view of ingest rate over the run; the final
-     * summary reports min/median/avg/max. (The first and last samples can be partial
-     * — startup ramp and the final fractional second.)
-     */
+    // ---------------------------------------------------------------- reporting / cap
+
     private Thread startThroughputSampler(List<Long> perSecond) {
         Thread t = new Thread(() -> {
-            long last = 0;
-            long sec = 0;
+            long last = 0, sec = 0;
             try {
                 while (running.get()) {
                     Thread.sleep(1000);
-                    long now = emitted.get();
+                    long now = tradesRows.get() + mdRows.get();
                     long delta = now - last;
                     last = now;
                     sec++;
                     perSecond.add(delta);
-                    System.out.printf("[rate] t=%ds  %,d rows/sec  (cum %,d)%n", sec, delta, now);
+                    System.out.printf("[rate] t=%ds  %,d rows/sec  (trades %,d, md %,d)%n",
+                            sec, delta, tradesRows.get(), mdRows.get());
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -419,7 +517,6 @@ public final class QwpTradesGenerator {
         return t;
     }
 
-    /** Stops the run after a fixed wall-clock duration (for bounded throughput tests). */
     private Thread startDeadline(int seconds) {
         Thread t = new Thread(() -> {
             try {
@@ -455,11 +552,6 @@ public final class QwpTradesGenerator {
                 (double) sum / sorted.length, sorted[sorted.length - 1]);
     }
 
-    /**
-     * Claim one slot against the global total. Returns false once the cap is hit so
-     * the calling worker stops. The decrement keeps the final emitted count exact
-     * even with multiple workers racing.
-     */
     private boolean claimSlot() {
         if (cfg.totalTrades <= 0) {
             emitted.incrementAndGet();
@@ -481,40 +573,9 @@ public final class QwpTradesGenerator {
         return endNs != null && secondStartNs >= endNs;
     }
 
-    private void emitTrade(Sender sender, long ts, FxPair p, double bid, double ask) {
-        ThreadLocalRandom rnd = ThreadLocalRandom.current();
-        boolean buy = rnd.nextBoolean();
-        boolean passive = rnd.nextDouble() < 0.4;
-        double quantity = FxUniverse.tradeSizeLognormal();
-
-        // Crossing price relative to top of book: passive prints close to touch,
-        // aggressive walks a few pips through it. (No depth ladder in this model.)
-        int slipPips = passive ? rnd.nextInt(0, 3) : rnd.nextInt(0, 7);
-        double price = buy ? ask + slipPips * p.pip : bid - slipPips * p.pip;
-        price = FxUniverse.quantizeToPip(price, p.pip, p.precision);
-
-        String ecn = FxUniverse.ECNS[rnd.nextInt(FxUniverse.ECNS.length)];
-        String counterparty = leiPool[rnd.nextInt(leiPool.length)];
-
-        // 128-bit ids straight from ThreadLocalRandom (lo, hi). These only need to be
-        // unique for the synthetic data and the DEDUP key, not cryptographically
-        // unpredictable, so we skip UUID.randomUUID()'s shared/contended SecureRandom.
-        sender.table(cfg.tableName())
-                .symbol("symbol", p.symbol)
-                .symbol("ecn", ecn)
-                .symbol("side", buy ? "buy" : "sell")
-                .symbol("counterparty", counterparty)
-                .boolColumn("passive", passive)
-                .doubleColumn("price", price)
-                .doubleColumn("quantity", quantity)
-                .uuidColumn("trade_id", rnd.nextLong(), rnd.nextLong())
-                .uuidColumn("order_id", rnd.nextLong(), rnd.nextLong())
-                .at(ts, ChronoUnit.NANOS);
-    }
-
     // ---------------------------------------------------------------- transport / DDL
 
-    private Sender buildSender(int workerId) {
+    private Sender buildSender(Kind kind, int workerId) {
         Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET);
         for (String host : cfg.hosts) {
             b.address(host);
@@ -530,30 +591,17 @@ public final class QwpTradesGenerator {
         } else if (cfg.user != null) {
             b.httpUsernamePassword(cfg.user, cfg.password);
         }
-        // Each worker needs its own store-and-forward dir and sender id. The sender
-        // does not mkdir -p its parent, so we create the full path up front.
-        String sfPath = cfg.sfDir + "/w" + workerId;
+        String sfPath = cfg.sfDir + "/" + tag(kind) + workerId;
         try {
             Files.createDirectories(Paths.get(sfPath));
         } catch (Exception e) {
-            System.err.printf("[w%d] WARN: could not pre-create sf dir %s: %s%n",
-                    workerId, sfPath, e.getMessage());
+            System.err.printf("[%s%d] WARN: could not pre-create sf dir %s: %s%n",
+                    tag(kind), workerId, sfPath, e.getMessage());
         }
-
-        // Transactional mode is the only mode: auto-flush sends deferred frames
-        // (FLAG_DEFER_COMMIT) that the server appends but does not commit; the
-        // server commits a single WAL transaction only on an explicit flush(). The
-        // worker calls flush() on a fixed cadence (--commit_interval_ms), so commit
-        // size is decoupled from frame size: many byte-bounded frames commit as one
-        // transaction. That keeps the sequencer/writer txn gap tiny.
-        //
-        // Auto-flush is bounded by BYTES, not rows, so every WebSocket frame stays
-        // safely under the QWP server's frame cap (~1MB) regardless of how wide the
-        // rows are. This removes the "1009 Message Too Big" failure class at the
-        // source. The high row cap is a non-binding safety net; bytes trip first.
         final AtomicLong lastConnLogMs = new AtomicLong(0);
+        final String who = tag(kind) + workerId;
         b.storeAndForwardDir(sfPath)
-                .senderId(cfg.senderId + "-" + workerId)
+                .senderId(cfg.senderId + "-" + who)
                 .transactional(true)
                 .reconnectMaxDurationMillis(300_000)
                 .reconnectInitialBackoffMillis(100)
@@ -561,45 +609,60 @@ public final class QwpTradesGenerator {
                 .autoFlushBytes(cfg.autoFlushBytes)
                 .autoFlushRows(1_000_000)
                 .autoFlushIntervalMillis(1_000)
-                .errorHandler(error -> System.err.printf("[w%d %s] BATCH ERROR: category=%s table=%s msg=%s%n",
-                        workerId, LocalDateTime.now().format(FMT), error.getCategory(),
+                .errorHandler(error -> System.err.printf("[%s %s] BATCH ERROR: category=%s table=%s msg=%s%n",
+                        who, LocalDateTime.now().format(FMT), error.getCategory(),
                         error.getTableName(), error.getServerMessage()))
                 .connectionListener(event -> {
-                    // Throttle connection logging to at most once/second per worker so a
-                    // transient reconnect blip cannot flood the output.
                     long now = System.currentTimeMillis();
                     long prev = lastConnLogMs.get();
                     if (now - prev >= 1000 && lastConnLogMs.compareAndSet(prev, now)) {
-                        System.out.printf("[w%d %s] CONNECTION: %s host=%s:%d%n",
-                                workerId, LocalDateTime.now().format(FMT), event.getKind(),
+                        System.out.printf("[%s %s] CONNECTION: %s host=%s:%d%n",
+                                who, LocalDateTime.now().format(FMT), event.getKind(),
                                 event.getHost(), event.getPort());
                     }
                 });
         return b.build();
     }
 
-    private void createTable() {
-        String retention = "";
-        if (cfg.shortTtl) {
-            retention = cfg.enterprise
-                    ? " STORAGE POLICY(" + ENTERPRISE_POLICY + ")"
-                    : " TTL 1 MONTH";
+    private String retentionClause(String ossTtl) {
+        if (!cfg.shortTtl) {
+            return "";
         }
-        String ddl = "CREATE TABLE IF NOT EXISTS " + cfg.tableName() + " ("
-                + "timestamp TIMESTAMP_NS PARQUET(delta_binary_packed, zstd(4)), "
-                + "symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter), "
-                + "ecn SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter), "
-                + "trade_id UUID PARQUET(default, zstd(4)), "
-                + "side SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter), "
-                + "passive BOOLEAN PARQUET(default, zstd(4)), "
-                + "price DOUBLE PARQUET(default, zstd(4)), "
-                + "quantity DOUBLE PARQUET(default, zstd(4)), "
-                + "counterparty SYMBOL PARQUET(rle_dictionary, zstd(4)), "
-                + "order_id UUID PARQUET(default, zstd(4))"
-                + ") timestamp(timestamp) PARTITION BY HOUR" + retention
-                + " DEDUP UPSERT KEYS(timestamp, trade_id)";
+        return cfg.enterprise ? " STORAGE POLICY(" + ENTERPRISE_POLICY + ")" : " TTL " + ossTtl;
+    }
 
-        System.out.println("[INFO] ensuring table " + cfg.tableName() + " exists ...");
+    private void createTables() {
+        if (cfg.tradesProcesses > 0) {
+            String ddl = "CREATE TABLE IF NOT EXISTS " + cfg.tradesTable() + " ("
+                    + "timestamp TIMESTAMP_NS PARQUET(delta_binary_packed, zstd(4)), "
+                    + "symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter), "
+                    + "ecn SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter), "
+                    + "trade_id UUID PARQUET(default, zstd(4)), "
+                    + "side SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter), "
+                    + "passive BOOLEAN PARQUET(default, zstd(4)), "
+                    + "price DOUBLE PARQUET(default, zstd(4)), "
+                    + "quantity DOUBLE PARQUET(default, zstd(4)), "
+                    + "counterparty SYMBOL PARQUET(rle_dictionary, zstd(4)), "
+                    + "order_id UUID PARQUET(default, zstd(4))"
+                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("1 MONTH")
+                    + " DEDUP UPSERT KEYS(timestamp, trade_id)";
+            execDdl(cfg.tradesTable(), ddl);
+        }
+        if (cfg.marketDataProcesses > 0) {
+            String ddl = "CREATE TABLE IF NOT EXISTS " + cfg.marketDataTable() + " ("
+                    + "timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)), "
+                    + "symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter), "
+                    + "bids DOUBLE[][] PARQUET(default, zstd(4)), "
+                    + "asks DOUBLE[][] PARQUET(default, zstd(4)), "
+                    + "best_bid DOUBLE PARQUET(default, zstd(4)), "
+                    + "best_ask DOUBLE PARQUET(default, zstd(4))"
+                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS");
+            execDdl(cfg.marketDataTable(), ddl);
+        }
+    }
+
+    private void execDdl(String table, String ddl) {
+        System.out.println("[INFO] ensuring table " + table + " exists ...");
         try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
             client.connect();
             client.execute(ddl, new QwpColumnBatchHandler() {
@@ -613,12 +676,12 @@ public final class QwpTradesGenerator {
 
                 @Override
                 public void onError(byte status, String message) {
-                    System.err.println("[DDL] ERROR: " + message);
+                    System.err.println("[DDL " + table + "] ERROR: " + message);
                 }
 
                 @Override
                 public void onExecDone(short opType, long rowsAffected) {
-                    System.out.println("[DDL] table ready.");
+                    System.out.println("[DDL] " + table + " ready.");
                 }
             });
         }
@@ -626,28 +689,43 @@ public final class QwpTradesGenerator {
 
     // ---------------------------------------------------------------- WAL backpressure
 
-    /**
-     * WAL backpressure: poll {@code wal_tables()} every 5s; if the sequencer gets
-     * more than the threshold transactions ahead of the writer, pause all workers,
-     * and resume only once the writer has fully caught up. Threshold is
-     * {@code 3 x processes} for more than 2 workers and {@code 5 x processes} at or
-     * below 2 — small values that stay sane because transactional commits keep the
-     * transaction count low (only a few large txns in flight).
-     */
     private Thread startWalMonitor() {
-        final int threshold = (cfg.processes > 2 ? 3 : 5) * cfg.processes;
+        final List<String> tables = new ArrayList<>();
+        final List<Integer> thresholds = new ArrayList<>();
+        if (cfg.tradesProcesses > 0) {
+            tables.add(cfg.tradesTable());
+            thresholds.add((cfg.tradesProcesses > 2 ? 3 : 5) * cfg.tradesProcesses);
+        }
+        if (cfg.marketDataProcesses > 0) {
+            tables.add(cfg.marketDataTable());
+            thresholds.add((cfg.marketDataProcesses > 2 ? 3 : 5) * cfg.marketDataProcesses);
+        }
         Thread t = new Thread(() -> {
             try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
                 client.connect();
                 while (running.get()) {
-                    long[] lag = queryWalLag(client);
-                    if (lag != null) {
-                        long diff = lag[0] - lag[1]; // sequencerTxn - writerTxn
-                        if (diff > threshold && paused.compareAndSet(false, true)) {
-                            System.out.printf("[wal] lag %d > %d, pausing ingestion%n", diff, threshold);
-                        } else if (lag[0] == lag[1] && paused.compareAndSet(true, false)) {
-                            System.out.println("[wal] caught up, resuming ingestion");
+                    boolean over = false, allCaught = true;
+                    for (int i = 0; i < tables.size(); i++) {
+                        long[] lag = queryWalLag(client, tables.get(i));
+                        if (lag == null) {
+                            continue;
                         }
+                        long diff = lag[0] - lag[1];
+                        if (diff > thresholds.get(i)) {
+                            over = true;
+                            if (!paused.get()) {
+                                System.out.printf("[wal] %s lag %d > %d, pausing ingestion%n",
+                                        tables.get(i), diff, thresholds.get(i));
+                            }
+                        }
+                        if (diff != 0) {
+                            allCaught = false;
+                        }
+                    }
+                    if (over) {
+                        paused.set(true);
+                    } else if (allCaught && paused.compareAndSet(true, false)) {
+                        System.out.println("[wal] caught up, resuming ingestion");
                     }
                     for (int s = 0; s < 5 && running.get(); s++) {
                         Thread.sleep(1000);
@@ -664,11 +742,10 @@ public final class QwpTradesGenerator {
         return t;
     }
 
-    private long[] queryWalLag(QwpQueryClient client) {
+    private long[] queryWalLag(QwpQueryClient client, String table) {
         final long[] out = {Long.MIN_VALUE, Long.MIN_VALUE};
         try {
-            client.execute("SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '"
-                            + cfg.tableName() + "'",
+            client.execute("SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '" + table + "'",
                     new QwpColumnBatchHandler() {
                         @Override
                         public void onBatch(QwpColumnBatch batch) {
@@ -716,33 +793,41 @@ public final class QwpTradesGenerator {
 
     // ---------------------------------------------------------------- start / helpers
 
-    /**
-     * Decide where to start the data clock. We continue strictly after the latest
-     * row already in the table to keep the series continuous and avoid clobbering
-     * existing data; an explicit --start_ts (faster-than-life) wins when provided.
-     */
     private long resolveStartNanos() {
         if ("faster-than-life".equals(cfg.mode) && cfg.startTs != null) {
             return isoToNanos(cfg.startTs);
         }
         long nowNs = Instant.now().toEpochMilli() * 1_000_000L;
-        Long latest = readMaxTimestampNanos();
+        Long latest = null;
+        if (cfg.tradesProcesses > 0) {
+            latest = maxOf(latest, readMaxTimestampNanos(cfg.tradesTable(), false));
+        }
+        if (cfg.marketDataProcesses > 0) {
+            latest = maxOf(latest, readMaxTimestampNanos(cfg.marketDataTable(), true));
+        }
         if (latest == null) {
             return nowNs;
         }
-        long after = latest + 1_000L; // 1 microsecond after the last row
+        long after = latest + 1_000L;
         return "faster-than-life".equals(cfg.mode) ? after : Math.max(nowNs, after);
     }
 
-    /**
-     * Read {@code max(timestamp)} (nanos) from the table, or null if empty/unavailable.
-     * Defensive against unit surprises: a value implausibly far from "now" is ignored.
-     */
-    private Long readMaxTimestampNanos() {
+    private static Long maxOf(Long a, Long b) {
+        if (a == null) {
+            return b;
+        }
+        if (b == null) {
+            return a;
+        }
+        return Math.max(a, b);
+    }
+
+    /** max(timestamp) from a table as nanos, or null. {@code micros} converts a TIMESTAMP column. */
+    private Long readMaxTimestampNanos(String table, boolean micros) {
         final AtomicLong out = new AtomicLong(Long.MIN_VALUE);
         try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
             client.connect();
-            client.execute("SELECT max(timestamp) FROM " + cfg.tableName(),
+            client.execute("SELECT max(timestamp) FROM " + table,
                     new QwpColumnBatchHandler() {
                         @Override
                         public void onBatch(QwpColumnBatch batch) {
@@ -755,7 +840,6 @@ public final class QwpTradesGenerator {
 
                         @Override
                         public void onError(byte status, String message) {
-                            // empty/missing -> leave sentinel; we treat as "no data".
                         }
                     });
         } catch (Exception e) {
@@ -765,31 +849,25 @@ public final class QwpTradesGenerator {
         if (v == Long.MIN_VALUE || v <= 0) {
             return null;
         }
+        long ns = micros ? v * 1000L : v;
         long nowNs = Instant.now().toEpochMilli() * 1_000_000L;
         long year = 365L * 24 * 3600 * NANOS_PER_SEC;
-        if (Math.abs(v - nowNs) > 2 * year) {
-            System.out.printf("[WARN] stored max(timestamp)=%d looks off vs now; ignoring for start.%n", v);
+        if (Math.abs(ns - nowNs) > 2 * year) {
             return null;
         }
-        return v;
+        return ns;
     }
 
-    /**
-     * Incremental start: seed each pair's mid from the last stored trade price
-     * ({@code LATEST ON timestamp PARTITION BY symbol}) and recentre its bracket
-     * around that price, so the series continues smoothly from existing data
-     * without consulting Yahoo. Pairs with no stored data keep their template mid.
-     */
-    private void seedStateFromDb() {
-        System.out.println("[INFO] incremental: seeding state from last stored prices in " + cfg.tableName());
+    /** Incremental: seed initial mids from the last stored trade prices. */
+    private void seedInitialMidFromDb() {
+        System.out.println("[INFO] incremental: seeding mids from last stored prices in " + cfg.tradesTable());
         Map<String, Integer> idx = new HashMap<>();
         for (int i = 0; i < pairs.size(); i++) {
             idx.put(pairs.get(i).symbol, i);
         }
-        final int[] seeded = {0};
         try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
             client.connect();
-            client.execute("SELECT symbol, price FROM " + cfg.tableName()
+            client.execute("SELECT symbol, price FROM " + cfg.tradesTable()
                             + " LATEST ON timestamp PARTITION BY symbol",
                     new QwpColumnBatchHandler() {
                         @Override
@@ -802,10 +880,9 @@ public final class QwpTradesGenerator {
                                 double px = row.getDoubleValue(1);
                                 if (px > 0) {
                                     FxPair p = pairs.get(i);
-                                    mids[i] = FxUniverse.quantizeToPip(px, p.pip, p.precision);
+                                    initialMid[i] = FxUniverse.quantizeToPip(px, p.pip, p.precision);
                                     p.low = px * 0.99;
                                     p.high = px * 1.01;
-                                    seeded[0]++;
                                 }
                             });
                         }
@@ -820,11 +897,8 @@ public final class QwpTradesGenerator {
                         }
                     });
         } catch (Exception e) {
-            System.err.println("[incremental] could not read prior state (" + e.getMessage()
-                    + "); starting from template brackets.");
+            System.err.println("[incremental] could not read prior state (" + e.getMessage() + ").");
         }
-        System.out.printf("[INFO] incremental: seeded %d/%d pairs from stored data.%n",
-                seeded[0], pairs.size());
     }
 
     private static long alignToSecond(long ns) {
@@ -836,7 +910,6 @@ public final class QwpTradesGenerator {
         try {
             odt = OffsetDateTime.parse(iso);
         } catch (Exception e) {
-            // Accept a trailing-Z-less local form too, assume UTC.
             odt = LocalDateTime.parse(iso).atOffset(ZoneOffset.UTC);
         }
         Instant in = odt.toInstant();

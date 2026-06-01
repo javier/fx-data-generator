@@ -1,61 +1,65 @@
-# qwp-fx-trades
+# qwp-fx
 
-A synthetic **FX trade** generator that ingests into QuestDB over **QWP** (the
-WebSocket binary protocol of the QuestDB Java client), with **HA failover** across
-a fleet of hosts. It runs a single worker by default and can fan out across
-**N worker threads** (`--processes`, 1–30) using a by-symbol split.
+A synthetic **FX market-data generator** that ingests into QuestDB over **QWP**
+(the WebSocket binary protocol of the QuestDB Java client), HA-aware across a fleet
+of hosts. It can populate two tables, each with its own pool of worker threads:
 
-It is the simplified, trades-only sibling of the Python FX data generator
+- **`qwp_trades`** — trade prints (schema identical to the Python `fx_trades`).
+- **`qwp_market_data`** — full order-book snapshots (identical to the Python
+  `market_data`: `bids`/`asks` as `DOUBLE[][]`, plus `best_bid`/`best_ask`).
+
+It is a simplified sibling of the Python FX data generator
 (`../fx_data_generator.py`). Differences by design:
 
-- **One table only:** `qwp_trades`, with a schema **identical** to the Python
-  `fx_trades` table (same columns, types, PARQUET encodings, `PARTITION BY HOUR`,
-  and `DEDUP UPSERT KEYS(timestamp, trade_id)`).
-- **No** order book, `core_price`, or `market_data` tables.
-- **No** materialized views.
-- **Single worker by default**; `--processes N` adds worker threads (one QWP
-  `Sender` each), splitting the symbols by a both-ends popularity draft.
-- **Transactional ingestion** (always on): frames stream to the server deferred,
-  and each worker commits one WAL transaction on a fixed cadence
-  (`--commit_interval_ms`, default 1s), so commit size is decoupled from WebSocket
-  frame size — many byte-bounded frames commit as one transaction, keeping the
-  WAL sequencer/writer gap small.
+- **Two tables, no others** — no `core_price`, no materialized views.
+- **Independent per-table pools:** `--trades_processes` workers feed `qwp_trades`,
+  `--market_data_processes` workers feed `qwp_market_data`. Each pool snake-drafts
+  the symbols across its own threads (both-ends popularity draft), and each worker
+  has its own QWP sender. You can give each table its own degree of parallelism
+  (e.g. 1 for trades, 2 for market_data). Separate tables ⇒ separate WAL writers.
+- **Transactional ingestion** (always on): frames stream deferred and each worker
+  commits one WAL transaction on a fixed cadence (`--commit_interval_ms`, default
+  1s), so commit size is decoupled from the WebSocket frame size — keeping the WAL
+  sequencer/writer gap small.
+- **Cross-table price consistency:** each symbol's mid/spread walk is
+  **deterministic** (seeded by the symbol), so a trades worker and a market_data
+  worker that both own a symbol compute the identical top-of-book for the same
+  (symbol, second) — with no shared state. Trades then **execute against the
+  reconstructed book** (walk levels), so every trade prints at a real book-level
+  price consistent with the published snapshot. Order size is log-normal; the
+  order-book volume ladder is log-scaled (~100k…1B), like the Python generator.
+- **Order → fills:** `--orders_*_per_sec` sets *orders*/sec; each order executes
+  against the book and yields one or more trade rows (Python semantics), so the
+  trade row count is `orders × fills`.
 
-Price realism is kept the same way as the Python generator: each pair's mid
-follows a controlled pip random walk inside a Yahoo-anchored bracket, and trades
-within a second are interpolated between the open and evolved close states so the
-series is continuous across second boundaries (`close(t) == open(t+1)`).
-
-## Table schema
+## Table schemas
 
 ```sql
 CREATE TABLE IF NOT EXISTS qwp_trades (
-    timestamp    TIMESTAMP_NS PARQUET(delta_binary_packed, zstd(4)),
-    symbol       SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
-    ecn          SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
-    trade_id     UUID PARQUET(default, zstd(4)),
-    side         SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter),
-    passive      BOOLEAN PARQUET(default, zstd(4)),
-    price        DOUBLE PARQUET(default, zstd(4)),
-    quantity     DOUBLE PARQUET(default, zstd(4)),
-    counterparty SYMBOL PARQUET(rle_dictionary, zstd(4)),
-    order_id     UUID PARQUET(default, zstd(4))
+    timestamp    TIMESTAMP_NS, symbol SYMBOL, ecn SYMBOL, trade_id UUID,
+    side SYMBOL, passive BOOLEAN, price DOUBLE, quantity DOUBLE,
+    counterparty SYMBOL, order_id UUID
 ) TIMESTAMP(timestamp) PARTITION BY HOUR DEDUP UPSERT KEYS(timestamp, trade_id);
+
+CREATE TABLE IF NOT EXISTS qwp_market_data (
+    timestamp TIMESTAMP, symbol SYMBOL,
+    bids DOUBLE[][], asks DOUBLE[][],   -- shape [2][levels]: row1 = prices, row2 = volumes
+    best_bid DOUBLE, best_ask DOUBLE
+) TIMESTAMP(timestamp) PARTITION BY HOUR;
 ```
 
-The generator creates this table itself (over QWP) if it does not exist.
-Retention is attached only with `--short_ttl` (`TTL 1 MONTH`, or
-`STORAGE POLICY(...)` when combined with `--enterprise`), matching the Python
-generator's `fx_trades` retention behaviour.
+(Real DDL also carries the Python PARQUET column encodings.) The generator creates
+whichever tables it needs over QWP. Retention is attached only with `--short_ttl`
+(`TTL 1 MONTH`/`3 DAYS`, or `STORAGE POLICY(...)` with `--enterprise`). `--suffix`
+applies to both names (`qwp_trades<s>`, `qwp_market_data<s>`).
 
 ## Prerequisites
 
 - **Java 17+** and **Maven 3+**.
-- A running **QuestDB** that speaks **QWP over WebSocket** (a build
-  protocol-compatible with client `1.3.2`). QWP listens on the same port as the
-  HTTP endpoint (default `9000`).
-- The **`org.questdb:questdb-client:1.3.2`** dependency, resolved automatically
-  from **Maven Central** — no local build or install needed.
+- A running **QuestDB** that speaks **QWP over WebSocket**, protocol-compatible
+  with client `1.3.2`. QWP shares the HTTP port (default `9000`).
+- The **`org.questdb:questdb-client:1.3.2`** dependency — resolved automatically
+  from **Maven Central**, no local build needed.
 
 ## Build
 
@@ -66,29 +70,9 @@ cd java-qwp
 mvn -q clean package
 ```
 
-## Run
-
-Helper scripts (set `HOSTS` to your fleet; defaults to `127.0.0.1:9000`):
-
-```bash
-# Real-time: wall-clock aligned, periodic Yahoo refresh, runs until Ctrl+C
-HOSTS=127.0.0.1:9000 ./run_realtime.sh
-
-# Faster-than-life backfill / stress test: no waiting, bounded by TOTAL
-HOSTS=127.0.0.1:9000 TOTAL=1000000 ./run_backfill.sh
-```
-
-Or invoke directly with `mvn compile exec:java` (the `compile` goal is required —
+Invoke directly with `mvn compile exec:java` (the `compile` goal is required —
 `exec:java` alone does not build, so a fresh checkout would hit
-`ClassNotFoundException`). See the full parameter list below:
-
-```bash
-mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
-    --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token_file $HOME/qwp_token.txt --total_market_data_events 0"
-```
-
-Show all options:
+`ClassNotFoundException`). Show all options:
 
 ```bash
 mvn -q -f ./pom.xml compile exec:java -Dexec.args="--help"
@@ -96,125 +80,116 @@ mvn -q -f ./pom.xml compile exec:java -Dexec.args="--help"
 
 ## Examples
 
-All examples target an HA fleet (internal VPC IPs) and read the QWP token from a
-file via `--token_file $HOME/qwp_token.txt` — put your token in that file (e.g.
-`echo '<your-token>' > ~/qwp_token.txt && chmod 600 ~/qwp_token.txt`) so it never
-appears on the command line or in shell history. Use `$HOME`, not `~`, inside the
-quoted `-Dexec.args` — the shell does not expand `~` there. `--tls_insecure` uses
-`wss` and **skips TLS certificate validation** (self-signed test clusters); on a
-cluster with valid certs use `--tls` instead.
+All examples target an HA fleet (internal VPC IPs) and read the token from a file
+via `--token_file $HOME/qwp_token.txt` — put your token there first
+(`echo '<token>' > ~/qwp_token.txt && chmod 600 ~/qwp_token.txt`) so it stays off
+the command line / shell history. Use `$HOME` (not `~`) inside the quoted args.
+`--tls_insecure` is `wss` + skipped cert validation (self-signed clusters); use
+`--tls` where certs are valid. Keep each command on one logical line (trailing `\`
+for line continuations).
 
-### 1-minute throughput test
+### Uncapped throughput, both tables, 1 minute
 
-Faster-than-life, single worker, bounded to 60 wall-clock seconds. Prints rows/sec
-every second, then a min/median/avg/max summary and total elapsed (generate/send
-time only, excluding Yahoo/DDL). Writes to a throwaway `qwp_trades_xxx`:
+Run flat-out for 60 wall-clock seconds — `--run_secs` is a wall-clock stopwatch, so
+this measures max throughput (it does **not** bound the data-time range). Low
+`--max_levels` keeps `market_data` rows small enough to sustain. Prints rows/sec
+each second (trades + market_data) and a summary:
 
 ```bash
 mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token_file $HOME/qwp_token.txt \
-    --processes 1 \
-    --total_market_data_events 0 --run_secs 60 \
+    --trades_processes 1 --market_data_processes 2 \
     --orders_min_per_sec 1000 --orders_max_per_sec 1000 \
+    --market_data_min_eps 5000 --market_data_max_eps 5000 \
+    --min_levels 1 --max_levels 2 \
+    --total_market_data_events 0 --run_secs 60 \
     --short_ttl true --enterprise true \
     --suffix _xxx"
 ```
 
-### Backfill (faster-than-life, bounded by row count)
+### A day of data (the data-generation pattern)
 
-Fill history forward from a start timestamp as fast as possible, stopping at a
-fixed row count:
+Bound by the **data-time window** (`--end_ts`) for the volume you actually want,
+with `--total_market_data_events` as a safety cap slightly above the expected total
+— whichever limit trips first ends the run:
 
 ```bash
 mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token_file $HOME/qwp_token.txt \
-    --processes 1 \
-    --total_market_data_events 20000000 \
-    --start_ts 2026-05-22T00:00:00.000000Z \
-    --orders_min_per_sec 1000 --orders_max_per_sec 1000 \
+    --trades_processes 1 --market_data_processes 2 \
+    --orders_min_per_sec 30 --orders_max_per_sec 30 \
+    --market_data_min_eps 1200 --market_data_max_eps 1200 \
+    --min_levels 40 --max_levels 40 \
+    --start_ts 2026-05-22T00:00:00.000000Z --end_ts 2026-05-23T00:00:00.000000Z \
+    --total_market_data_events 120000000 \
     --short_ttl true --enterprise true"
 ```
 
-### Real-time (continuous stream)
-
-Wall-clock paced (one data-second per real second), periodic Yahoo refresh, runs
-until Ctrl+C:
+### Real-time (continuous stream until Ctrl+C)
 
 ```bash
 mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token_file $HOME/qwp_token.txt \
-    --processes 1 \
-    --total_market_data_events 0 \
-    --orders_min_per_sec 2000 --orders_max_per_sec 5000 \
-    --short_ttl true --enterprise true"
+    --trades_processes 1 --market_data_processes 2 \
+    --orders_min_per_sec 30 --orders_max_per_sec 30 \
+    --market_data_min_eps 1200 --market_data_max_eps 1200 \
+    --total_market_data_events 0"
 ```
 
-Verify what landed (HTTP query endpoint, against any node — use `qwp_trades_xxx`
-for the throughput example):
+Verify (HTTP query endpoint, any node — add the `--suffix` for the throughput run):
 
 ```bash
-curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20rows,%20count_distinct(trade_id)%20ids,%20min(timestamp)%20first_ts,%20max(timestamp)%20last_ts%20FROM%20qwp_trades"
+curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20FROM%20qwp_trades"
+curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20FROM%20qwp_market_data"
 ```
 
 ## HA / connection model
 
 All hosts share **one** credential set and **one** transport scheme:
 
-- `--hosts h1:9000,h2:9000,h3:9000` — the failover fleet (`--host` for a single host).
-- `--tls` — use `wss` for every host. `--tls_insecure` also disables certificate
-  validation (self-signed clusters).
-- `--token <t>` (or `--token_file <path>` to keep the token off the command line
-  and shell history) **or** `--user <u> --password <p>` — applied to all hosts.
+- `--hosts h1:9000,h2:9000,h3:9000` — the failover fleet (`--host` for one host).
+- `--tls` (`wss`) / `--tls_insecure` (also skips cert validation).
+- `--token <t>` (or `--token_file <path>` to keep it off the CLI) **or**
+  `--user <u> --password <p>` — applied to all hosts.
 - Store-and-forward is **on** (`--sf_dir`, default `/tmp/qwp_trades_sf`, with one
-  `wN` subdir per worker) so a failover mid-batch does not drop unacknowledged
-  trades; the sender reconnects with backoff and replays from the spill directory.
-- **WAL backpressure:** a monitor polls `wal_tables()` every 5s and pauses all
-  workers when the table's `sequencerTxn - writerTxn` lag exceeds the threshold —
-  `3 × processes` for more than 2 workers, `5 × processes` for 2 or fewer —
-  resuming once the writer has caught up. These stay small because transactional
-  commits keep only a few large transactions in flight at a time.
-
-Connection and batch-error events are logged (connection events throttled to
-once/second per worker), so you can see which node took over during a failover.
+  subdir per worker, e.g. `t0`, `md0`, `md1`) so a mid-batch failover does not drop
+  unacknowledged rows; the sender reconnects with backoff and replays the spill.
+- **WAL backpressure:** a monitor polls `wal_tables()` every 5s for each enabled
+  table and pauses all workers when its `sequencerTxn - writerTxn` lag exceeds the
+  threshold — `3 × processes` above 2 workers, `5 × processes` at or below — then
+  resumes when caught up. Small thresholds stay sane because transactional commits
+  keep only a few large transactions in flight.
 
 ## Parameters
 
-Option names accept **either** the Python underscore form (`--start_ts`,
-`--total_market_data_events`) **or** kebab form (`--start-ts`, `--total-trades`).
+Option names accept Python underscore form (`--start_ts`) or kebab form
+(`--start-ts`).
 
-### General / connection
-
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `--mode` | _(required)_ | `real-time` or `faster-than-life` |
-| `--hosts` (`--host`) | `127.0.0.1:9000` | comma-separated HA fleet |
-| `--tls` / `--tls_insecure` | off | `wss` for all hosts (insecure = skip cert check) |
-| `--token` | none | QWP/bearer token (enterprise), shared across hosts |
-| `--token_file <path>` | none | read the token from a file instead of `--token` (keeps it off the CLI / shell history) |
-| `--user` + `--password` | none | OR HTTP basic auth, shared across hosts |
-| `--sf_dir <dir>` | `/tmp/qwp_trades_sf` | store-and-forward spill directory |
-| `--sender_id <id>` | `qwp-fx-trades` | store-and-forward sender id |
-| `--auto_flush_bytes <n>` | 524288 | QWP auto-flush size in bytes (keep under the ~1MB WS frame) |
-
-### Trades / volume / time
+### Pools (one thread set per table)
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--orders_min_per_sec` / `--orders_max_per_sec` | 50 / 200 | throughput, events/sec |
-| `--total_market_data_events` | 1000000 | max events; `0` = unlimited (real-time) |
-| `--start_ts <iso>` | after last row / now | start of data clock (faster-than-life) |
-| `--end_ts <iso>` | none | max timestamp / upper bound |
-| `--run_secs <n>` | 0 (no cap) | stop after n wall-clock seconds (fixed-duration throughput test) |
-| `--commit_interval_ms <n>` | 1000 | transaction rate: how often each worker commits (flush) |
+| `--trades_processes <n>` | 1 | worker threads for `qwp_trades`, 0–30 (0 = off) |
+| `--market_data_processes <n>` | 0 | worker threads for `qwp_market_data`, 0–30 (0 = off) |
 
-**Total elapsed** generate/send time is **always** reported at the end
-(`[DONE] emitted N in X.XXs = Y trades/sec`; it excludes Yahoo and DDL startup).
-**Per-second** throughput (`[rate] t=Ns  … rows/sec`, plus a min/median/avg/max
-summary) is reported **only when `--run_secs` is set** — that's the fixed-duration
-throughput-test path.
+### Volume / time (each rate is the **table-wide total** across that pool)
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--orders_min/max_per_sec` | 50 / 200 | `qwp_trades` orders/sec; each order → 1+ fills |
+| `--market_data_min/max_eps` | 1200 / 15000 | `qwp_market_data` snapshots/sec |
+| `--min_levels` / `--max_levels` | 40 / 40 | order-book depth per snapshot |
+| `--total_market_data_events <n>` | 1000000 | max total rows across tables; `0` = unlimited |
+| `--start_ts` / `--end_ts <iso>` | after last row / none | data-time window (bound the volume) |
+| `--run_secs <n>` | 0 | **wall-clock** stop (throughput tests); not a data window |
+| `--commit_interval_ms <n>` | 1000 | transaction rate (commit cadence) |
+
+Whichever stop condition (`--end_ts`, `--total_market_data_events`, `--run_secs`)
+is reached **first** ends the run. Total elapsed time is always reported; per-second
+rows/sec (with a summary) is reported only when `--run_secs` is set.
 
 ### Reference data / schema
 
@@ -222,50 +197,33 @@ throughput-test path.
 | --- | --- | --- |
 | `--yahoo_refresh_secs <n>` | 300 | real-time Yahoo refresh interval |
 | `--no_yahoo` | off | skip Yahoo, use template brackets (offline) |
-| `--incremental [true\|false]` | false | seed prices from last stored row, skip Yahoo |
-| `--short_ttl [true\|false]` | off | attach retention to the table |
-| `--enterprise [true\|false]` | off | with `--short_ttl`, use STORAGE POLICY instead of TTL |
-| `--suffix <s>` | none | table becomes `qwp_trades<s>` |
+| `--incremental [true\|false]` | false | seed mids from last stored trade, skip Yahoo |
+| `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise) |
+| `--suffix <s>` | none | tables become `qwp_trades<s>` / `qwp_market_data<s>` |
 | `--lei_pool_size <n>` | 2000 | distinct counterparties |
 
-### Parallelism
+### Accepted but unused / unsupported
 
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `--processes <n>` | 1 | worker threads, 1–30; symbols split by a both-ends popularity draft |
-
-Each worker owns a disjoint, weight-balanced set of symbols end-to-end (own price
-state, own QWP sender), preserving per-symbol continuity; the global
-`--total_market_data_events` cap is shared via an atomic counter.
-
-**Note:** for a single table on a single QuestDB node, **one worker is fastest** —
-the bottleneck is the server's single-writer WAL apply, so extra workers add
-contention (and trigger backpressure pauses) without raising throughput.
-Multi-worker pays off only across multiple tables or nodes.
-
-### Accepted but currently unused
-
-`--chunk_seconds` is accepted for Python-CLI parity but has no effect (state is
-streamed per-second, so there is no upfront precompute to chunk); it prints a
-`[note]`.
-
-ILP/PG-transport flags (`--protocol`, `--pg_port`, `--ilp_user`, `--token_x`,
-`--token_y`) and the order-book / `market_data` / `core_price` / materialized-view
-flags (`--market_data_*_eps`, `--core_*_eps`, `--min_levels`, `--max_levels`,
-`--create_views`) are **not supported** — this is a trades-only QWP generator, so
-passing them is an error.
+`--processes` is **removed** — use `--trades_processes` / `--market_data_processes`.
+`--chunk_seconds` is accepted for parity but has no effect. ILP/PG-transport flags
+(`--protocol`, `--pg_port`, `--ilp_user`, `--token_x`, `--token_y`) and
+`core_price` / materialized-view flags (`--core_*_eps`, `--create_views`) are not
+supported and error if passed.
 
 ## Notes
 
-- **Timestamp safety:** the generator reads `max(timestamp)` from `qwp_trades` and
-  continues strictly after it, so reruns extend the series rather than overlapping
-  it. `--start_ts` overrides this in faster-than-life mode. On an empty table it
-  starts at "now".
-- **Modes:** real-time advances the data clock one second per wall-clock second
-  (and refreshes Yahoo periodically); faster-than-life runs as fast as possible
-  with no wall-clock wait, bounded by `--total_market_data_events` and/or `--end_ts`.
-- **Protocol compatibility:** QWP is a development wire protocol. The running
-  QuestDB server must be protocol-compatible with client `1.3.2`; a mismatch
-  surfaces as a version/role exception at connect time.
-- Java uses its own truststore, so there is no macOS certifi workaround to apply
-  (unlike the Python pipeline).
+- **Faster-than-life respects the per-second rate.** Volume = data-time span ×
+  rate. Bound by `--end_ts` (e.g. one day at 1200 eps → exactly that many rows,
+  ~1200/sec) for a known dataset; `--run_secs` instead runs flat-out for N *wall*
+  seconds and covers as much simulated time as it can (use it for throughput, not
+  to size a dataset). Best practice: set both `--end_ts` and a `--total_market_data_events`
+  safety cap.
+- **Throughput ceiling.** With apply headroom (e.g. a cluster) the limiter is
+  client generation, so per-table workers scale; the eventual wall is the storage
+  out-of-order (O3) apply, which grows with multi-worker data-clock divergence —
+  keep an eye on the WAL lag. Separate tables/pools and modest per-table worker
+  counts keep O3 low.
+- **Protocol compatibility:** QWP is a development wire protocol; the server must
+  be protocol-compatible with client `1.3.2`.
+- Java uses its own truststore — no macOS certifi workaround needed.
+```

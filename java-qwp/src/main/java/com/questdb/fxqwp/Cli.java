@@ -44,9 +44,16 @@ public final class Cli {
     public long totalTrades = 1_000_000;       // max events; 0 = unlimited (real-time)
     public String startTs = null;              // ISO-8601 start (faster-than-life)
     public String endTs = null;                // ISO-8601 max timestamp (upper bound)
-    public int processes = 1;                  // worker threads (1-30)
+    public int tradesProcesses = 1;            // worker threads for qwp_trades (0 = off)
+    public int marketDataProcesses = 0;        // worker threads for qwp_market_data (0 = off)
     public int runSecs = 0;                    // wall-clock run cap in seconds; 0 = no cap
     public int commitIntervalMs = 1000;        // transaction rate: commit (flush) cadence in ms
+
+    // market_data volume (snapshots/sec across its whole pool) and order-book depth
+    public int marketDataMinEps = 1200;
+    public int marketDataMaxEps = 15000;
+    public int minLevels = 40;
+    public int maxLevels = 40;
 
     // --- reference data / schema --------------------------------------------
     public int yahooRefreshSecs = 300;
@@ -131,8 +138,23 @@ public final class Cli {
                 case "end_ts":
                     c.endTs = req(args, ++i, raw);
                     break;
-                case "processes":
-                    c.processes = Integer.parseInt(req(args, ++i, raw));
+                case "trades_processes":
+                    c.tradesProcesses = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "market_data_processes":
+                    c.marketDataProcesses = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "market_data_min_eps":
+                    c.marketDataMinEps = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "market_data_max_eps":
+                    c.marketDataMaxEps = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "min_levels":
+                    c.minLevels = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "max_levels":
+                    c.maxLevels = Integer.parseInt(req(args, ++i, raw));
                     break;
                 case "run_secs":
                 case "runtime_secs":
@@ -195,7 +217,7 @@ public final class Cli {
         if (hosts.isEmpty()) {
             fail("--hosts must list at least one host");
         }
-        if (tradesMinPerSec <= 0 || tradesMaxPerSec < tradesMinPerSec) {
+        if (tradesProcesses > 0 && (tradesMinPerSec <= 0 || tradesMaxPerSec < tradesMinPerSec)) {
             fail("require 0 < --orders_min_per_sec <= --orders_max_per_sec");
         }
         if (token != null && (user != null || password != null)) {
@@ -207,8 +229,22 @@ public final class Cli {
         if (leiPoolSize <= 0) {
             fail("--lei_pool_size must be > 0");
         }
-        if (processes < 1 || processes > 30) {
-            fail("--processes must be between 1 and 30 (one worker thread per disjoint symbol set)");
+        if (tradesProcesses < 0 || tradesProcesses > 30) {
+            fail("--trades_processes must be between 0 and 30");
+        }
+        if (marketDataProcesses < 0 || marketDataProcesses > 30) {
+            fail("--market_data_processes must be between 0 and 30");
+        }
+        if (tradesProcesses == 0 && marketDataProcesses == 0) {
+            fail("enable at least one pool (--trades_processes and/or --market_data_processes > 0)");
+        }
+        if (marketDataProcesses > 0) {
+            if (marketDataMinEps <= 0 || marketDataMaxEps < marketDataMinEps) {
+                fail("require 0 < --market_data_min_eps <= --market_data_max_eps");
+            }
+            if (minLevels < 1 || maxLevels < minLevels) {
+                fail("require 1 <= --min_levels <= --max_levels");
+            }
         }
         if (autoFlushBytes < 1024) {
             fail("--auto_flush_bytes must be >= 1024");
@@ -228,8 +264,12 @@ public final class Cli {
         }
     }
 
-    public String tableName() {
-        return suffix.isEmpty() ? "qwp_trades" : "qwp_trades" + suffix;
+    public String tradesTable() {
+        return "qwp_trades" + suffix;
+    }
+
+    public String marketDataTable() {
+        return "qwp_market_data" + suffix;
     }
 
     public String scheme() {
@@ -351,13 +391,19 @@ public final class Cli {
                 "  --sender_id <id>                  store-and-forward sender id (default qwp-fx-trades)",
                 "  --auto_flush_bytes <n>            QWP sender auto-flush size in bytes (default 524288 = 512 KiB)",
                 "",
-                "Volume / time:",
-                "  --orders_min_per_sec <n>          throughput floor, events/sec (default 50)",
-                "  --orders_max_per_sec <n>          throughput ceiling, events/sec (default 200)",
-                "  --total_market_data_events <n>    max events; 0 = unlimited (default 1000000)",
+                "Pools (one thread set per table; symbols snake-drafted across each pool):",
+                "  --trades_processes <n>            worker threads for qwp_trades, 0-30 (default 1; 0 = off)",
+                "  --market_data_processes <n>       worker threads for qwp_market_data, 0-30 (default 0 = off)",
+                "",
+                "Volume / time (each *_per_sec / *_eps is the table-wide total across its pool):",
+                "  --orders_min_per_sec <n>          qwp_trades orders/sec total (default 50); each order -> 1+ fills",
+                "  --orders_max_per_sec <n>          qwp_trades orders/sec total (default 200)",
+                "  --market_data_min_eps <n>         qwp_market_data snapshots/sec total (default 1200)",
+                "  --market_data_max_eps <n>         qwp_market_data snapshots/sec total (default 15000)",
+                "  --min_levels <n> --max_levels <n> order-book depth per snapshot (default 40/40)",
+                "  --total_market_data_events <n>    max total rows across tables; 0 = unlimited (default 1000000)",
                 "  --start_ts <iso>                  faster-than-life start (default: after last row / now)",
                 "  --end_ts <iso>                    max timestamp / upper bound",
-                "  --processes <n>                   worker threads, 1-30 (default 1); by-symbol split",
                 "  --run_secs <n>                    stop after n wall-clock seconds (0 = no cap; for throughput tests)",
                 "  --commit_interval_ms <n>          transaction rate: commit cadence in ms (default 1000)",
                 "",

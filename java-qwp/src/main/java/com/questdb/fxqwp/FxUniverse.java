@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.SplittableRandom;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -110,12 +111,16 @@ public final class FxUniverse {
     /**
      * Controlled mid-price random walk: small drift each tick, with a rare shock.
      * Clamped to the pair's [low, high] bracket. Mirrors {@code evolve_mid_price}.
+     *
+     * <p>Takes an explicit {@link SplittableRandom} so the walk is <b>deterministic
+     * per symbol</b>: seeded identically in both worker pools, it produces the same
+     * mid for the same (symbol, second), which is what keeps trade prices and the
+     * order-book top-of-book consistent across the two tables.
      */
-    public static double evolveMid(double prevMid, FxPair pair, double driftPips) {
-        ThreadLocalRandom rnd = ThreadLocalRandom.current();
-        double change = rnd.nextDouble(-driftPips * pair.pip, driftPips * pair.pip);
-        if (rnd.nextDouble() < 0.010) {
-            change += rnd.nextDouble(-20 * pair.pip, 20 * pair.pip);
+    public static double evolveMid(double prevMid, FxPair pair, double driftPips, SplittableRandom rng) {
+        double change = rng.nextDouble(-driftPips * pair.pip, driftPips * pair.pip);
+        if (rng.nextDouble() < 0.010) {
+            change += rng.nextDouble(-20 * pair.pip, 20 * pair.pip);
         }
         double newMid = prevMid + change;
         newMid = Math.max(pair.low, Math.min(pair.high, newMid));
@@ -123,16 +128,41 @@ public final class FxUniverse {
     }
 
     /**
-     * Spread random walk expressed in whole pips, mostly flat with rare widening.
-     * Kept within 1..8 pips. Mirrors the spread logic in {@code evolve_state_one_tick}.
+     * Spread random walk in whole pips, mostly flat with rare widening, 1..8 pips.
+     * Deterministic given the per-symbol {@link SplittableRandom}.
      */
-    public static int evolveSpreadPips(int prevSpreadPips) {
-        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+    public static int evolveSpreadPips(int prevSpreadPips, SplittableRandom rng) {
         int[] nudge = {-1, 0, 0, 0, 1};
-        int sp = prevSpreadPips + nudge[rnd.nextInt(nudge.length)];
-        if (rnd.nextDouble() < 0.0005) {
-            sp += rnd.nextInt(3, 11); // 3..10
+        int sp = prevSpreadPips + nudge[rng.nextInt(nudge.length)];
+        if (rng.nextDouble() < 0.0005) {
+            sp += rng.nextInt(3, 11); // 3..10
         }
         return Math.max(1, Math.min(8, sp));
+    }
+
+    /**
+     * Log-scaled volume ladder (50 bands, ~100k to ~1B), mirroring the Python
+     * {@code make_ladder}. Order-book level i draws its volume from band i, so
+     * liquidity grows with depth (best levels thinner, deeper levels heavier).
+     */
+    public static long[] makeVolumeLadder() {
+        int bands = 50;
+        double vMin = 100_000, vMax = 1_000_000_000.0;
+        double step = (Math.log10(vMax) - Math.log10(vMin)) / (bands - 1);
+        long[] ladder = new long[bands];
+        for (int i = 0; i < bands; i++) {
+            ladder[i] = Math.round(Math.pow(10, Math.log10(vMin) + i * step));
+        }
+        return ladder;
+    }
+
+    /** Random volume for order-book level {@code level}, from the ladder band. Mirrors Python. */
+    public static long volumeForLevel(int level, long[] ladder) {
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+        int i = Math.min(level, ladder.length - 1);
+        if (i == 0) {
+            return rnd.nextLong(ladder[0] / 2, ladder[0] + 1);
+        }
+        return rnd.nextLong(ladder[i - 1], ladder[i] + 1);
     }
 }
