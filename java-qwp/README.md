@@ -1,8 +1,9 @@
 # qwp-fx-trades
 
-A single-worker synthetic **FX trade** generator that ingests into QuestDB over
-**QWP** (the WebSocket binary protocol of the QuestDB Java client), with **HA
-failover** across a fleet of hosts.
+A synthetic **FX trade** generator that ingests into QuestDB over **QWP** (the
+WebSocket binary protocol of the QuestDB Java client), with **HA failover** across
+a fleet of hosts. It runs a single worker by default and can fan out across
+**N worker threads** (`--processes`, 1–30) using a by-symbol split.
 
 It is the simplified, trades-only sibling of the Python FX data generator
 (`../fx_data_generator.py`). Differences by design:
@@ -12,7 +13,8 @@ It is the simplified, trades-only sibling of the Python FX data generator
   and `DEDUP UPSERT KEYS(timestamp, trade_id)`).
 - **No** order book, `core_price`, or `market_data` tables.
 - **No** materialized views.
-- **Single worker** using the QWP `Sender`.
+- **Single worker by default**; `--processes N` adds worker threads (one QWP
+  `Sender` each), splitting the symbols by a both-ends popularity draft.
 
 Price realism is kept the same way as the Python generator: each pair's mid
 follows a controlled pip random walk inside a Yahoo-anchored bracket, and trades
@@ -130,12 +132,15 @@ All hosts share **one** credential set and **one** transport scheme:
 - `--tls` — use `wss` for every host. `--tls_insecure` also disables certificate
   validation (self-signed clusters).
 - `--token <t>` **or** `--user <u> --password <p>` — applied to all hosts.
-- Store-and-forward is **on** (`--sf_dir`, default `/tmp/qwp_trades_sf`) so a
-  failover mid-batch does not drop unacknowledged trades; the sender reconnects
-  with backoff and replays from the spill directory.
+- Store-and-forward is **on** (`--sf_dir`, default `/tmp/qwp_trades_sf`, with one
+  `wN` subdir per worker) so a failover mid-batch does not drop unacknowledged
+  trades; the sender reconnects with backoff and replays from the spill directory.
+- **WAL backpressure:** a monitor polls `wal_tables()` every 5s and pauses all
+  workers when the table's `sequencerTxn - writerTxn` lag exceeds `3 × processes`,
+  resuming once the writer has caught up.
 
-Connection and batch-error events are logged, so you can see which node took over
-during a failover.
+Connection and batch-error events are logged (connection events throttled to
+once/second per worker), so you can see which node took over during a failover.
 
 ## Parameters
 
@@ -176,11 +181,26 @@ Option names accept **either** the Python underscore form (`--start_ts`,
 | `--suffix <s>` | none | table becomes `qwp_trades<s>` |
 | `--lei_pool_size <n>` | 2000 | distinct counterparties |
 
+### Parallelism
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--processes <n>` | 1 | worker threads, 1–30; symbols split by a both-ends popularity draft |
+
+Each worker owns a disjoint, weight-balanced set of symbols end-to-end (own price
+state, own QWP sender), preserving per-symbol continuity; the global
+`--total_market_data_events` cap is shared via an atomic counter.
+
+**Note:** for a single table on a single QuestDB node, **one worker is fastest** —
+the bottleneck is the server's single-writer WAL apply, so extra workers add
+contention (and trigger backpressure pauses) without raising throughput.
+Multi-worker pays off only across multiple tables or nodes.
+
 ### Accepted but currently unused
 
-`--processes` (single-worker only; `n>1` is noted and ignored) and
-`--chunk_seconds` (state is streamed per-second, so there is no upfront precompute
-to chunk) are accepted but have no effect yet — each prints a `[note]`.
+`--chunk_seconds` is accepted for Python-CLI parity but has no effect (state is
+streamed per-second, so there is no upfront precompute to chunk); it prints a
+`[note]`.
 
 ILP/PG-transport flags (`--protocol`, `--pg_port`, `--ilp_user`, `--token_x`,
 `--token_y`) and the order-book / `market_data` / `core_price` / materialized-view
