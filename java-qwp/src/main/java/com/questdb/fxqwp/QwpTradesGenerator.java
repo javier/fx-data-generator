@@ -731,15 +731,21 @@ public final class QwpTradesGenerator {
                         }
                         long diff = lag[0] - lag[1]; // sequencerTxn - writerTxn
                         AtomicBoolean flag = pausedFor(kinds.get(i));
-                        if (diff > thresholds.get(i)) {
+                        // Hysteresis: pause when lag climbs above the high-water mark,
+                        // resume once it drains back to half of it (not all the way to 0).
+                        // Riding the apply ceiling in a tight sawtooth keeps the pool
+                        // flowing instead of slamming to 0/s for the full drain.
+                        int highWater = thresholds.get(i);
+                        long lowWater = highWater / 2;
+                        if (diff > highWater) {
                             if (flag.compareAndSet(false, true)) {
                                 System.out.printf("[wal] %s lag %d > %d, pausing %s pool%n",
-                                        tables.get(i), diff, thresholds.get(i), tag(kinds.get(i)));
+                                        tables.get(i), diff, highWater, tag(kinds.get(i)));
                             }
-                        } else if (diff == 0) {
+                        } else if (diff <= lowWater) {
                             if (flag.compareAndSet(true, false)) {
-                                System.out.printf("[wal] %s caught up, resuming %s pool%n",
-                                        tables.get(i), tag(kinds.get(i)));
+                                System.out.printf("[wal] %s drained to %d (<= %d), resuming %s pool%n",
+                                        tables.get(i), diff, lowWater, tag(kinds.get(i)));
                             }
                         }
                         if (flag.get()) {

@@ -139,6 +139,27 @@ mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
     --total_market_data_events 0"
 ```
 
+#### Pinning a target rate (real-time)
+
+In real-time, one data-second is one wall-second, so the per-second rates *are*
+the rows/sec: `--market_data_*_eps` is market_data rows/sec and `--orders_*_per_sec`
+is the order rate. Set the min and max equal for a flat rate. This example pins
+**~1,000,000 market_data rows/sec** with trades at the Python default proportion
+(`orders : market_data` ≈ `30 : 15000` = 1:500, so ~2,000 orders/sec):
+
+```bash
+mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
+    --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
+    --tls_insecure --token_file $HOME/qwp_token.txt \
+    --trades_processes 1 --market_data_processes 2 \
+    --orders_min_per_sec 2000 --orders_max_per_sec 2000 \
+    --market_data_min_eps 1000000 --market_data_max_eps 1000000 \
+    --min_levels 1 --max_levels 2 \
+    --total_market_data_events 0 \
+    --short_ttl true --enterprise true \
+    --suffix _xxx"
+```
+
 Verify (HTTP query endpoint, any node — add the `--suffix` for the throughput run):
 
 ```bash
