@@ -81,6 +81,12 @@ public final class QwpTradesGenerator {
     private final AtomicLong tradesRows = new AtomicLong(0);
     private final AtomicLong mdRows = new AtomicLong(0);
     private final AtomicLong coreRows = new AtomicLong(0);
+    // Wall-clock ms when each pool's last worker finished — pools finish at different
+    // times (the light tables cover the window first), so per-pool rate is rows over
+    // that pool's own active span, not the whole run.
+    private final AtomicLong tradesFinishMs = new AtomicLong(0);
+    private final AtomicLong mdFinishMs = new AtomicLong(0);
+    private final AtomicLong coreFinishMs = new AtomicLong(0);
 
     private QwpTradesGenerator(Cli cfg) {
         this.cfg = cfg;
@@ -189,10 +195,11 @@ public final class QwpTradesGenerator {
 
         double secs = (System.nanoTime() - t0) / 1e9;
         printThroughputSummary(perSecond);
-        System.out.printf("[DONE] in %.2fs: trades=%,d (%,.0f/s), market_data=%,d (%,.0f/s), core_price=%,d (%,.0f/s)%n",
-                secs, tradesRows.get(), secs > 0 ? tradesRows.get() / secs : 0.0,
-                mdRows.get(), secs > 0 ? mdRows.get() / secs : 0.0,
-                coreRows.get(), secs > 0 ? coreRows.get() / secs : 0.0);
+        long totalRows = tradesRows.get() + mdRows.get() + coreRows.get();
+        System.out.printf("[DONE] in %.2fs wall — %,d rows total:%n", secs, totalRows);
+        printPoolDone("trades", tradesRows.get(), tradesFinishMs.get(), wallStartMs);
+        printPoolDone("market_data", mdRows.get(), mdFinishMs.get(), wallStartMs);
+        printPoolDone("core_price", coreRows.get(), coreFinishMs.get(), wallStartMs);
     }
 
     private List<Thread> spawnPool(Kind kind, int processes, int poolMin, int poolMax,
@@ -442,6 +449,7 @@ public final class QwpTradesGenerator {
             } catch (Exception e) {
                 System.err.printf("[%s worker %d] FATAL: %s%n", tag(kind), id, e.getMessage());
             } finally {
+                finishMsFor(kind).accumulateAndGet(System.currentTimeMillis(), Math::max);
                 bidArrays.values().forEach(DoubleArray::close);
                 askArrays.values().forEach(DoubleArray::close);
             }
@@ -795,6 +803,16 @@ public final class QwpTradesGenerator {
         return t;
     }
 
+    /** One per-pool summary line: rows + rate over the pool's own active span. */
+    private void printPoolDone(String name, long rows, long finishMs, long startMs) {
+        if (rows == 0) {
+            return;
+        }
+        double activeSecs = finishMs > startMs ? (finishMs - startMs) / 1000.0 : 0.0;
+        double rate = activeSecs > 0 ? rows / activeSecs : 0.0;
+        System.out.printf("  %-12s %,15d rows  (%,.0f/s over %.1fs)%n", name, rows, rate, activeSecs);
+    }
+
     private void printThroughputSummary(List<Long> perSecond) {
         if (perSecond.isEmpty()) {
             return;
@@ -965,6 +983,14 @@ public final class QwpTradesGenerator {
             case TRADES: return pausedTrades;
             case MARKET_DATA: return pausedMd;
             default: return pausedCore;
+        }
+    }
+
+    private AtomicLong finishMsFor(Kind kind) {
+        switch (kind) {
+            case TRADES: return tradesFinishMs;
+            case MARKET_DATA: return mdFinishMs;
+            default: return coreFinishMs;
         }
     }
 
