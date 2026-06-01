@@ -68,8 +68,10 @@ public final class QwpTradesGenerator {
     private final int totalAllWeight; // sum of (11 - rank) across all pairs
 
     private final AtomicBoolean running = new AtomicBoolean(true);
-    private final AtomicBoolean paused = new AtomicBoolean(false);
-    private final AtomicLong emitted = new AtomicLong(0);     // combined row cap counter
+    // Per-pool pause flags: each table's WAL lag pauses only its own pool, so a
+    // struggling market_data table never freezes the trades pool (and vice versa).
+    private final AtomicBoolean pausedTrades = new AtomicBoolean(false);
+    private final AtomicBoolean pausedMd = new AtomicBoolean(false);
     private final AtomicLong tradesRows = new AtomicLong(0);
     private final AtomicLong mdRows = new AtomicLong(0);
 
@@ -115,12 +117,12 @@ public final class QwpTradesGenerator {
         if (cfg.incremental) {
             seedInitialMidFromDb();
         } else if (!cfg.noYahoo) {
-            new YahooFinance().refreshBrackets(pairs, 1.0);
+            new YahooFinance().refreshBrackets(pairs, 1.0, Long.MIN_VALUE); // startup: reset timeline
         }
         for (int i = 0; i < pairs.size(); i++) {
             FxPair p = pairs.get(i);
             if (initialMid[i] <= 0) {
-                initialMid[i] = FxUniverse.quantizeToPip(p.midOfBracket(), p.pip, p.precision);
+                initialMid[i] = FxUniverse.quantizeToPip(p.midOfBracketAt(0), p.pip, p.precision);
             }
         }
 
@@ -145,7 +147,7 @@ public final class QwpTradesGenerator {
         Thread deadline = cfg.runSecs > 0 ? startDeadline(cfg.runSecs) : null;
         Thread walMonitor = startWalMonitor();
         Thread yahooRefresher = (realtime && !cfg.noYahoo && !cfg.incremental)
-                ? startYahooRefresher() : null;
+                ? startYahooRefresher(wallStartMs) : null;
 
         List<Thread> workers = new ArrayList<>();
         workers.addAll(spawnPool(Kind.TRADES, cfg.tradesProcesses, cfg.tradesMinPerSec,
@@ -309,15 +311,19 @@ public final class QwpTradesGenerator {
             String table = kind == Kind.TRADES ? cfg.tradesTable() : cfg.marketDataTable();
             boolean realtime = "real-time".equals(cfg.mode);
             try (Sender sender = buildSender(kind, id)) {
-                long secondStartNs = alignToSecond(startNs);
+                long base = alignToSecond(startNs);
+                long secondStartNs = base;
                 long secIdx = 0;
                 long lastCommitMs = System.currentTimeMillis();
-                while (running.get() && !stop && !budgetReached() && !pastEnd(secondStartNs, endNs)) {
+                while (running.get() && !stop && !capReached() && !pastEnd(secondStartNs, endNs)) {
                     waitWhilePaused();
                     if (!running.get()) {
                         break;
                     }
-                    emitSecond(sender, table, secondStartNs, realtime ? 7.0 : 5.0);
+                    // Data-second index, identical across both pools for the same
+                    // secondStartNs -> deterministic bracket lookup -> consistent walk.
+                    long k = (secondStartNs - base) / NANOS_PER_SEC;
+                    emitSecond(sender, table, secondStartNs, realtime ? 7.0 : 5.0, k);
                     secondStartNs += NANOS_PER_SEC;
 
                     long nowMs = System.currentTimeMillis();
@@ -344,21 +350,24 @@ public final class QwpTradesGenerator {
             }
         }
 
-        private void emitSecond(Sender sender, String table, long secondStartNs, double driftPips) {
+        private void emitSecond(Sender sender, String table, long secondStartNs, double driftPips, long k) {
             // Advance the deterministic walk once per owned symbol this second (keeps the
             // two pools in lockstep regardless of which events land on which symbol).
+            // Bracket is looked up at second k, so both pools clamp identically.
             for (int j = 0; j < owned.length; j++) {
                 FxPair p = pairs.get(owned[j]);
                 oMid[j] = walkMid[j];
                 oSp[j] = walkSp[j];
-                cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips, walkRng[j]);
+                double lo = p.lowAt(k);
+                double hi = p.highAt(k);
+                cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips, lo, hi, walkRng[j]);
                 cSp[j] = FxUniverse.evolveSpreadPips(oSp[j], walkRng[j]);
             }
 
             int nEvents = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
             long[] offsets = new long[nEvents];
-            for (int k = 0; k < nEvents; k++) {
-                offsets[k] = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
+            for (int e = 0; e < nEvents; e++) {
+                offsets[e] = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
             }
             Arrays.sort(offsets);
 
@@ -381,7 +390,7 @@ public final class QwpTradesGenerator {
                         break;
                     }
                 } else {
-                    if (!claimSlot()) {
+                    if (capReached()) {
                         stop = true;
                         break;
                     }
@@ -421,12 +430,12 @@ public final class QwpTradesGenerator {
                 if (buy ? price > limit : price < limit) {
                     break;
                 }
+                if (capReached()) {
+                    return false;
+                }
                 double lvlVol = FxUniverse.volumeForLevel(lvl, ladder);
                 double qty = Math.min(remaining, lvlVol);
                 remaining -= qty;
-                if (!claimSlot()) {
-                    return false;
-                }
                 String counterparty = leiPool[rnd.nextInt(leiPool.length)];
                 sender.table(table)
                         .symbol("symbol", p.symbol)
@@ -486,8 +495,11 @@ public final class QwpTradesGenerator {
         }
 
         private void waitWhilePaused() throws InterruptedException {
-            while (paused.get() && running.get()) {
-                Thread.sleep(5000);
+            AtomicBoolean flag = pausedFor(kind);
+            // Only spins here while this pool is paused, so a fine 200ms poll is cheap
+            // and lets the worker resume promptly once its table has caught up.
+            while (flag.get() && running.get()) {
+                Thread.sleep(200);
             }
         }
     }
@@ -496,17 +508,20 @@ public final class QwpTradesGenerator {
 
     private Thread startThroughputSampler(List<Long> perSecond) {
         Thread t = new Thread(() -> {
-            long last = 0, sec = 0;
+            long lastT = 0, lastMd = 0, sec = 0;
             try {
                 while (running.get()) {
                     Thread.sleep(1000);
-                    long now = tradesRows.get() + mdRows.get();
-                    long delta = now - last;
-                    last = now;
+                    long nowT = tradesRows.get();
+                    long nowMd = mdRows.get();
+                    long dT = nowT - lastT;
+                    long dMd = nowMd - lastMd;
+                    lastT = nowT;
+                    lastMd = nowMd;
                     sec++;
-                    perSecond.add(delta);
-                    System.out.printf("[rate] t=%ds  %,d rows/sec  (trades %,d, md %,d)%n",
-                            sec, delta, tradesRows.get(), mdRows.get());
+                    perSecond.add(dT + dMd);
+                    System.out.printf("[rate] t=%ds  trades %,d/s  md %,d/s  (total %,d/s)%n",
+                            sec, dT, dMd, dT + dMd);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -552,21 +567,18 @@ public final class QwpTradesGenerator {
                 (double) sum / sorted.length, sorted[sorted.length - 1]);
     }
 
-    private boolean claimSlot() {
-        if (cfg.totalTrades <= 0) {
-            emitted.incrementAndGet();
-            return true;
-        }
-        long s = emitted.getAndIncrement();
-        if (s >= cfg.totalTrades) {
-            emitted.decrementAndGet();
-            return false;
-        }
-        return true;
+    /**
+     * The row-count `--total_market_data_events` caps: the **market_data** table
+     * when that pool is enabled (it dominates and grows fastest, so it defines the
+     * hard stop), otherwise the trades table. When this counter hits the cap the
+     * whole run stops (both pools).
+     */
+    private AtomicLong capCounter() {
+        return cfg.marketDataProcesses > 0 ? mdRows : tradesRows;
     }
 
-    private boolean budgetReached() {
-        return cfg.totalTrades > 0 && emitted.get() >= cfg.totalTrades;
+    private boolean capReached() {
+        return cfg.totalTrades > 0 && capCounter().get() >= cfg.totalTrades;
     }
 
     private boolean pastEnd(long secondStartNs, Long endNs) {
@@ -689,14 +701,21 @@ public final class QwpTradesGenerator {
 
     // ---------------------------------------------------------------- WAL backpressure
 
+    private AtomicBoolean pausedFor(Kind kind) {
+        return kind == Kind.TRADES ? pausedTrades : pausedMd;
+    }
+
     private Thread startWalMonitor() {
+        final List<Kind> kinds = new ArrayList<>();
         final List<String> tables = new ArrayList<>();
         final List<Integer> thresholds = new ArrayList<>();
         if (cfg.tradesProcesses > 0) {
+            kinds.add(Kind.TRADES);
             tables.add(cfg.tradesTable());
             thresholds.add((cfg.tradesProcesses > 2 ? 3 : 5) * cfg.tradesProcesses);
         }
         if (cfg.marketDataProcesses > 0) {
+            kinds.add(Kind.MARKET_DATA);
             tables.add(cfg.marketDataTable());
             thresholds.add((cfg.marketDataProcesses > 2 ? 3 : 5) * cfg.marketDataProcesses);
         }
@@ -704,31 +723,36 @@ public final class QwpTradesGenerator {
             try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
                 client.connect();
                 while (running.get()) {
-                    boolean over = false, allCaught = true;
+                    boolean anyPaused = false;
                     for (int i = 0; i < tables.size(); i++) {
                         long[] lag = queryWalLag(client, tables.get(i));
                         if (lag == null) {
                             continue;
                         }
-                        long diff = lag[0] - lag[1];
+                        long diff = lag[0] - lag[1]; // sequencerTxn - writerTxn
+                        AtomicBoolean flag = pausedFor(kinds.get(i));
                         if (diff > thresholds.get(i)) {
-                            over = true;
-                            if (!paused.get()) {
-                                System.out.printf("[wal] %s lag %d > %d, pausing ingestion%n",
-                                        tables.get(i), diff, thresholds.get(i));
+                            if (flag.compareAndSet(false, true)) {
+                                System.out.printf("[wal] %s lag %d > %d, pausing %s pool%n",
+                                        tables.get(i), diff, thresholds.get(i), tag(kinds.get(i)));
+                            }
+                        } else if (diff == 0) {
+                            if (flag.compareAndSet(true, false)) {
+                                System.out.printf("[wal] %s caught up, resuming %s pool%n",
+                                        tables.get(i), tag(kinds.get(i)));
                             }
                         }
-                        if (diff != 0) {
-                            allCaught = false;
+                        if (flag.get()) {
+                            anyPaused = true;
                         }
                     }
-                    if (over) {
-                        paused.set(true);
-                    } else if (allCaught && paused.compareAndSet(true, false)) {
-                        System.out.println("[wal] caught up, resuming ingestion");
-                    }
-                    for (int s = 0; s < 5 && running.get(); s++) {
-                        Thread.sleep(1000);
+                    // Poll fast (250ms) only while draining a pause; otherwise idle at 5s.
+                    long sleepMs = anyPaused ? 250 : 5000;
+                    long remaining = sleepMs;
+                    while (remaining > 0 && running.get()) {
+                        long chunk = Math.min(remaining, 500);
+                        Thread.sleep(chunk);
+                        remaining -= chunk;
                     }
                 }
             } catch (InterruptedException e) {
@@ -769,7 +793,8 @@ public final class QwpTradesGenerator {
         return out[0] == Long.MIN_VALUE ? null : out;
     }
 
-    private Thread startYahooRefresher() {
+    private Thread startYahooRefresher(long wallStartMs) {
+        final long marginSec = 5;
         Thread t = new Thread(() -> {
             YahooFinance yf = new YahooFinance();
             try {
@@ -780,7 +805,11 @@ public final class QwpTradesGenerator {
                     if (!running.get()) {
                         break;
                     }
-                    yf.refreshBrackets(pairs, 1.0);
+                    // Stamp new brackets a few data-seconds ahead (real-time data clock
+                    // tracks wall clock), so every worker adopts them at the same second
+                    // -> the clamp stays consistent across both pools.
+                    long effSec = (System.currentTimeMillis() - wallStartMs) / 1000 + marginSec;
+                    yf.refreshBrackets(pairs, 1.0, effSec);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -881,8 +910,7 @@ public final class QwpTradesGenerator {
                                 if (px > 0) {
                                     FxPair p = pairs.get(i);
                                     initialMid[i] = FxUniverse.quantizeToPip(px, p.pip, p.precision);
-                                    p.low = px * 0.99;
-                                    p.high = px * 1.01;
+                                    p.resetBracket(px * 0.99, px * 1.01);
                                 }
                             });
                         }

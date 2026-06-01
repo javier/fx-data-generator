@@ -35,17 +35,30 @@ public final class YahooFinance {
      * @param pairs       pairs to refresh in place
      * @param bracketPct  half-width of the bracket as a percentage (1.0 == +/-1%)
      */
-    public void refreshBrackets(List<FxPair> pairs, double bracketPct) {
+    /**
+     * Refresh each pair's [low, high] bracket from its live mid.
+     *
+     * @param effSec the data-second at which the new brackets take effect. Pass
+     *               {@link Long#MIN_VALUE} for the startup fetch (resets the timeline
+     *               to a single initial bracket); pass a future data-second for a
+     *               periodic real-time refresh (appends, so both pools adopt it at
+     *               the same second). A failed fetch keeps the current bracket.
+     */
+    public void refreshBrackets(List<FxPair> pairs, double bracketPct, long effSec) {
         double pct = bracketPct / 100.0;
         System.out.println("[INFO] Refreshing reference data from Yahoo Finance.");
         for (FxPair pair : pairs) {
             Double mid = fetchMid(pair.yahooTicker());
             if (mid != null && mid > 0 && !mid.isNaN()) {
-                pair.low = mid * (1 - pct);
-                pair.high = mid * (1 + pct);
+                double low = mid * (1 - pct);
+                double high = mid * (1 + pct);
+                if (effSec == Long.MIN_VALUE) {
+                    pair.resetBracket(low, high);
+                } else {
+                    pair.appendBracket(effSec, low, high);
+                }
             } else {
-                System.out.printf("[YF] %s: fallback to template bracket [%s, %s]%n",
-                        pair.symbol, pair.low, pair.high);
+                System.out.printf("[YF] %s: keeping current bracket (fetch failed)%n", pair.symbol);
             }
         }
     }

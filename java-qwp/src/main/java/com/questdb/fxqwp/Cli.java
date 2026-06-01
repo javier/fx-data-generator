@@ -401,7 +401,7 @@ public final class Cli {
                 "  --market_data_min_eps <n>         qwp_market_data snapshots/sec total (default 1200)",
                 "  --market_data_max_eps <n>         qwp_market_data snapshots/sec total (default 15000)",
                 "  --min_levels <n> --max_levels <n> order-book depth per snapshot (default 40/40)",
-                "  --total_market_data_events <n>    max total rows across tables; 0 = unlimited (default 1000000)",
+                "  --total_market_data_events <n>    max market_data rows (the dominant table; trades if md off); stops the run; 0 = unlimited",
                 "  --start_ts <iso>                  faster-than-life start (default: after last row / now)",
                 "  --end_ts <iso>                    max timestamp / upper bound",
                 "  --run_secs <n>                    stop after n wall-clock seconds (0 = no cap; for throughput tests)",

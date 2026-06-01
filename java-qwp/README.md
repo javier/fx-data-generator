@@ -182,7 +182,7 @@ Option names accept Python underscore form (`--start_ts`) or kebab form
 | `--orders_min/max_per_sec` | 50 / 200 | `qwp_trades` orders/sec; each order → 1+ fills |
 | `--market_data_min/max_eps` | 1200 / 15000 | `qwp_market_data` snapshots/sec |
 | `--min_levels` / `--max_levels` | 40 / 40 | order-book depth per snapshot |
-| `--total_market_data_events <n>` | 1000000 | max total rows across tables; `0` = unlimited |
+| `--total_market_data_events <n>` | 1000000 | max **market_data** rows (the dominant table; caps trades if market_data is off); stops the whole run; `0` = unlimited |
 | `--start_ts` / `--end_ts <iso>` | after last row / none | data-time window (bound the volume) |
 | `--run_secs <n>` | 0 | **wall-clock** stop (throughput tests); not a data window |
 | `--commit_interval_ms <n>` | 1000 | transaction rate (commit cadence) |

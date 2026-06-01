@@ -117,13 +117,14 @@ public final class FxUniverse {
      * mid for the same (symbol, second), which is what keeps trade prices and the
      * order-book top-of-book consistent across the two tables.
      */
-    public static double evolveMid(double prevMid, FxPair pair, double driftPips, SplittableRandom rng) {
+    public static double evolveMid(double prevMid, FxPair pair, double driftPips,
+                                   double low, double high, SplittableRandom rng) {
         double change = rng.nextDouble(-driftPips * pair.pip, driftPips * pair.pip);
         if (rng.nextDouble() < 0.010) {
             change += rng.nextDouble(-20 * pair.pip, 20 * pair.pip);
         }
         double newMid = prevMid + change;
-        newMid = Math.max(pair.low, Math.min(pair.high, newMid));
+        newMid = Math.max(low, Math.min(high, newMid));
         return quantizeToPip(newMid, pair.pip, pair.precision);
     }
 
