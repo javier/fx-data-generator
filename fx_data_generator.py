@@ -357,6 +357,16 @@ def retention_clause(short_ttl, enterprise, oss_ttl, enterprise_policy):
     return f'TTL {oss_ttl}'
 
 
+# Materialized views currently cannot accept STORAGE POLICY in QuestDB, so they
+# always fall back to TTL semantics (even in enterprise mode). The enterprise_policy
+# argument is accepted but ignored, so callers can keep their existing signatures
+# and we can revert by pointing the matview `rc` lambda back at retention_clause.
+def mv_retention_clause(short_ttl, enterprise, oss_ttl, enterprise_policy):
+    if not short_ttl:
+        return ''
+    return f'TTL {oss_ttl}'
+
+
 TABLE_ENTERPRISE_POLICY = 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 3 months'
 
 
@@ -408,7 +418,10 @@ def ensure_materialized_views_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     short_ttl = args.short_ttl
     enterprise = args.enterprise
-    rc = lambda oss_ttl, ep: retention_clause(short_ttl, enterprise, oss_ttl, ep)
+    # Storage policies are not yet supported on materialized views in QuestDB.
+    # To re-enable storage policies for matviews, swap the lambdas below.
+    # rc = lambda oss_ttl, ep: retention_clause(short_ttl, enterprise, oss_ttl, ep)
+    rc = lambda oss_ttl, ep: mv_retention_clause(short_ttl, enterprise, oss_ttl, ep)
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1s', suffix)}  AS (
