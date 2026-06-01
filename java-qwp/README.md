@@ -176,13 +176,13 @@ mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
     --suffix _xxx"
 ```
 
-#### All three tables, ~1M rows/sec total (real-time)
+#### All three tables, just over 1M rows/sec total (real-time)
 
-Splits a round 1M rows/sec across the tables — **750K market_data + 225K core_price
-+ ~25K trades**. core_price (top-of-book) is rate-controlled directly by its eps;
-trades is `orders × fills`, and each order fills ~3.5 book levels (measured at depth
-≥ ~11), so ~7,150 orders/sec ≈ 25K trade rows/sec. Bump `--orders_*_per_sec` live to
-raise the trade share:
+Splits ~1.015M rows/sec across the tables — **750K market_data + 240K core_price
++ ~25K trades**. market_data and core_price (top-of-book) are rate-controlled
+directly by their eps; trades is `orders × fills`, and each order fills ~3.5 book
+levels (measured at depth ≥ ~11), so ~7,150 orders/sec ≈ 25K trade rows/sec. Bump
+`--orders_*_per_sec` live to raise the trade share:
 
 ```bash
 mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
@@ -191,7 +191,7 @@ mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
     --trades_processes 1 --market_data_processes 3 --core_processes 1 \
     --orders_min_per_sec 7150 --orders_max_per_sec 7150 \
     --market_data_min_eps 750000 --market_data_max_eps 750000 \
-    --core_min_eps 225000 --core_max_eps 225000 \
+    --core_min_eps 240000 --core_max_eps 240000 \
     --min_levels 20 --max_levels 20 \
     --total_market_data_events 0 \
     --short_ttl true --enterprise true \
