@@ -84,8 +84,9 @@ With `--create_views true` the generator also creates three matviews over
 All use `CREATE ... IF NOT EXISTS` (idempotent — to redefine one, drop it first).
 Retention follows Python: matviews always take **TTL** (not STORAGE POLICY, which
 QuestDB doesn't yet support on views) when `--short_ttl` is set, via a helper that's
-ready to switch to storage policies once enterprise matviews support them. `OWNED BY
-'admin'` is attached when `--enterprise` is set.
+ready to switch to storage policies once enterprise matviews support them. The views
+are owned by the connecting (ingest) user — no `OWNED BY` clause — so creation never
+requires admin/superuser privileges.
 
 ## Prerequisites
 

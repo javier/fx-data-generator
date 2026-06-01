@@ -968,7 +968,8 @@ public final class QwpTradesGenerator {
      * Optional materialized views over market_data (Python parity, suffix-aware):
      * a 1m OHLC (REFRESH IMMEDIATE), a 15m OHLC cascading off the 1m view
      * (REFRESH EVERY 5m), and an hourly BBO (REFRESH EVERY 10m). Retention is TTL via
-     * {@link #mvRetentionClause(String)}; OWNED BY 'admin' is attached on enterprise.
+     * {@link #mvRetentionClause(String)}. The views are owned by the connecting user
+     * (no OWNED BY clause), so creation never needs admin/superuser privileges.
      */
     private void createViews() {
         if (!cfg.createViews) {
@@ -984,26 +985,25 @@ public final class QwpTradesGenerator {
         String md15m = "qwp_market_data_ohlc_15m" + cfg.suffix;
         String bbo1h = "qwp_bbo_1h" + cfg.suffix;
         String ttl = mvRetentionClause("3 DAYS");
-        String owned = cfg.enterprise ? " OWNED BY 'admin'" : "";
 
         execDdl(md1m, "CREATE MATERIALIZED VIEW IF NOT EXISTS '" + md1m + "' WITH BASE '" + md + "' REFRESH IMMEDIATE AS ("
                 + "SELECT timestamp, symbol, "
                 + "first(best_bid) AS open, max(best_bid) AS high, min(best_bid) AS low, last(best_bid) AS close, "
                 + "SUM(bids[2][1]) AS total_volume "
                 + "FROM " + md + " SAMPLE BY 1m"
-                + ") PARTITION BY HOUR" + ttl + owned);
+                + ") PARTITION BY HOUR" + ttl);
 
         execDdl(md15m, "CREATE MATERIALIZED VIEW IF NOT EXISTS '" + md15m + "' WITH BASE '" + md1m + "' REFRESH EVERY 5m AS ("
                 + "SELECT timestamp, symbol, "
                 + "first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, "
                 + "SUM(total_volume) AS total_volume "
                 + "FROM " + md1m + " SAMPLE BY 15m"
-                + ") PARTITION BY HOUR" + ttl + owned);
+                + ") PARTITION BY HOUR" + ttl);
 
         execDdl(bbo1h, "CREATE MATERIALIZED VIEW IF NOT EXISTS '" + bbo1h + "' REFRESH EVERY 10m AS ("
                 + "SELECT timestamp, symbol, max(best_bid) AS bid, min(best_ask) AS ask "
                 + "FROM " + md + " SAMPLE BY 1h"
-                + ") PARTITION BY DAY" + ttl + owned);
+                + ") PARTITION BY DAY" + ttl);
     }
 
     private void execDdl(String table, String ddl) {
