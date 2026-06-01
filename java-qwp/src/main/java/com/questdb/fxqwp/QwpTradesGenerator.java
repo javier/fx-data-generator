@@ -147,6 +147,9 @@ public final class QwpTradesGenerator {
         List<Long> perSecond = new ArrayList<>();
         Thread sampler = cfg.runSecs > 0 ? startThroughputSampler(perSecond) : null;
         Thread deadline = cfg.runSecs > 0 ? startDeadline(cfg.runSecs) : null;
+        // Outside benchmark mode (no --run_secs), emit a lightweight heartbeat every
+        // 10s so a long-running stream still shows it is alive and keeping pace.
+        Thread heartbeat = cfg.runSecs == 0 ? startHeartbeat() : null;
         Thread walMonitor = startWalMonitor();
         Thread yahooRefresher = (realtime && !cfg.noYahoo && !cfg.incremental)
                 ? startYahooRefresher(wallStartMs) : null;
@@ -173,6 +176,10 @@ public final class QwpTradesGenerator {
         if (sampler != null) {
             sampler.interrupt();
             sampler.join(1500);
+        }
+        if (heartbeat != null) {
+            heartbeat.interrupt();
+            heartbeat.join(1000);
         }
         if (walMonitor != null) {
             walMonitor.join(2000);
@@ -609,6 +616,59 @@ public final class QwpTradesGenerator {
                 Thread.currentThread().interrupt();
             }
         }, "qwp-throughput-sampler");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    /**
+     * Continuous-mode heartbeat: every ~10s print, per enabled table, the average
+     * rows/sec over the interval and the accumulated row count. Daemon thread that
+     * only reads the row counters, so it never touches the ingestion hot path.
+     */
+    private Thread startHeartbeat() {
+        Thread t = new Thread(() -> {
+            long lastMs = System.currentTimeMillis();
+            long lastT = 0, lastMd = 0, lastCp = 0, elapsed = 0;
+            try {
+                while (running.get()) {
+                    long target = 10_000, slept = 0;
+                    while (slept < target && running.get()) {
+                        long chunk = Math.min(500, target - slept);
+                        Thread.sleep(chunk);
+                        slept += chunk;
+                    }
+                    if (!running.get()) {
+                        break;
+                    }
+                    long now = System.currentTimeMillis();
+                    double dt = (now - lastMs) / 1000.0;
+                    if (dt <= 0) {
+                        dt = 1;
+                    }
+                    long nowT = tradesRows.get(), nowMd = mdRows.get(), nowCp = coreRows.get();
+                    elapsed += Math.round(dt);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("[hb] t=").append(elapsed).append("s ");
+                    if (cfg.tradesProcesses > 0) {
+                        sb.append(String.format("  trades %,d/s (%,d)", Math.round((nowT - lastT) / dt), nowT));
+                    }
+                    if (cfg.marketDataProcesses > 0) {
+                        sb.append(String.format("  md %,d/s (%,d)", Math.round((nowMd - lastMd) / dt), nowMd));
+                    }
+                    if (cfg.coreProcesses > 0) {
+                        sb.append(String.format("  core %,d/s (%,d)", Math.round((nowCp - lastCp) / dt), nowCp));
+                    }
+                    System.out.println(sb);
+                    lastMs = now;
+                    lastT = nowT;
+                    lastMd = nowMd;
+                    lastCp = nowCp;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "qwp-heartbeat");
         t.setDaemon(true);
         t.start();
         return t;

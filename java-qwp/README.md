@@ -257,8 +257,15 @@ Option names accept Python underscore form (`--start_ts`) or kebab form
 | `--commit_interval_ms <n>` | 1000 | transaction rate (commit cadence) |
 
 Whichever stop condition (`--end_ts`, `--total_market_data_events`, `--run_secs`)
-is reached **first** ends the run. Total elapsed time is always reported; per-second
-rows/sec (with a summary) is reported only when `--run_secs` is set.
+is reached **first** ends the run. Total elapsed time is always reported. Reporting
+depends on the mode:
+
+- **Benchmark mode (`--run_secs > 0`):** a per-second `[rate]` line (`trades` / `md`
+  / `core`) plus a min/median/avg/max summary at the end.
+- **Continuous mode (no `--run_secs`):** a lightweight `[hb]` heartbeat every 10s
+  showing, per enabled table, the average rows/sec over the interval and the
+  accumulated row count, e.g.
+  `[hb] t=20s  trades 25,030/s (500,600)  md 749,900/s (15M)  core 240,100/s (4.8M)`.
 
 ### Reference data / schema
 
