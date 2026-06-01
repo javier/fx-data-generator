@@ -78,10 +78,12 @@ HOSTS=127.0.0.1:9000 ./run_realtime.sh
 HOSTS=127.0.0.1:9000 TOTAL=1000000 ./run_backfill.sh
 ```
 
-Or invoke directly with `mvn exec:java` (see the full parameter list below):
+Or invoke directly with `mvn compile exec:java` (the `compile` goal is required —
+`exec:java` alone does not build, so a fresh checkout would hit
+`ClassNotFoundException`). See the full parameter list below:
 
 ```bash
-mvn -q -f ./pom.xml exec:java -Dexec.args="--mode real-time \
+mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token_file $HOME/qwp_token.txt --total_market_data_events 0"
 ```
@@ -89,7 +91,7 @@ mvn -q -f ./pom.xml exec:java -Dexec.args="--mode real-time \
 Show all options:
 
 ```bash
-mvn -q -f ./pom.xml exec:java -Dexec.args="--help"
+mvn -q -f ./pom.xml compile exec:java -Dexec.args="--help"
 ```
 
 ## Examples
@@ -109,7 +111,7 @@ every second, then a min/median/avg/max summary and total elapsed (generate/send
 time only, excluding Yahoo/DDL). Writes to a throwaway `qwp_trades_xxx`:
 
 ```bash
-mvn -q -f ./pom.xml exec:java -Dexec.args="--mode faster-than-life \
+mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token_file $HOME/qwp_token.txt \
     --processes 1 \
@@ -125,7 +127,7 @@ Fill history forward from a start timestamp as fast as possible, stopping at a
 fixed row count:
 
 ```bash
-mvn -q -f ./pom.xml exec:java -Dexec.args="--mode faster-than-life \
+mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token_file $HOME/qwp_token.txt \
     --processes 1 \
@@ -141,7 +143,7 @@ Wall-clock paced (one data-second per real second), periodic Yahoo refresh, runs
 until Ctrl+C:
 
 ```bash
-mvn -q -f ./pom.xml exec:java -Dexec.args="--mode real-time \
+mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token_file $HOME/qwp_token.txt \
     --processes 1 \
