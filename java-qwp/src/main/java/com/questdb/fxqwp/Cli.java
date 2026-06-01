@@ -1,5 +1,8 @@
 package com.questdb.fxqwp;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -77,7 +80,16 @@ public final class Cli {
                     c.tlsInsecure = true;
                     break;
                 case "token":
+                    if (c.token != null) {
+                        fail("use either --token or --token_file, not both");
+                    }
                     c.token = req(args, ++i, raw);
+                    break;
+                case "token_file":
+                    if (c.token != null) {
+                        fail("use either --token or --token_file, not both");
+                    }
+                    c.token = readTokenFile(req(args, ++i, raw));
                     break;
                 case "user":
                     c.user = req(args, ++i, raw);
@@ -299,6 +311,20 @@ public final class Cli {
         return args[i];
     }
 
+    /** Read the QWP token from a file (trimmed), so it never appears on the command line. */
+    private static String readTokenFile(String path) {
+        try {
+            String t = Files.readString(Paths.get(path)).trim();
+            if (t.isEmpty()) {
+                fail("--token_file " + path + " is empty");
+            }
+            return t;
+        } catch (IOException e) {
+            fail("could not read --token_file " + path + ": " + e.getMessage());
+            return null; // unreachable: fail() throws
+        }
+    }
+
     private static void fail(String msg) {
         System.err.println("ERROR: " + msg + "\n");
         printUsage();
@@ -319,6 +345,7 @@ public final class Cli {
                 "  --tls                             use wss for every host",
                 "  --tls_insecure                    use wss and disable certificate validation",
                 "  --token <t>                       QWP/bearer token   (enterprise)",
+                "  --token_file <path>               read the QWP token from a file (keeps it off the CLI)",
                 "  --user <u> --password <p>         OR HTTP basic auth",
                 "  --sf_dir <dir>                    store-and-forward dir (default /tmp/qwp_trades_sf)",
                 "  --sender_id <id>                  store-and-forward sender id (default qwp-fx-trades)",

@@ -86,7 +86,7 @@ Or invoke directly with `mvn exec:java` (see the full parameter list below):
 ```bash
 mvn -q exec:java -Dexec.args="--mode real-time \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token <TOKEN> --total_market_data_events 0"
+    --tls_insecure --token_file ~/qwp_token.txt --total_market_data_events 0"
 ```
 
 Show all options:
@@ -97,10 +97,12 @@ mvn -q exec:java -Dexec.args="--help"
 
 ## Examples
 
-All examples target an HA fleet (internal VPC IPs). `<TOKEN>` is a placeholder —
-substitute your QWP ingestion token; don't commit a real one. `--tls_insecure`
-uses `wss` and **skips TLS certificate validation** (self-signed test clusters);
-on a cluster with valid certs use `--tls` instead.
+All examples target an HA fleet (internal VPC IPs) and read the QWP token from a
+file via `--token_file ~/qwp_token.txt` — put your token in that file (e.g.
+`echo '<your-token>' > ~/qwp_token.txt && chmod 600 ~/qwp_token.txt`) so it never
+appears on the command line or in shell history. `--tls_insecure` uses `wss` and
+**skips TLS certificate validation** (self-signed test clusters); on a cluster
+with valid certs use `--tls` instead.
 
 ### 1-minute throughput test
 
@@ -111,7 +113,7 @@ time only, excluding Yahoo/DDL). Writes to a throwaway `qwp_trades_xxx`:
 ```bash
 mvn -q exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token <TOKEN> \
+    --tls_insecure --token_file ~/qwp_token.txt \
     --processes 1 \
     --total_market_data_events 0 --run_secs 60 \
     --orders_min_per_sec 1000 --orders_max_per_sec 1000 \
@@ -127,7 +129,7 @@ fixed row count:
 ```bash
 mvn -q exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token <TOKEN> \
+    --tls_insecure --token_file ~/qwp_token.txt \
     --processes 1 \
     --total_market_data_events 20000000 \
     --start_ts 2026-05-22T00:00:00.000000Z \
@@ -143,7 +145,7 @@ until Ctrl+C:
 ```bash
 mvn -q exec:java -Dexec.args="--mode real-time \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token <TOKEN> \
+    --tls_insecure --token_file ~/qwp_token.txt \
     --processes 1 \
     --total_market_data_events 0 \
     --orders_min_per_sec 2000 --orders_max_per_sec 5000 \
@@ -164,7 +166,8 @@ All hosts share **one** credential set and **one** transport scheme:
 - `--hosts h1:9000,h2:9000,h3:9000` — the failover fleet (`--host` for a single host).
 - `--tls` — use `wss` for every host. `--tls_insecure` also disables certificate
   validation (self-signed clusters).
-- `--token <t>` **or** `--user <u> --password <p>` — applied to all hosts.
+- `--token <t>` (or `--token_file <path>` to keep the token off the command line
+  and shell history) **or** `--user <u> --password <p>` — applied to all hosts.
 - Store-and-forward is **on** (`--sf_dir`, default `/tmp/qwp_trades_sf`, with one
   `wN` subdir per worker) so a failover mid-batch does not drop unacknowledged
   trades; the sender reconnects with backoff and replays from the spill directory.
@@ -190,6 +193,7 @@ Option names accept **either** the Python underscore form (`--start_ts`,
 | `--hosts` (`--host`) | `127.0.0.1:9000` | comma-separated HA fleet |
 | `--tls` / `--tls_insecure` | off | `wss` for all hosts (insecure = skip cert check) |
 | `--token` | none | QWP/bearer token (enterprise), shared across hosts |
+| `--token_file <path>` | none | read the token from a file instead of `--token` (keeps it off the CLI / shell history) |
 | `--user` + `--password` | none | OR HTTP basic auth, shared across hosts |
 | `--sf_dir <dir>` | `/tmp/qwp_trades_sf` | store-and-forward spill directory |
 | `--sender_id <id>` | `qwp-fx-trades` | store-and-forward sender id |
