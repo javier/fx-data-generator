@@ -15,6 +15,11 @@ It is the simplified, trades-only sibling of the Python FX data generator
 - **No** materialized views.
 - **Single worker by default**; `--processes N` adds worker threads (one QWP
   `Sender` each), splitting the symbols by a both-ends popularity draft.
+- **Transactional ingestion** (always on): frames stream to the server deferred,
+  and each worker commits one WAL transaction on a fixed cadence
+  (`--commit_interval_ms`, default 1s), so commit size is decoupled from WebSocket
+  frame size — many byte-bounded frames commit as one transaction, keeping the
+  WAL sequencer/writer gap small.
 
 Price realism is kept the same way as the Python generator: each pair's mid
 follows a controlled pip random walk inside a Yahoo-anchored bracket, and trades
@@ -79,7 +84,8 @@ HOSTS=127.0.0.1:9000 TOTAL=1000000 ./run_backfill.sh
 Or invoke directly with `mvn exec:java` (see the full parameter list below):
 
 ```bash
-mvn -q exec:java -Dexec.args="--mode real-time --hosts h1:9000,h2:9000,h3:9000 \
+mvn -q exec:java -Dexec.args="--mode real-time \
+    --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token <TOKEN> --total_market_data_events 0"
 ```
 
@@ -89,39 +95,66 @@ Show all options:
 mvn -q exec:java -Dexec.args="--help"
 ```
 
-## Example: how we run it
+## Examples
 
-A 20M-row faster-than-life backfill into a local QuestDB, offline (no Yahoo), at a
-steady 1000 events/sec of data-clock density:
+All examples target an HA fleet (internal VPC IPs). `<TOKEN>` is a placeholder —
+substitute your QWP ingestion token; don't commit a real one. `--tls_insecure`
+uses `wss` and **skips TLS certificate validation** (self-signed test clusters);
+on a cluster with valid certs use `--tls` instead.
 
-```bash
-mvn -q exec:java -Dexec.args="--mode faster-than-life --no_yahoo \
-    --hosts 127.0.0.1:9000 \
-    --total_market_data_events 20000000 \
-    --orders_min_per_sec 1000 --orders_max_per_sec 1000"
-```
+### 1-minute throughput test
 
-The run ends with a throughput line, e.g.:
-
-```
-[DONE] emitted 20000000 trades in 12.23s = 1,634,846 trades/sec.
-```
-
-Verify what landed (HTTP query endpoint):
-
-```bash
-curl -s "http://localhost:9000/exec?query=SELECT%20count()%20rows,%20count_distinct(trade_id)%20ids,%20min(timestamp)%20first_ts,%20max(timestamp)%20last_ts%20FROM%20qwp_trades"
-```
-
-A realistic HA + TLS + token backfill against an enterprise cluster:
+Faster-than-life, single worker, bounded to 60 wall-clock seconds. Prints rows/sec
+every second, then a min/median/avg/max summary and total elapsed (generate/send
+time only, excluding Yahoo/DDL). Writes to a throwaway `qwp_trades_xxx`:
 
 ```bash
 mvn -q exec:java -Dexec.args="--mode faster-than-life \
-    --hosts primary:9000,replica1:9000,replica2:9000 \
+    --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
     --tls_insecure --token <TOKEN> \
-    --total_market_data_events 5000000 \
-    --orders_min_per_sec 100 --orders_max_per_sec 500 \
-    --start_ts 2026-05-29T00:00:00"
+    --processes 1 \
+    --total_market_data_events 0 --run_secs 60 \
+    --orders_min_per_sec 1000 --orders_max_per_sec 1000 \
+    --short_ttl true --enterprise true \
+    --suffix _xxx"
+```
+
+### Backfill (faster-than-life, bounded by row count)
+
+Fill history forward from a start timestamp as fast as possible, stopping at a
+fixed row count:
+
+```bash
+mvn -q exec:java -Dexec.args="--mode faster-than-life \
+    --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
+    --tls_insecure --token <TOKEN> \
+    --processes 1 \
+    --total_market_data_events 20000000 \
+    --start_ts 2026-05-22T00:00:00.000000Z \
+    --orders_min_per_sec 1000 --orders_max_per_sec 1000 \
+    --short_ttl true --enterprise true"
+```
+
+### Real-time (continuous stream)
+
+Wall-clock paced (one data-second per real second), periodic Yahoo refresh, runs
+until Ctrl+C:
+
+```bash
+mvn -q exec:java -Dexec.args="--mode real-time \
+    --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
+    --tls_insecure --token <TOKEN> \
+    --processes 1 \
+    --total_market_data_events 0 \
+    --orders_min_per_sec 2000 --orders_max_per_sec 5000 \
+    --short_ttl true --enterprise true"
+```
+
+Verify what landed (HTTP query endpoint, against any node — use `qwp_trades_xxx`
+for the throughput example):
+
+```bash
+curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20rows,%20count_distinct(trade_id)%20ids,%20min(timestamp)%20first_ts,%20max(timestamp)%20last_ts%20FROM%20qwp_trades"
 ```
 
 ## HA / connection model
@@ -136,8 +169,10 @@ All hosts share **one** credential set and **one** transport scheme:
   `wN` subdir per worker) so a failover mid-batch does not drop unacknowledged
   trades; the sender reconnects with backoff and replays from the spill directory.
 - **WAL backpressure:** a monitor polls `wal_tables()` every 5s and pauses all
-  workers when the table's `sequencerTxn - writerTxn` lag exceeds `3 × processes`,
-  resuming once the writer has caught up.
+  workers when the table's `sequencerTxn - writerTxn` lag exceeds the threshold —
+  `3 × processes` for more than 2 workers, `5 × processes` for 2 or fewer —
+  resuming once the writer has caught up. These stay small because transactional
+  commits keep only a few large transactions in flight at a time.
 
 Connection and batch-error events are logged (connection events throttled to
 once/second per worker), so you can see which node took over during a failover.
@@ -168,6 +203,14 @@ Option names accept **either** the Python underscore form (`--start_ts`,
 | `--total_market_data_events` | 1000000 | max events; `0` = unlimited (real-time) |
 | `--start_ts <iso>` | after last row / now | start of data clock (faster-than-life) |
 | `--end_ts <iso>` | none | max timestamp / upper bound |
+| `--run_secs <n>` | 0 (no cap) | stop after n wall-clock seconds (fixed-duration throughput test) |
+| `--commit_interval_ms <n>` | 1000 | transaction rate: how often each worker commits (flush) |
+
+**Total elapsed** generate/send time is **always** reported at the end
+(`[DONE] emitted N in X.XXs = Y trades/sec`; it excludes Yahoo and DDL startup).
+**Per-second** throughput (`[rate] t=Ns  … rows/sec`, plus a min/median/avg/max
+summary) is reported **only when `--run_secs` is set** — that's the fixed-duration
+throughput-test path.
 
 ### Reference data / schema
 

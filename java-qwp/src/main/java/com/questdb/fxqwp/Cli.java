@@ -41,7 +41,9 @@ public final class Cli {
     public long totalTrades = 1_000_000;       // max events; 0 = unlimited (real-time)
     public String startTs = null;              // ISO-8601 start (faster-than-life)
     public String endTs = null;                // ISO-8601 max timestamp (upper bound)
-    public int processes = 1;                  // single-worker generator (see note)
+    public int processes = 1;                  // worker threads (1-30)
+    public int runSecs = 0;                    // wall-clock run cap in seconds; 0 = no cap
+    public int commitIntervalMs = 1000;        // transaction rate: commit (flush) cadence in ms
 
     // --- reference data / schema --------------------------------------------
     public int yahooRefreshSecs = 300;
@@ -120,6 +122,13 @@ public final class Cli {
                 case "processes":
                     c.processes = Integer.parseInt(req(args, ++i, raw));
                     break;
+                case "run_secs":
+                case "runtime_secs":
+                    c.runSecs = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "commit_interval_ms":
+                    c.commitIntervalMs = Integer.parseInt(req(args, ++i, raw));
+                    break;
 
                 // ---- reference data / schema ----
                 case "yahoo_refresh_secs":
@@ -192,12 +201,18 @@ public final class Cli {
         if (autoFlushBytes < 1024) {
             fail("--auto_flush_bytes must be >= 1024");
         }
+        if (runSecs < 0) {
+            fail("--run_secs must be >= 0");
+        }
+        if (commitIntervalMs < 1) {
+            fail("--commit_interval_ms must be >= 1");
+        }
         if (autoFlushBytes > 900_000) {
             System.out.println("[note] --auto_flush_bytes " + autoFlushBytes
                     + " is near/above the QWP WebSocket frame cap (~1MB); large frames risk a 1009 rejection.");
         }
-        if ("faster-than-life".equals(mode) && totalTrades <= 0 && endTs == null) {
-            fail("faster-than-life requires a bound: set --total_market_data_events > 0 or --end_ts");
+        if ("faster-than-life".equals(mode) && totalTrades <= 0 && endTs == null && runSecs <= 0) {
+            fail("faster-than-life requires a bound: set --total_market_data_events > 0, --end_ts, or --run_secs");
         }
     }
 
@@ -316,6 +331,8 @@ public final class Cli {
                 "  --start_ts <iso>                  faster-than-life start (default: after last row / now)",
                 "  --end_ts <iso>                    max timestamp / upper bound",
                 "  --processes <n>                   worker threads, 1-30 (default 1); by-symbol split",
+                "  --run_secs <n>                    stop after n wall-clock seconds (0 = no cap; for throughput tests)",
+                "  --commit_interval_ms <n>          transaction rate: commit cadence in ms (default 1000)",
                 "",
                 "Reference data / schema:",
                 "  --yahoo_refresh_secs <n>          real-time Yahoo refresh interval (default 300)",

@@ -70,7 +70,6 @@ public final class QwpTradesGenerator {
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final AtomicBoolean paused = new AtomicBoolean(false);
     private final AtomicLong emitted = new AtomicLong(0);
-    private final AtomicLong lastReport = new AtomicLong(0);
 
     private QwpTradesGenerator(Cli cfg) {
         this.cfg = cfg;
@@ -145,6 +144,13 @@ public final class QwpTradesGenerator {
         long wallStartMs = System.currentTimeMillis();
         long t0 = System.nanoTime();
 
+        // Per-second throughput sampling is only enabled with --run_secs (a bounded
+        // throughput test); otherwise we just report total elapsed time at the end.
+        // Both the sampler and the wall-clock cap hang off --run_secs.
+        List<Long> perSecond = new ArrayList<>();
+        Thread sampler = cfg.runSecs > 0 ? startThroughputSampler(perSecond) : null;
+        Thread deadline = cfg.runSecs > 0 ? startDeadline(cfg.runSecs) : null;
+
         List<Thread> workers = new ArrayList<>();
         for (int w = 0; w < cfg.processes; w++) {
             Thread th = new Thread(new Worker(w, assignment.get(w), startNs, endNs, wallStartMs),
@@ -161,12 +167,21 @@ public final class QwpTradesGenerator {
         if (yahooRefresher != null) {
             yahooRefresher.interrupt();
         }
+        if (deadline != null) {
+            deadline.interrupt();
+            deadline.join(1000);
+        }
+        if (sampler != null) {
+            sampler.interrupt();
+            sampler.join(1500);
+        }
         if (walMonitor != null) {
             walMonitor.join(2000);
         }
 
         double secs = (System.nanoTime() - t0) / 1e9;
         long total = emitted.get();
+        printThroughputSummary(perSecond);
         System.out.printf("[DONE] emitted %d trades in %.2fs = %,.0f trades/sec (%d workers).%n",
                 total, secs, secs > 0 ? total / secs : 0.0, cfg.processes);
     }
@@ -268,6 +283,7 @@ public final class QwpTradesGenerator {
                 boolean realtime = "real-time".equals(cfg.mode);
                 long secondStartNs = alignToSecond(startNs);
                 long secIdx = 0;
+                long lastCommitMs = System.currentTimeMillis();
                 while (running.get() && !stop && !budgetReached() && !pastEnd(secondStartNs, endNs)) {
                     waitWhilePaused();
                     if (!running.get()) {
@@ -277,18 +293,23 @@ public final class QwpTradesGenerator {
                     emitSecond(sender, secondStartNs, n, realtime ? 7.0 : 5.0);
                     secondStartNs += NANOS_PER_SEC;
 
-                    if (realtime) {
+                    // Commit (transactional flush) on the configured cadence. Deferred
+                    // frames have been streaming via auto-flush; this is the commit point.
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastCommitMs >= cfg.commitIntervalMs) {
                         sender.flush();
+                        lastCommitMs = nowMs;
+                    }
+
+                    if (realtime) {
                         secIdx++;
                         long sleepMs = (wallStartMs + secIdx * 1000L) - System.currentTimeMillis();
                         if (sleepMs > 0) {
                             Thread.sleep(sleepMs);
                         }
-                    } else if (id == 0) {
-                        reportProgress(secondStartNs);
                     }
                 }
-                sender.flush();
+                sender.flush(); // final commit of any deferred rows
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
@@ -357,13 +378,69 @@ public final class QwpTradesGenerator {
         }
     }
 
-    private void reportProgress(long secondStartNs) {
-        long e = emitted.get();
-        if (e - lastReport.get() >= 1_000_000) {
-            lastReport.set(e);
-            System.out.printf("[ft-life] %d trades emitted (data clock %s)%n",
-                    e, Instant.ofEpochSecond(0, secondStartNs));
+    /**
+     * Per-second throughput sampler: every wall-clock second, print rows/sec and
+     * record it. Gives a per-second view of ingest rate over the run; the final
+     * summary reports min/median/avg/max. (The first and last samples can be partial
+     * — startup ramp and the final fractional second.)
+     */
+    private Thread startThroughputSampler(List<Long> perSecond) {
+        Thread t = new Thread(() -> {
+            long last = 0;
+            long sec = 0;
+            try {
+                while (running.get()) {
+                    Thread.sleep(1000);
+                    long now = emitted.get();
+                    long delta = now - last;
+                    last = now;
+                    sec++;
+                    perSecond.add(delta);
+                    System.out.printf("[rate] t=%ds  %,d rows/sec  (cum %,d)%n", sec, delta, now);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "qwp-throughput-sampler");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    /** Stops the run after a fixed wall-clock duration (for bounded throughput tests). */
+    private Thread startDeadline(int seconds) {
+        Thread t = new Thread(() -> {
+            try {
+                for (int s = 0; s < seconds && running.get(); s++) {
+                    Thread.sleep(1000);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (running.compareAndSet(true, false)) {
+                System.out.printf("[run] reached --run_secs %d, stopping.%n", seconds);
+            }
+        }, "qwp-deadline");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    private void printThroughputSummary(List<Long> perSecond) {
+        if (perSecond.isEmpty()) {
+            return;
         }
+        long[] sorted = new long[perSecond.size()];
+        long sum = 0;
+        for (int i = 0; i < sorted.length; i++) {
+            sorted[i] = perSecond.get(i);
+            sum += sorted[i];
+        }
+        Arrays.sort(sorted);
+        System.out.printf("[throughput] %d per-second samples: min=%,d  median=%,d  avg=%,.0f  max=%,d  rows/sec%n",
+                sorted.length, sorted[0], sorted[sorted.length / 2],
+                (double) sum / sorted.length, sorted[sorted.length - 1]);
     }
 
     /**
@@ -451,15 +528,21 @@ public final class QwpTradesGenerator {
                     workerId, sfPath, e.getMessage());
         }
 
+        // Transactional mode is the only mode: auto-flush sends deferred frames
+        // (FLAG_DEFER_COMMIT) that the server appends but does not commit; the
+        // server commits a single WAL transaction only on an explicit flush(). The
+        // worker calls flush() on a fixed cadence (--commit_interval_ms), so commit
+        // size is decoupled from frame size: many byte-bounded frames commit as one
+        // transaction. That keeps the sequencer/writer txn gap tiny.
+        //
         // Auto-flush is bounded by BYTES, not rows, so every WebSocket frame stays
         // safely under the QWP server's frame cap (~1MB) regardless of how wide the
         // rows are. This removes the "1009 Message Too Big" failure class at the
-        // source (an oversized frame can never be produced, so nothing oversized can
-        // spill to store-and-forward and poison later runs). The high row cap is a
-        // non-binding safety net; the byte threshold always trips first.
+        // source. The high row cap is a non-binding safety net; bytes trip first.
         final AtomicLong lastConnLogMs = new AtomicLong(0);
         b.storeAndForwardDir(sfPath)
                 .senderId(cfg.senderId + "-" + workerId)
+                .transactional(true)
                 .reconnectMaxDurationMillis(300_000)
                 .reconnectInitialBackoffMillis(100)
                 .reconnectMaxBackoffMillis(5_000)
@@ -532,12 +615,15 @@ public final class QwpTradesGenerator {
     // ---------------------------------------------------------------- WAL backpressure
 
     /**
-     * Python-style WAL backpressure: poll {@code wal_tables()} every 5s; if the
-     * sequencer gets more than {@code 3 * processes} transactions ahead of the
-     * writer, pause all workers, and resume only once the writer has fully caught up.
+     * WAL backpressure: poll {@code wal_tables()} every 5s; if the sequencer gets
+     * more than the threshold transactions ahead of the writer, pause all workers,
+     * and resume only once the writer has fully caught up. Threshold is
+     * {@code 3 x processes} for more than 2 workers and {@code 5 x processes} at or
+     * below 2 — small values that stay sane because transactional commits keep the
+     * transaction count low (only a few large txns in flight).
      */
     private Thread startWalMonitor() {
-        final int threshold = 3 * cfg.processes;
+        final int threshold = (cfg.processes > 2 ? 3 : 5) * cfg.processes;
         Thread t = new Thread(() -> {
             try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
                 client.connect();
