@@ -74,6 +74,7 @@ public final class Cli {
     public boolean incremental = false;        // seed state from last stored prices, skip Yahoo
     public boolean shortTtl = false;
     public boolean enterprise = false;
+    public boolean createViews = false;        // create market_data OHLC/BBO matviews
     public String suffix = "";                 // table-name suffix (parity with Python)
     public int leiPoolSize = 2000;
 
@@ -213,6 +214,9 @@ public final class Cli {
                     break;
                 case "enterprise":
                     i = boolFlag(args, i, v -> c.enterprise = v);
+                    break;
+                case "create_views":
+                    i = boolFlag(args, i, v -> c.createViews = v);
                     break;
                 case "suffix":
                     c.suffix = req(args, ++i, raw);
@@ -482,6 +486,7 @@ public final class Cli {
                 "  --incremental [true|false]        seed prices from last stored row, skip Yahoo",
                 "  --short_ttl [true|false]          attach retention to the table",
                 "  --enterprise [true|false]         with --short_ttl, use STORAGE POLICY instead of TTL",
+                "  --create_views [true|false]       create market_data OHLC (1m/15m) + hourly BBO matviews",
                 "  --suffix <s>                      append suffix to the table name (-> qwp_trades<s>)",
                 "  --lei_pool_size <n>               distinct counterparties (default 2000)",
                 "  --chunk_seconds <n>               accepted but unused (state is streamed per-second)")));

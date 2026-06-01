@@ -28,4 +28,4 @@ exec mvn -q exec:java -Dexec.args="--mode faster-than-life \
 --min_levels 1 --max_levels 2 \
 --start_ts ${START} --end_ts ${END} \
 --total_market_data_events 2850000000 \
---short_ttl true --enterprise true --lei_pool_size 2000 --suffix ${SUFFIX}"
+--short_ttl true --enterprise true --create_views true --lei_pool_size 2000 --suffix ${SUFFIX}"

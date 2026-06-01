@@ -14,8 +14,9 @@ of hosts. It can populate three tables, each with its own pool of worker threads
 It is a simplified sibling of the Python FX data generator
 (`../fx_data_generator.py`). Differences by design:
 
-- **Three tables, no materialized views** — `qwp_trades`, `qwp_market_data`,
-  `qwp_core_price`; no derived/aggregated views.
+- **Three tables, optional materialized views** — `qwp_trades`, `qwp_market_data`,
+  `qwp_core_price`; with `--create_views` it also builds three matviews over
+  `qwp_market_data` (1m + 15m OHLC and an hourly BBO, see below).
 - **Independent per-table pools:** `--trades_processes` workers feed `qwp_trades`,
   `--market_data_processes` workers feed `qwp_market_data`, `--core_processes`
   workers feed `qwp_core_price`. Each pool snake-drafts the symbols across its own
@@ -68,6 +69,23 @@ whichever tables its enabled pools need over QWP. Retention is attached only wit
 `--short_ttl` (`TTL 1 MONTH`/`3 DAYS`, or `STORAGE POLICY(...)` with `--enterprise`).
 `--suffix` applies to all three names (`qwp_trades<s>`, `qwp_market_data<s>`,
 `qwp_core_price<s>`).
+
+### Materialized views (`--create_views`)
+
+With `--create_views true` the generator also creates three matviews over
+`qwp_market_data<s>` (suffix threaded through, the 15m view cascades off the 1m):
+
+| view | base | refresh | content |
+| --- | --- | --- | --- |
+| `qwp_market_data_ohlc_1m<s>` | `qwp_market_data<s>` | IMMEDIATE | 1m OHLC of `best_bid` + Σ best-bid volume |
+| `qwp_market_data_ohlc_15m<s>` | the 1m view | EVERY 5m | 15m OHLC rolled up from the 1m view |
+| `qwp_bbo_1h<s>` | `qwp_market_data<s>` | EVERY 10m | hourly max bid / min ask |
+
+All use `CREATE ... IF NOT EXISTS` (idempotent — to redefine one, drop it first).
+Retention follows Python: matviews always take **TTL** (not STORAGE POLICY, which
+QuestDB doesn't yet support on views) when `--short_ttl` is set, via a helper that's
+ready to switch to storage policies once enterprise matviews support them. `OWNED BY
+'admin'` is attached when `--enterprise` is set.
 
 ## Prerequisites
 
@@ -312,6 +330,7 @@ depends on the mode:
 | `--no_yahoo` | off | skip Yahoo, use template brackets (offline) |
 | `--incremental [true\|false]` | false | seed mids from last stored trade, skip Yahoo |
 | `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise) |
+| `--create_views [true\|false]` | false | build the market_data OHLC (1m/15m) + hourly BBO matviews |
 | `--suffix <s>` | none | tables become `qwp_trades<s>` / `qwp_market_data<s>` / `qwp_core_price<s>` |
 | `--lei_pool_size <n>` | 2000 | distinct counterparties |
 
@@ -320,8 +339,7 @@ depends on the mode:
 `--processes` is **removed** — use `--trades_processes` / `--market_data_processes`
 / `--core_processes`. `--chunk_seconds` is accepted for parity but has no effect.
 ILP/PG-transport flags (`--protocol`, `--pg_port`, `--ilp_user`, `--token_x`,
-`--token_y`) and materialized-view flags (`--create_views`) are not supported and
-error if passed.
+`--token_y`) are not supported and error if passed.
 
 ## Notes
 

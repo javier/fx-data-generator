@@ -24,4 +24,4 @@ exec mvn -q exec:java -Dexec.args="--mode real-time \
 --orders_min_per_sec 5 --orders_max_per_sec 30 \
 --min_levels 5 --max_levels 5 \
 --total_market_data_events 0 \
---short_ttl true --enterprise true --suffix ${SUFFIX}"
+--short_ttl true --enterprise true --create_views true --suffix ${SUFFIX}"
