@@ -230,6 +230,30 @@ All hosts share **one** credential set and **one** transport scheme:
   the pool rides the apply ceiling instead of stalling to 0/s). Polling idles at 5s
   and tightens to 250ms only while a pool is draining.
 
+## Timestamp safety & backfill
+
+Before generating, the tool reads `max(timestamp)` across the enabled tables (suffix
+aware) and refuses to ingest behind existing data — out-of-order inserts behind newer
+rows are painful (O3 partition rewrites). Behaviour matches the Python generator:
+
+- **Faster-than-life:** the start is **advanced** past the latest existing row
+  (`[INFO] Advancing start … to avoid overlap`). If `--end_ts` is at or before the
+  latest row, the run **aborts** with a clear error (the whole window is behind
+  existing data). If everything requested is already present, it exits cleanly.
+- **Real-time:** if the newest row is in the future (e.g. from a prior run's
+  look-ahead), it **waits** (`[INFO] … Waiting Ns to avoid overlap`) until wall-clock
+  passes it, then starts at "now".
+
+So to **backfill** into a table that already has newer data, the older window is
+skipped — backfill into a fresh `--suffix`, or extend forward from where the data
+ends. Real-time rows are stamped `--realtime_lookahead_secs` (default 2s) ahead of
+wall-clock so the live dashboard stays ahead of WAL apply lag.
+
+Intra-second events interpolate each symbol's best bid/ask between its open and close
+state, with the **first and last event pinned exactly to open/close**, so
+`close(second t) == open(second t+1)` holds in the emitted rows — OHLC candles join
+cleanly with no false gaps.
+
 ## Parameters
 
 Option names accept Python underscore form (`--start_ts`) or kebab form
@@ -284,6 +308,7 @@ depends on the mode:
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--yahoo_refresh_secs <n>` | 300 | real-time Yahoo refresh interval |
+| `--realtime_lookahead_secs <n>` | 2 | real-time: stamp rows n s ahead of wall-clock so the live dashboard stays ahead of WAL apply lag |
 | `--no_yahoo` | off | skip Yahoo, use template brackets (offline) |
 | `--incremental [true\|false]` | false | seed mids from last stored trade, skip Yahoo |
 | `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise) |

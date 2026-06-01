@@ -52,6 +52,11 @@ public final class QwpTradesGenerator {
     private static final long NANOS_PER_SEC = 1_000_000_000L;
     private static final long WALK_SEED_BASE = 0xF1A7C0DEL;
     private static final long GOLDEN = 0x9E3779B97F4A7C15L;
+    // Per-second event plan packs (offset << SYM_BITS | ownedIndex) into one long so a
+    // single sort orders events by offset while carrying their symbol. 6 bits => <=64
+    // symbols per worker (universe is 30), offset (<1e9) fits in the remaining bits.
+    private static final int SYM_BITS = 6;
+    private static final long SYM_MASK = (1L << SYM_BITS) - 1;
     private static final String ENTERPRISE_POLICY =
             "TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 3 months";
 
@@ -131,13 +136,10 @@ public final class QwpTradesGenerator {
         // 2) Schema for each enabled table.
         createTables();
 
-        // 3) Start point (data clock).
-        long startNs = resolveStartNanos();
+        // 3) Start point (data clock). resolveStartNanos enforces the same overlap
+        //    safety as Python: advance/abort in faster-than-life, wait in real-time.
         Long endNs = cfg.endTs == null ? null : isoToNanos(cfg.endTs);
-        if (endNs != null && endNs <= startNs) {
-            System.err.printf("[ERROR] --end_ts (%s) is not after the start point. Aborting.%n", cfg.endTs);
-            return;
-        }
+        long startNs = resolveStartNanos(endNs);
 
         // 4) Build the two pools and run them.
         boolean realtime = "real-time".equals(cfg.mode);
@@ -297,11 +299,20 @@ public final class QwpTradesGenerator {
         private final Map<Integer, DoubleArray> bidArrays = new HashMap<>();
         private final Map<Integer, DoubleArray> askArrays = new HashMap<>();
         private boolean stop = false;
-        // Per-second event plan: offsets[0..offsetCount) sorted within the second,
-        // consumed across sub-second slices via offsetCursor (filled by beginSecond).
-        private long[] offsets;
+        // Per-second event plan: evPlan[0..offsetCount) packs (offset<<SYM_BITS|ownedIdx),
+        // sorted by offset, consumed across sub-second slices via offsetCursor.
+        private long[] evPlan;
         private int offsetCount;
         private int offsetCursor;
+        private int[] symCount;   // events per owned symbol this second
+        private int[] symSeen;    // running per-symbol ordinal during emission
+        // Exact open/close best bid/ask per owned symbol (Python interpolates bid/ask
+        // directly by event ordinal and pins the first/last event to open/close).
+        private double[] oBid;
+        private double[] oAsk;
+        private double[] cBid;
+        private double[] cAsk;
+        private final long tsLookaheadNs;
 
         Worker(Kind kind, int id, List<Integer> ownedList, int poolMin, int poolMax,
                long startNs, Long endNs, long wallStartMs) {
@@ -311,6 +322,10 @@ public final class QwpTradesGenerator {
             this.endNs = endNs;
             this.wallStartMs = wallStartMs;
             this.owned = ownedList.stream().mapToInt(Integer::intValue).toArray();
+            // Per-symbol selection weight = (11 - rank), so more liquid pairs get more
+            // events. NOTE: deliberate divergence from Python, which weights only trades
+            // and picks market_data/core_price symbols uniformly — weighting all three is
+            // more realistic (majors quote/trade far more than exotics).
             this.cumW = new int[owned.length];
             int acc = 0;
             for (int j = 0; j < owned.length; j++) {
@@ -335,7 +350,15 @@ public final class QwpTradesGenerator {
             this.cInd1 = new double[owned.length];
             this.oInd2 = new double[owned.length];
             this.cInd2 = new double[owned.length];
-            this.offsets = new long[wMax + 1];
+            this.evPlan = new long[wMax + 1];
+            this.symCount = new int[owned.length];
+            this.symSeen = new int[owned.length];
+            this.oBid = new double[owned.length];
+            this.oAsk = new double[owned.length];
+            this.cBid = new double[owned.length];
+            this.cAsk = new double[owned.length];
+            this.tsLookaheadNs = "real-time".equals(cfg.mode)
+                    ? (long) cfg.realtimeLookaheadSecs * NANOS_PER_SEC : 0L;
             for (int j = 0; j < owned.length; j++) {
                 int g = owned[j];
                 walkRng[j] = new SplittableRandom(WALK_SEED_BASE + GOLDEN * g);
@@ -374,7 +397,7 @@ public final class QwpTradesGenerator {
                         // Data-second index, identical across pools for the same
                         // secondStartNs -> deterministic bracket lookup -> consistent walk.
                         long k = (secondStartNs - base) / NANOS_PER_SEC;
-                        beginSecond(k, 7.0);
+                        beginSecond(k, 5.0);
                         long sliceEnd = sliceNs;
                         while (true) {
                             emitSlice(sender, table, secondStartNs, sliceEnd);
@@ -439,6 +462,15 @@ public final class QwpTradesGenerator {
                 double hi = p.highAt(k);
                 cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips, lo, hi, walkRng[j]);
                 cSp[j] = FxUniverse.evolveSpreadPips(oSp[j], walkRng[j]);
+                // Exact open/close best bid/ask; intra-second events interpolate between
+                // these by ordinal, with the first/last event pinned exactly to them so
+                // close(t) == open(t+1) holds in the emitted rows (clean OHLC candles).
+                oBid[j] = FxUniverse.quantizeToPip(oMid[j] - oSp[j] * p.pip / 2.0, p.pip, p.precision);
+                oAsk[j] = FxUniverse.quantizeToPip(oMid[j] + oSp[j] * p.pip / 2.0, p.pip, p.precision);
+                cBid[j] = FxUniverse.quantizeToPip(cMid[j] - cSp[j] * p.pip / 2.0, p.pip, p.precision);
+                cAsk[j] = FxUniverse.quantizeToPip(cMid[j] + cSp[j] * p.pip / 2.0, p.pip, p.precision);
+                symCount[j] = 0;
+                symSeen[j] = 0;
             }
             // Indicators live only on core_price; advance their (separate) walk here.
             if (kind == Kind.CORE_PRICE) {
@@ -451,9 +483,12 @@ public final class QwpTradesGenerator {
             }
             int nEvents = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
             for (int e = 0; e < nEvents; e++) {
-                offsets[e] = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
+                int idx = pickOwned();
+                long offset = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
+                evPlan[e] = (offset << SYM_BITS) | idx;
+                symCount[idx]++;
             }
-            Arrays.sort(offsets, 0, nEvents);
+            Arrays.sort(evPlan, 0, nEvents);  // sorts by offset (high bits), symbol follows
             offsetCount = nEvents;
             offsetCursor = 0;
         }
@@ -462,23 +497,35 @@ public final class QwpTradesGenerator {
          *  previous slice left off. Sets {@code stop} on cap/end-of-window. */
         private void emitSlice(Sender sender, String table, long secondStartNs, long toNs) {
             while (offsetCursor < offsetCount) {
-                long offset = offsets[offsetCursor];
+                long packed = evPlan[offsetCursor];
+                long offset = packed >>> SYM_BITS;
                 if (offset >= toNs) {
                     return;
                 }
                 offsetCursor++;
-                long ts = secondStartNs + offset;
+                int idx = (int) (packed & SYM_MASK);
+                long ts = secondStartNs + offset + tsLookaheadNs;
                 if (endNs != null && ts >= endNs) {
                     stop = true;
                     return;
                 }
-                int j = pickOwned();
-                FxPair p = pairs.get(owned[j]);
-                double f = (double) offset / NANOS_PER_SEC;
-                double mid = FxUniverse.quantizeToPip(oMid[j] + (cMid[j] - oMid[j]) * f, p.pip, p.precision);
-                int sp = Math.max(1, Math.min(8, (int) Math.round(oSp[j] + (cSp[j] - oSp[j]) * f)));
-                double bid = FxUniverse.quantizeToPip(mid - sp * p.pip / 2.0, p.pip, p.precision);
-                double ask = FxUniverse.quantizeToPip(mid + sp * p.pip / 2.0, p.pip, p.precision);
+                FxPair p = pairs.get(owned[idx]);
+                int j = symSeen[idx]++;
+                int n = symCount[idx];
+                boolean last = j == n - 1;
+                double bid;
+                double ask;
+                if (j == 0) {                       // first event of this symbol: exact open
+                    bid = oBid[idx];
+                    ask = oAsk[idx];
+                } else if (last) {                  // last event: exact close
+                    bid = cBid[idx];
+                    ask = cAsk[idx];
+                } else {                            // interpolate bid/ask by ordinal
+                    double frac = (double) j / (n - 1);
+                    bid = FxUniverse.quantizeToPip(oBid[idx] + frac * (cBid[idx] - oBid[idx]), p.pip, p.precision);
+                    ask = FxUniverse.quantizeToPip(oAsk[idx] + frac * (cAsk[idx] - oAsk[idx]), p.pip, p.precision);
+                }
 
                 if (kind == Kind.TRADES) {
                     if (!emitOrder(sender, table, ts, p, bid, ask)) {
@@ -497,8 +544,9 @@ public final class QwpTradesGenerator {
                         stop = true;
                         return;
                     }
-                    double ind1 = oInd1[j] + (cInd1[j] - oInd1[j]) * f;
-                    double ind2 = oInd2[j] + (cInd2[j] - oInd2[j]) * f;
+                    // Python uses open-state indicators for all but the last event (close).
+                    double ind1 = last ? cInd1[idx] : oInd1[idx];
+                    double ind2 = last ? cInd2[idx] : oInd2[idx];
                     emitCore(sender, table, ts, p, bid, ask, ind1, ind2);
                     coreRows.incrementAndGet();
                 }
@@ -1048,11 +1096,72 @@ public final class QwpTradesGenerator {
 
     // ---------------------------------------------------------------- start / helpers
 
-    private long resolveStartNanos() {
-        if ("faster-than-life".equals(cfg.mode) && cfg.startTs != null) {
-            return isoToNanos(cfg.startTs);
+    /**
+     * Resolve the data-clock start, enforcing the same overlap safety as the Python
+     * generator. Faster-than-life: advance the start past the latest existing row,
+     * exit if the whole window is already present, and abort if {@code --end_ts} is at
+     * or before the latest row. Real-time: wait (sleep) until wall-clock passes the
+     * latest row, then start at "now". May {@code System.exit} with a clear message.
+     */
+    private long resolveStartNanos(Long endNs) {
+        boolean ftl = "faster-than-life".equals(cfg.mode);
+        Long latest = latestAcrossTables();
+
+        if (ftl) {
+            long startNs = cfg.startTs != null ? isoToNanos(cfg.startTs)
+                    : (latest != null ? latest + 1_000L : nowNs());
+            if (latest != null) {
+                long next = latest + 1_000L;
+                if (next > startNs) {
+                    System.out.printf("[INFO] Advancing start from %s to %s to avoid overlap with existing data.%n",
+                            nanosToIso(startNs), nanosToIso(next));
+                    startNs = next;
+                }
+            }
+            if (endNs != null && latest != null && endNs <= latest) {
+                System.err.printf("[ERROR] --end_ts (%s) is at or before the most recent data in the tables (%s); "
+                                + "the whole window is behind existing data and would ingest out-of-order. Aborting.%n",
+                        cfg.endTs, nanosToIso(latest));
+                System.exit(1);
+            }
+            if (endNs != null && startNs >= endNs) {
+                if (latest != null) {
+                    System.out.println("[INFO] All data in the requested range is already present. Exiting.");
+                } else {
+                    System.out.printf("[INFO] No work to do: start (%s) >= --end_ts (%s). Exiting.%n",
+                            nanosToIso(startNs), cfg.endTs);
+                }
+                System.exit(0);
+            }
+            return startNs;
         }
-        long nowNs = Instant.now().toEpochMilli() * 1_000_000L;
+
+        // Real-time: wait until wall-clock is past the latest row so we never overlap.
+        if (latest != null) {
+            long next = latest + 1_000L;
+            long now = nowNs();
+            if (next > now) {
+                double waitSecs = (next - now) / 1e9;
+                System.out.printf("[INFO] Last row in DB is %s. Waiting %.1fs to avoid overlap...%n",
+                        nanosToIso(latest), waitSecs);
+                try {
+                    Thread.sleep((long) Math.ceil(waitSecs * 1000.0));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        long startNs = nowNs();
+        if (endNs != null && startNs >= endNs) {
+            System.out.printf("[INFO] No work to do: now (%s) >= --end_ts (%s). Exiting.%n",
+                    nanosToIso(startNs), cfg.endTs);
+            System.exit(0);
+        }
+        return startNs;
+    }
+
+    /** Latest timestamp (nanos) across every enabled table, or null if all empty. */
+    private Long latestAcrossTables() {
         Long latest = null;
         if (cfg.tradesProcesses > 0) {
             latest = maxOf(latest, readMaxTimestampNanos(cfg.tradesTable(), false));
@@ -1060,11 +1169,18 @@ public final class QwpTradesGenerator {
         if (cfg.marketDataProcesses > 0) {
             latest = maxOf(latest, readMaxTimestampNanos(cfg.marketDataTable(), true));
         }
-        if (latest == null) {
-            return nowNs;
+        if (cfg.coreProcesses > 0) {
+            latest = maxOf(latest, readMaxTimestampNanos(cfg.corePriceTable(), true));
         }
-        long after = latest + 1_000L;
-        return "faster-than-life".equals(cfg.mode) ? after : Math.max(nowNs, after);
+        return latest;
+    }
+
+    private static long nowNs() {
+        return Instant.now().toEpochMilli() * 1_000_000L;
+    }
+
+    private static String nanosToIso(long ns) {
+        return Instant.ofEpochSecond(ns / NANOS_PER_SEC, ns % NANOS_PER_SEC).toString();
     }
 
     private static Long maxOf(Long a, Long b) {

@@ -64,6 +64,10 @@ public final class Cli {
     public int coreMinEps = 700;
     public int coreMaxEps = 1000;
 
+    // Real-time: stamp events this many seconds ahead of wall-clock so the live
+    // dashboard stays ahead of WAL apply lag (matches the Python generator's +2s).
+    public int realtimeLookaheadSecs = 2;
+
     // --- reference data / schema --------------------------------------------
     public int yahooRefreshSecs = 300;
     public boolean noYahoo = false;
@@ -195,6 +199,9 @@ public final class Cli {
                 case "yahoo_refresh_secs":
                     c.yahooRefreshSecs = Integer.parseInt(req(args, ++i, raw));
                     break;
+                case "realtime_lookahead_secs":
+                    c.realtimeLookaheadSecs = Integer.parseInt(req(args, ++i, raw));
+                    break;
                 case "no_yahoo":
                     c.noYahoo = true;
                     break;
@@ -287,6 +294,9 @@ public final class Cli {
         }
         if (commitIntervalMs < 1) {
             fail("--commit_interval_ms must be >= 1");
+        }
+        if (realtimeLookaheadSecs < 0) {
+            fail("--realtime_lookahead_secs must be >= 0");
         }
         if (tradesCommitMs < 0 || marketDataCommitMs < 0 || coreCommitMs < 0) {
             fail("per-table commit intervals must be >= 0 (0 = inherit --commit_interval_ms)");
@@ -467,6 +477,7 @@ public final class Cli {
                 "",
                 "Reference data / schema:",
                 "  --yahoo_refresh_secs <n>          real-time Yahoo refresh interval (default 300)",
+                "  --realtime_lookahead_secs <n>     real-time: stamp events n s ahead of wall-clock (default 2)",
                 "  --no_yahoo                        skip Yahoo, use template brackets (offline)",
                 "  --incremental [true|false]        seed prices from last stored row, skip Yahoo",
                 "  --short_ttl [true|false]          attach retention to the table",
