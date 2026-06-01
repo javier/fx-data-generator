@@ -254,7 +254,19 @@ Option names accept Python underscore form (`--start_ts`) or kebab form
 | `--total_market_data_events <n>` | 1000000 | max **market_data** rows (the dominant table; caps trades if market_data is off); stops the whole run; `0` = unlimited |
 | `--start_ts` / `--end_ts <iso>` | after last row / none | data-time window (bound the volume) |
 | `--run_secs <n>` | 0 | **wall-clock** stop (throughput tests); not a data window |
-| `--commit_interval_ms <n>` | 1000 | transaction rate (commit cadence) |
+| `--commit_interval_ms <n>` | 1000 | global commit (WAL transaction) cadence in ms |
+| `--trades_commit_interval_ms <n>` | inherit | commit cadence for `qwp_trades` only |
+| `--market_data_commit_interval_ms <n>` | inherit | commit cadence for `qwp_market_data` only |
+| `--core_commit_interval_ms <n>` | inherit | commit cadence for `qwp_core_price` only |
+
+Commit cadence is **per pool**; each per-table flag overrides `--commit_interval_ms`
+for its table (unset = inherit the global). In **real-time** the cadence can be
+**sub-second** — each data-second is sliced into `commit_interval` chunks that are
+emitted, flushed and paced individually, so e.g. `--market_data_commit_interval_ms 400`
+commits the order book ~2.5×/sec (fresher live dashboard) while trades/prices stay at
+1s. In **faster-than-life** the cadence is wall-clock based (larger interval = more
+data-seconds squashed per transaction = higher throughput); sub-second values there
+just mean "commit as often as possible".
 
 Whichever stop condition (`--end_ts`, `--total_market_data_events`, `--run_secs`)
 is reached **first** ends the run. Total elapsed time is always reported. Reporting

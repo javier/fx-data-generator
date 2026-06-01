@@ -48,7 +48,11 @@ public final class Cli {
     public int marketDataProcesses = 0;        // worker threads for qwp_market_data (0 = off)
     public int coreProcesses = 0;              // worker threads for qwp_core_price (0 = off)
     public int runSecs = 0;                    // wall-clock run cap in seconds; 0 = no cap
-    public int commitIntervalMs = 1000;        // transaction rate: commit (flush) cadence in ms
+    public int commitIntervalMs = 1000;        // transaction rate: commit (flush) cadence in ms (global default)
+    // Per-pool commit-cadence overrides; 0 = inherit commitIntervalMs.
+    public int tradesCommitMs = 0;
+    public int marketDataCommitMs = 0;
+    public int coreCommitMs = 0;
 
     // market_data volume (snapshots/sec across its whole pool) and order-book depth
     public int marketDataMinEps = 1200;
@@ -177,6 +181,15 @@ public final class Cli {
                 case "commit_interval_ms":
                     c.commitIntervalMs = Integer.parseInt(req(args, ++i, raw));
                     break;
+                case "trades_commit_interval_ms":
+                    c.tradesCommitMs = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "market_data_commit_interval_ms":
+                    c.marketDataCommitMs = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "core_commit_interval_ms":
+                    c.coreCommitMs = Integer.parseInt(req(args, ++i, raw));
+                    break;
 
                 // ---- reference data / schema ----
                 case "yahoo_refresh_secs":
@@ -275,6 +288,9 @@ public final class Cli {
         if (commitIntervalMs < 1) {
             fail("--commit_interval_ms must be >= 1");
         }
+        if (tradesCommitMs < 0 || marketDataCommitMs < 0 || coreCommitMs < 0) {
+            fail("per-table commit intervals must be >= 0 (0 = inherit --commit_interval_ms)");
+        }
         if (autoFlushBytes > 900_000) {
             System.out.println("[note] --auto_flush_bytes " + autoFlushBytes
                     + " is near/above the QWP WebSocket frame cap (~1MB); large frames risk a 1009 rejection.");
@@ -294,6 +310,18 @@ public final class Cli {
 
     public String corePriceTable() {
         return "qwp_core_price" + suffix;
+    }
+
+    public int tradesCommitIntervalMs() {
+        return tradesCommitMs > 0 ? tradesCommitMs : commitIntervalMs;
+    }
+
+    public int marketDataCommitIntervalMs() {
+        return marketDataCommitMs > 0 ? marketDataCommitMs : commitIntervalMs;
+    }
+
+    public int coreCommitIntervalMs() {
+        return coreCommitMs > 0 ? coreCommitMs : commitIntervalMs;
     }
 
     public String scheme() {
@@ -433,6 +461,9 @@ public final class Cli {
                 "  --end_ts <iso>                    max timestamp / upper bound",
                 "  --run_secs <n>                    stop after n wall-clock seconds (0 = no cap; for throughput tests)",
                 "  --commit_interval_ms <n>          transaction rate: commit cadence in ms (default 1000)",
+                "  --trades_commit_interval_ms <n>   commit cadence for qwp_trades only (default: --commit_interval_ms)",
+                "  --market_data_commit_interval_ms <n>  commit cadence for qwp_market_data only (default: --commit_interval_ms)",
+                "  --core_commit_interval_ms <n>     commit cadence for qwp_core_price only (default: --commit_interval_ms)",
                 "",
                 "Reference data / schema:",
                 "  --yahoo_refresh_secs <n>          real-time Yahoo refresh interval (default 300)",

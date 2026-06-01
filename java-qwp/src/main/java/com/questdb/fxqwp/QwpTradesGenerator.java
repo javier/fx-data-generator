@@ -297,6 +297,11 @@ public final class QwpTradesGenerator {
         private final Map<Integer, DoubleArray> bidArrays = new HashMap<>();
         private final Map<Integer, DoubleArray> askArrays = new HashMap<>();
         private boolean stop = false;
+        // Per-second event plan: offsets[0..offsetCount) sorted within the second,
+        // consumed across sub-second slices via offsetCursor (filled by beginSecond).
+        private long[] offsets;
+        private int offsetCount;
+        private int offsetCursor;
 
         Worker(Kind kind, int id, List<Integer> ownedList, int poolMin, int poolMax,
                long startNs, Long endNs, long wallStartMs) {
@@ -330,6 +335,7 @@ public final class QwpTradesGenerator {
             this.cInd1 = new double[owned.length];
             this.oInd2 = new double[owned.length];
             this.cInd2 = new double[owned.length];
+            this.offsets = new long[wMax + 1];
             for (int j = 0; j < owned.length; j++) {
                 int g = owned[j];
                 walkRng[j] = new SplittableRandom(WALK_SEED_BASE + GOLDEN * g);
@@ -348,33 +354,62 @@ public final class QwpTradesGenerator {
             String table = kind == Kind.TRADES ? cfg.tradesTable()
                     : kind == Kind.MARKET_DATA ? cfg.marketDataTable()
                     : cfg.corePriceTable();
+            int commitMs = kind == Kind.TRADES ? cfg.tradesCommitIntervalMs()
+                    : kind == Kind.MARKET_DATA ? cfg.marketDataCommitIntervalMs()
+                    : cfg.coreCommitIntervalMs();
             boolean realtime = "real-time".equals(cfg.mode);
             try (Sender sender = buildSender(kind, id)) {
                 long base = alignToSecond(startNs);
                 long secondStartNs = base;
-                long secIdx = 0;
-                long lastCommitMs = System.currentTimeMillis();
-                while (running.get() && !stop && !capReached() && !pastEnd(secondStartNs, endNs)) {
-                    waitWhilePaused();
-                    if (!running.get()) {
-                        break;
+                if (realtime) {
+                    // Real-time: commit cadence can be sub-second. Split each data-second
+                    // into slices of `commitMs`, emitting + flushing + pacing per slice so
+                    // the data trickles across the second (and the WAL commits at commitMs).
+                    long sliceNs = Math.min(NANOS_PER_SEC, Math.max(1L, (long) commitMs) * 1_000_000L);
+                    while (running.get() && !stop && !capReached() && !pastEnd(secondStartNs, endNs)) {
+                        waitWhilePaused();
+                        if (!running.get()) {
+                            break;
+                        }
+                        // Data-second index, identical across pools for the same
+                        // secondStartNs -> deterministic bracket lookup -> consistent walk.
+                        long k = (secondStartNs - base) / NANOS_PER_SEC;
+                        beginSecond(k, 7.0);
+                        long sliceEnd = sliceNs;
+                        while (true) {
+                            emitSlice(sender, table, secondStartNs, sliceEnd);
+                            sender.flush();
+                            long deadlineMs = wallStartMs + k * 1000L + sliceEnd / 1_000_000L;
+                            long sleepMs = deadlineMs - System.currentTimeMillis();
+                            if (sleepMs > 0) {
+                                Thread.sleep(sleepMs);
+                            }
+                            if (stop || !running.get() || sliceEnd >= NANOS_PER_SEC) {
+                                break;
+                            }
+                            sliceEnd = Math.min(NANOS_PER_SEC, sliceEnd + sliceNs);
+                        }
+                        endSecond();
+                        secondStartNs += NANOS_PER_SEC;
                     }
-                    // Data-second index, identical across both pools for the same
-                    // secondStartNs -> deterministic bracket lookup -> consistent walk.
-                    long k = (secondStartNs - base) / NANOS_PER_SEC;
-                    emitSecond(sender, table, secondStartNs, realtime ? 7.0 : 5.0, k);
-                    secondStartNs += NANOS_PER_SEC;
-
-                    long nowMs = System.currentTimeMillis();
-                    if (nowMs - lastCommitMs >= cfg.commitIntervalMs) {
-                        sender.flush();
-                        lastCommitMs = nowMs;
-                    }
-                    if (realtime) {
-                        secIdx++;
-                        long sleepMs = (wallStartMs + secIdx * 1000L) - System.currentTimeMillis();
-                        if (sleepMs > 0) {
-                            Thread.sleep(sleepMs);
+                } else {
+                    // Faster-than-life: no wall pacing; emit whole seconds and commit on a
+                    // wall-clock cadence so many data-seconds squash into one transaction.
+                    long lastCommitMs = System.currentTimeMillis();
+                    while (running.get() && !stop && !capReached() && !pastEnd(secondStartNs, endNs)) {
+                        waitWhilePaused();
+                        if (!running.get()) {
+                            break;
+                        }
+                        long k = (secondStartNs - base) / NANOS_PER_SEC;
+                        beginSecond(k, 5.0);
+                        emitSlice(sender, table, secondStartNs, NANOS_PER_SEC);
+                        endSecond();
+                        secondStartNs += NANOS_PER_SEC;
+                        long nowMs = System.currentTimeMillis();
+                        if (nowMs - lastCommitMs >= commitMs) {
+                            sender.flush();
+                            lastCommitMs = nowMs;
                         }
                     }
                 }
@@ -389,10 +424,13 @@ public final class QwpTradesGenerator {
             }
         }
 
-        private void emitSecond(Sender sender, String table, long secondStartNs, double driftPips, long k) {
-            // Advance the deterministic walk once per owned symbol this second (keeps the
-            // two pools in lockstep regardless of which events land on which symbol).
-            // Bracket is looked up at second k, so both pools clamp identically.
+        /**
+         * Advance the deterministic walk once for data-second {@code k} (open/close per
+         * owned symbol, plus core_price indicators) and lay out this second's event
+         * offsets. Done once per second regardless of how many sub-second commit slices
+         * follow, so price continuity is unaffected by the commit cadence.
+         */
+        private void beginSecond(long k, double driftPips) {
             for (int j = 0; j < owned.length; j++) {
                 FxPair p = pairs.get(owned[j]);
                 oMid[j] = walkMid[j];
@@ -411,18 +449,28 @@ public final class QwpTradesGenerator {
                     cInd2[j] = FxUniverse.evolveIndicator(oInd2[j], indRng[j]);
                 }
             }
-
             int nEvents = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
-            long[] offsets = new long[nEvents];
             for (int e = 0; e < nEvents; e++) {
                 offsets[e] = ThreadLocalRandom.current().nextLong(NANOS_PER_SEC);
             }
-            Arrays.sort(offsets);
+            Arrays.sort(offsets, 0, nEvents);
+            offsetCount = nEvents;
+            offsetCursor = 0;
+        }
 
-            for (long offset : offsets) {
+        /** Emit the prepared events whose offset is {@code < toNs}, continuing where the
+         *  previous slice left off. Sets {@code stop} on cap/end-of-window. */
+        private void emitSlice(Sender sender, String table, long secondStartNs, long toNs) {
+            while (offsetCursor < offsetCount) {
+                long offset = offsets[offsetCursor];
+                if (offset >= toNs) {
+                    return;
+                }
+                offsetCursor++;
                 long ts = secondStartNs + offset;
                 if (endNs != null && ts >= endNs) {
-                    break;
+                    stop = true;
+                    return;
                 }
                 int j = pickOwned();
                 FxPair p = pairs.get(owned[j]);
@@ -435,19 +483,19 @@ public final class QwpTradesGenerator {
                 if (kind == Kind.TRADES) {
                     if (!emitOrder(sender, table, ts, p, bid, ask)) {
                         stop = true;
-                        break;
+                        return;
                     }
                 } else if (kind == Kind.MARKET_DATA) {
                     if (capReached()) {
                         stop = true;
-                        break;
+                        return;
                     }
                     emitSnapshot(sender, table, ts, p, bid, ask);
                     mdRows.incrementAndGet();
                 } else {
                     if (capReached()) {
                         stop = true;
-                        break;
+                        return;
                     }
                     double ind1 = oInd1[j] + (cInd1[j] - oInd1[j]) * f;
                     double ind2 = oInd2[j] + (cInd2[j] - oInd2[j]) * f;
@@ -455,7 +503,10 @@ public final class QwpTradesGenerator {
                     coreRows.incrementAndGet();
                 }
             }
+        }
 
+        /** Carry this second's close state forward as the next second's open (continuity). */
+        private void endSecond() {
             for (int j = 0; j < owned.length; j++) {
                 walkMid[j] = cMid[j];
                 walkSp[j] = cSp[j];
