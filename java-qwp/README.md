@@ -54,14 +54,8 @@ generator's `fx_trades` retention behaviour.
 - A running **QuestDB** that speaks **QWP over WebSocket** (a build
   protocol-compatible with client `1.3.2`). QWP listens on the same port as the
   HTTP endpoint (default `9000`).
-- The **`org.questdb:questdb-client:1.3.2`** artifact in your local Maven cache.
-  Build and install it from your checkout of the separate client repo
-  (`java-questdb-client`):
-
-  ```bash
-  cd /path/to/java-questdb-client
-  mvn clean install -DskipTests
-  ```
+- The **`org.questdb:questdb-client:1.3.2`** dependency, resolved automatically
+  from **Maven Central** — no local build or install needed.
 
 ## Build
 
@@ -89,7 +83,7 @@ Or invoke directly with `mvn exec:java` (see the full parameter list below):
 ```bash
 mvn -q -f ./pom.xml exec:java -Dexec.args="--mode real-time \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token_file ~/qwp_token.txt --total_market_data_events 0"
+    --tls_insecure --token_file $HOME/qwp_token.txt --total_market_data_events 0"
 ```
 
 Show all options:
@@ -101,11 +95,12 @@ mvn -q -f ./pom.xml exec:java -Dexec.args="--help"
 ## Examples
 
 All examples target an HA fleet (internal VPC IPs) and read the QWP token from a
-file via `--token_file ~/qwp_token.txt` — put your token in that file (e.g.
+file via `--token_file $HOME/qwp_token.txt` — put your token in that file (e.g.
 `echo '<your-token>' > ~/qwp_token.txt && chmod 600 ~/qwp_token.txt`) so it never
-appears on the command line or in shell history. `--tls_insecure` uses `wss` and
-**skips TLS certificate validation** (self-signed test clusters); on a cluster
-with valid certs use `--tls` instead.
+appears on the command line or in shell history. Use `$HOME`, not `~`, inside the
+quoted `-Dexec.args` — the shell does not expand `~` there. `--tls_insecure` uses
+`wss` and **skips TLS certificate validation** (self-signed test clusters); on a
+cluster with valid certs use `--tls` instead.
 
 ### 1-minute throughput test
 
@@ -116,7 +111,7 @@ time only, excluding Yahoo/DDL). Writes to a throwaway `qwp_trades_xxx`:
 ```bash
 mvn -q -f ./pom.xml exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token_file ~/qwp_token.txt \
+    --tls_insecure --token_file $HOME/qwp_token.txt \
     --processes 1 \
     --total_market_data_events 0 --run_secs 60 \
     --orders_min_per_sec 1000 --orders_max_per_sec 1000 \
@@ -132,7 +127,7 @@ fixed row count:
 ```bash
 mvn -q -f ./pom.xml exec:java -Dexec.args="--mode faster-than-life \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token_file ~/qwp_token.txt \
+    --tls_insecure --token_file $HOME/qwp_token.txt \
     --processes 1 \
     --total_market_data_events 20000000 \
     --start_ts 2026-05-22T00:00:00.000000Z \
@@ -148,7 +143,7 @@ until Ctrl+C:
 ```bash
 mvn -q -f ./pom.xml exec:java -Dexec.args="--mode real-time \
     --hosts 172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000 \
-    --tls_insecure --token_file ~/qwp_token.txt \
+    --tls_insecure --token_file $HOME/qwp_token.txt \
     --processes 1 \
     --total_market_data_events 0 \
     --orders_min_per_sec 2000 --orders_max_per_sec 5000 \

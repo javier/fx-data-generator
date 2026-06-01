@@ -87,7 +87,7 @@ public final class QwpTradesGenerator {
         this.totalAllWeight = acc;
     }
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         Cli cfg;
         try {
             cfg = Cli.parse(args);
@@ -95,7 +95,19 @@ public final class QwpTradesGenerator {
             System.exit(2);
             return;
         }
-        new QwpTradesGenerator(cfg).run();
+        try {
+            new QwpTradesGenerator(cfg).run();
+        } catch (Exception e) {
+            // Print a readable failure instead of letting the exception propagate as
+            // an opaque "exception occurred while executing the Java class" from the
+            // Maven exec plugin. Common causes: host unreachable, TLS/auth, or a
+            // client/server QWP protocol-version mismatch.
+            System.err.printf("[FATAL] %s: %s%n", e.getClass().getSimpleName(), e.getMessage());
+            for (Throwable c = e.getCause(); c != null && c != c.getCause(); c = c.getCause()) {
+                System.err.printf("[FATAL]   caused by %s: %s%n", c.getClass().getSimpleName(), c.getMessage());
+            }
+            System.exit(1);
+        }
     }
 
     private void run() throws Exception {
