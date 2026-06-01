@@ -22,6 +22,9 @@ public final class FxUniverse {
     /** Venues a trade can print on (matches the Python {@code ecn_pool}). */
     public static final String[] ECNS = {"LMAX", "EBS", "Hotspot", "Currenex"};
 
+    /** core_price event reasons, matching the Python {@code random.choice([...])}. */
+    public static final String[] CORE_REASONS = {"normal", "news_event", "liquidity_event"};
+
     private FxUniverse() {
     }
 
@@ -139,6 +142,21 @@ public final class FxUniverse {
             sp += rng.nextInt(3, 11); // 3..10
         }
         return Math.max(1, Math.min(8, sp));
+    }
+
+    /**
+     * Indicator random walk in [0, 1]: tiny drift each second with a rare shock.
+     * Deterministic given the per-symbol {@link SplittableRandom}. Mirrors the
+     * Python {@code evolve_indicator} (drift 0.01, shock prob 0.01, shock +/-0.2).
+     * Used only by {@code core_price}, so it draws from a dedicated RNG that never
+     * perturbs the mid/spread stream the other pools must reproduce identically.
+     */
+    public static double evolveIndicator(double value, SplittableRandom rng) {
+        value += rng.nextDouble(-0.01, 0.01);
+        if (rng.nextDouble() < 0.01) {
+            value += rng.nextDouble(-0.2, 0.2);
+        }
+        return Math.max(0.0, Math.min(1.0, value));
     }
 
     /**

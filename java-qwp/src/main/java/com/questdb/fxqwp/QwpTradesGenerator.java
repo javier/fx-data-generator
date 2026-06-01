@@ -55,7 +55,7 @@ public final class QwpTradesGenerator {
     private static final String ENTERPRISE_POLICY =
             "TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 3 months";
 
-    private enum Kind { TRADES, MARKET_DATA }
+    private enum Kind { TRADES, MARKET_DATA, CORE_PRICE }
 
     private final Cli cfg;
     private final List<FxPair> pairs = FxUniverse.defaultPairs();
@@ -72,8 +72,10 @@ public final class QwpTradesGenerator {
     // struggling market_data table never freezes the trades pool (and vice versa).
     private final AtomicBoolean pausedTrades = new AtomicBoolean(false);
     private final AtomicBoolean pausedMd = new AtomicBoolean(false);
+    private final AtomicBoolean pausedCore = new AtomicBoolean(false);
     private final AtomicLong tradesRows = new AtomicLong(0);
     private final AtomicLong mdRows = new AtomicLong(0);
+    private final AtomicLong coreRows = new AtomicLong(0);
 
     private QwpTradesGenerator(Cli cfg) {
         this.cfg = cfg;
@@ -154,6 +156,8 @@ public final class QwpTradesGenerator {
                 cfg.tradesMaxPerSec, startNs, endNs, wallStartMs));
         workers.addAll(spawnPool(Kind.MARKET_DATA, cfg.marketDataProcesses, cfg.marketDataMinEps,
                 cfg.marketDataMaxEps, startNs, endNs, wallStartMs));
+        workers.addAll(spawnPool(Kind.CORE_PRICE, cfg.coreProcesses, cfg.coreMinEps,
+                cfg.coreMaxEps, startNs, endNs, wallStartMs));
         for (Thread th : workers) {
             th.join();
         }
@@ -176,9 +180,10 @@ public final class QwpTradesGenerator {
 
         double secs = (System.nanoTime() - t0) / 1e9;
         printThroughputSummary(perSecond);
-        System.out.printf("[DONE] in %.2fs: trades=%,d (%,.0f/s), market_data=%,d (%,.0f/s)%n",
+        System.out.printf("[DONE] in %.2fs: trades=%,d (%,.0f/s), market_data=%,d (%,.0f/s), core_price=%,d (%,.0f/s)%n",
                 secs, tradesRows.get(), secs > 0 ? tradesRows.get() / secs : 0.0,
-                mdRows.get(), secs > 0 ? mdRows.get() / secs : 0.0);
+                mdRows.get(), secs > 0 ? mdRows.get() / secs : 0.0,
+                coreRows.get(), secs > 0 ? coreRows.get() / secs : 0.0);
     }
 
     private List<Thread> spawnPool(Kind kind, int processes, int poolMin, int poolMax,
@@ -200,7 +205,11 @@ public final class QwpTradesGenerator {
     }
 
     private static String tag(Kind kind) {
-        return kind == Kind.TRADES ? "t" : "md";
+        switch (kind) {
+            case TRADES: return "t";
+            case MARKET_DATA: return "md";
+            default: return "cp";
+        }
     }
 
     // ---------------------------------------------------------------- worker fleet
@@ -268,6 +277,15 @@ public final class QwpTradesGenerator {
         private final double[] cMid;
         private final int[] oSp;
         private final int[] cSp;
+        // core_price: per-symbol indicator walk (separate RNG so it never perturbs the
+        // mid/spread stream the other pools reproduce identically). Only used by CORE_PRICE.
+        private final SplittableRandom[] indRng;
+        private final double[] walkInd1;
+        private final double[] walkInd2;
+        private final double[] oInd1;
+        private final double[] cInd1;
+        private final double[] oInd2;
+        private final double[] cInd2;
         // market_data: reusable DoubleArrays keyed by level count
         private final Map<Integer, DoubleArray> bidArrays = new HashMap<>();
         private final Map<Integer, DoubleArray> askArrays = new HashMap<>();
@@ -298,17 +316,31 @@ public final class QwpTradesGenerator {
             this.cMid = new double[owned.length];
             this.oSp = new int[owned.length];
             this.cSp = new int[owned.length];
+            this.indRng = new SplittableRandom[owned.length];
+            this.walkInd1 = new double[owned.length];
+            this.walkInd2 = new double[owned.length];
+            this.oInd1 = new double[owned.length];
+            this.cInd1 = new double[owned.length];
+            this.oInd2 = new double[owned.length];
+            this.cInd2 = new double[owned.length];
             for (int j = 0; j < owned.length; j++) {
                 int g = owned[j];
                 walkRng[j] = new SplittableRandom(WALK_SEED_BASE + GOLDEN * g);
                 walkMid[j] = initialMid[g];
                 walkSp[j] = 4;
+                // Distinct seed from walkRng so the indicator draws never shift the
+                // mid/spread stream. Initial values match the Python template (0.2, 0.5).
+                indRng[j] = new SplittableRandom((WALK_SEED_BASE * 31 + 0x5DEECE66DL) + GOLDEN * g);
+                walkInd1[j] = 0.2;
+                walkInd2[j] = 0.5;
             }
         }
 
         @Override
         public void run() {
-            String table = kind == Kind.TRADES ? cfg.tradesTable() : cfg.marketDataTable();
+            String table = kind == Kind.TRADES ? cfg.tradesTable()
+                    : kind == Kind.MARKET_DATA ? cfg.marketDataTable()
+                    : cfg.corePriceTable();
             boolean realtime = "real-time".equals(cfg.mode);
             try (Sender sender = buildSender(kind, id)) {
                 long base = alignToSecond(startNs);
@@ -363,6 +395,15 @@ public final class QwpTradesGenerator {
                 cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips, lo, hi, walkRng[j]);
                 cSp[j] = FxUniverse.evolveSpreadPips(oSp[j], walkRng[j]);
             }
+            // Indicators live only on core_price; advance their (separate) walk here.
+            if (kind == Kind.CORE_PRICE) {
+                for (int j = 0; j < owned.length; j++) {
+                    oInd1[j] = walkInd1[j];
+                    oInd2[j] = walkInd2[j];
+                    cInd1[j] = FxUniverse.evolveIndicator(oInd1[j], indRng[j]);
+                    cInd2[j] = FxUniverse.evolveIndicator(oInd2[j], indRng[j]);
+                }
+            }
 
             int nEvents = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
             long[] offsets = new long[nEvents];
@@ -389,19 +430,34 @@ public final class QwpTradesGenerator {
                         stop = true;
                         break;
                     }
-                } else {
+                } else if (kind == Kind.MARKET_DATA) {
                     if (capReached()) {
                         stop = true;
                         break;
                     }
                     emitSnapshot(sender, table, ts, p, bid, ask);
                     mdRows.incrementAndGet();
+                } else {
+                    if (capReached()) {
+                        stop = true;
+                        break;
+                    }
+                    double ind1 = oInd1[j] + (cInd1[j] - oInd1[j]) * f;
+                    double ind2 = oInd2[j] + (cInd2[j] - oInd2[j]) * f;
+                    emitCore(sender, table, ts, p, bid, ask, ind1, ind2);
+                    coreRows.incrementAndGet();
                 }
             }
 
             for (int j = 0; j < owned.length; j++) {
                 walkMid[j] = cMid[j];
                 walkSp[j] = cSp[j];
+            }
+            if (kind == Kind.CORE_PRICE) {
+                for (int j = 0; j < owned.length; j++) {
+                    walkInd1[j] = cInd1[j];
+                    walkInd2[j] = cInd2[j];
+                }
             }
         }
 
@@ -484,6 +540,29 @@ public final class QwpTradesGenerator {
                     .at(ts, ChronoUnit.NANOS);
         }
 
+        /**
+         * Emit one top-of-book core_price row: best bid/ask (from the same walk the
+         * other tables use, so prices stay consistent) plus level-0 volumes, a random
+         * ecn/reason, and the interpolated indicators. Mirrors the Python {@code emit_core}.
+         */
+        private void emitCore(Sender sender, String table, long ts, FxPair p,
+                              double bid, double ask, double ind1, double ind2) {
+            ThreadLocalRandom rnd = ThreadLocalRandom.current();
+            String ecn = FxUniverse.ECNS[rnd.nextInt(FxUniverse.ECNS.length)];
+            String reason = FxUniverse.CORE_REASONS[rnd.nextInt(FxUniverse.CORE_REASONS.length)];
+            sender.table(table)
+                    .symbol("symbol", p.symbol)
+                    .symbol("ecn", ecn)
+                    .symbol("reason", reason)
+                    .doubleColumn("bid_price", bid)
+                    .longColumn("bid_volume", FxUniverse.volumeForLevel(0, ladder))
+                    .doubleColumn("ask_price", ask)
+                    .longColumn("ask_volume", FxUniverse.volumeForLevel(0, ladder))
+                    .doubleColumn("indicator1", Math.round(ind1 * 1000.0) / 1000.0)
+                    .doubleColumn("indicator2", Math.round(ind2 * 1000.0) / 1000.0)
+                    .at(ts, ChronoUnit.NANOS);
+        }
+
         private int pickOwned() {
             int r = ThreadLocalRandom.current().nextInt(totalW);
             for (int j = 0; j < cumW.length; j++) {
@@ -508,20 +587,23 @@ public final class QwpTradesGenerator {
 
     private Thread startThroughputSampler(List<Long> perSecond) {
         Thread t = new Thread(() -> {
-            long lastT = 0, lastMd = 0, sec = 0;
+            long lastT = 0, lastMd = 0, lastCp = 0, sec = 0;
             try {
                 while (running.get()) {
                     Thread.sleep(1000);
                     long nowT = tradesRows.get();
                     long nowMd = mdRows.get();
+                    long nowCp = coreRows.get();
                     long dT = nowT - lastT;
                     long dMd = nowMd - lastMd;
+                    long dCp = nowCp - lastCp;
                     lastT = nowT;
                     lastMd = nowMd;
+                    lastCp = nowCp;
                     sec++;
-                    perSecond.add(dT + dMd);
-                    System.out.printf("[rate] t=%ds  trades %,d/s  md %,d/s  (total %,d/s)%n",
-                            sec, dT, dMd, dT + dMd);
+                    perSecond.add(dT + dMd + dCp);
+                    System.out.printf("[rate] t=%ds  trades %,d/s  md %,d/s  core %,d/s  (total %,d/s)%n",
+                            sec, dT, dMd, dCp, dT + dMd + dCp);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -671,6 +753,21 @@ public final class QwpTradesGenerator {
                     + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS");
             execDdl(cfg.marketDataTable(), ddl);
         }
+        if (cfg.coreProcesses > 0) {
+            String ddl = "CREATE TABLE IF NOT EXISTS " + cfg.corePriceTable() + " ("
+                    + "timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)), "
+                    + "symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter), "
+                    + "ecn SYMBOL PARQUET(rle_dictionary, zstd(4), bloom_filter), "
+                    + "bid_price DOUBLE PARQUET(default, zstd(4)), "
+                    + "bid_volume LONG PARQUET(default, zstd(4)), "
+                    + "ask_price DOUBLE PARQUET(default, zstd(4)), "
+                    + "ask_volume LONG PARQUET(default, zstd(4)), "
+                    + "reason SYMBOL PARQUET(rle_dictionary, zstd(4)), "
+                    + "indicator1 DOUBLE PARQUET(default, zstd(4)), "
+                    + "indicator2 DOUBLE PARQUET(default, zstd(4))"
+                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS");
+            execDdl(cfg.corePriceTable(), ddl);
+        }
     }
 
     private void execDdl(String table, String ddl) {
@@ -702,7 +799,11 @@ public final class QwpTradesGenerator {
     // ---------------------------------------------------------------- WAL backpressure
 
     private AtomicBoolean pausedFor(Kind kind) {
-        return kind == Kind.TRADES ? pausedTrades : pausedMd;
+        switch (kind) {
+            case TRADES: return pausedTrades;
+            case MARKET_DATA: return pausedMd;
+            default: return pausedCore;
+        }
     }
 
     private Thread startWalMonitor() {
@@ -718,6 +819,11 @@ public final class QwpTradesGenerator {
             kinds.add(Kind.MARKET_DATA);
             tables.add(cfg.marketDataTable());
             thresholds.add((cfg.marketDataProcesses > 2 ? 3 : 5) * cfg.marketDataProcesses);
+        }
+        if (cfg.coreProcesses > 0) {
+            kinds.add(Kind.CORE_PRICE);
+            tables.add(cfg.corePriceTable());
+            thresholds.add((cfg.coreProcesses > 2 ? 3 : 5) * cfg.coreProcesses);
         }
         Thread t = new Thread(() -> {
             try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {

@@ -46,6 +46,7 @@ public final class Cli {
     public String endTs = null;                // ISO-8601 max timestamp (upper bound)
     public int tradesProcesses = 1;            // worker threads for qwp_trades (0 = off)
     public int marketDataProcesses = 0;        // worker threads for qwp_market_data (0 = off)
+    public int coreProcesses = 0;              // worker threads for qwp_core_price (0 = off)
     public int runSecs = 0;                    // wall-clock run cap in seconds; 0 = no cap
     public int commitIntervalMs = 1000;        // transaction rate: commit (flush) cadence in ms
 
@@ -54,6 +55,10 @@ public final class Cli {
     public int marketDataMaxEps = 15000;
     public int minLevels = 40;
     public int maxLevels = 40;
+
+    // core_price volume (top-of-book snapshots/sec across its whole pool)
+    public int coreMinEps = 700;
+    public int coreMaxEps = 1000;
 
     // --- reference data / schema --------------------------------------------
     public int yahooRefreshSecs = 300;
@@ -150,6 +155,15 @@ public final class Cli {
                 case "market_data_max_eps":
                     c.marketDataMaxEps = Integer.parseInt(req(args, ++i, raw));
                     break;
+                case "core_processes":
+                    c.coreProcesses = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "core_min_eps":
+                    c.coreMinEps = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "core_max_eps":
+                    c.coreMaxEps = Integer.parseInt(req(args, ++i, raw));
+                    break;
                 case "min_levels":
                     c.minLevels = Integer.parseInt(req(args, ++i, raw));
                     break;
@@ -235,8 +249,11 @@ public final class Cli {
         if (marketDataProcesses < 0 || marketDataProcesses > 30) {
             fail("--market_data_processes must be between 0 and 30");
         }
-        if (tradesProcesses == 0 && marketDataProcesses == 0) {
-            fail("enable at least one pool (--trades_processes and/or --market_data_processes > 0)");
+        if (coreProcesses < 0 || coreProcesses > 30) {
+            fail("--core_processes must be between 0 and 30");
+        }
+        if (tradesProcesses == 0 && marketDataProcesses == 0 && coreProcesses == 0) {
+            fail("enable at least one pool (--trades_processes, --market_data_processes and/or --core_processes > 0)");
         }
         if (marketDataProcesses > 0) {
             if (marketDataMinEps <= 0 || marketDataMaxEps < marketDataMinEps) {
@@ -245,6 +262,9 @@ public final class Cli {
             if (minLevels < 1 || maxLevels < minLevels) {
                 fail("require 1 <= --min_levels <= --max_levels");
             }
+        }
+        if (coreProcesses > 0 && (coreMinEps <= 0 || coreMaxEps < coreMinEps)) {
+            fail("require 0 < --core_min_eps <= --core_max_eps");
         }
         if (autoFlushBytes < 1024) {
             fail("--auto_flush_bytes must be >= 1024");
@@ -270,6 +290,10 @@ public final class Cli {
 
     public String marketDataTable() {
         return "qwp_market_data" + suffix;
+    }
+
+    public String corePriceTable() {
+        return "qwp_core_price" + suffix;
     }
 
     public String scheme() {
@@ -394,12 +418,15 @@ public final class Cli {
                 "Pools (one thread set per table; symbols snake-drafted across each pool):",
                 "  --trades_processes <n>            worker threads for qwp_trades, 0-30 (default 1; 0 = off)",
                 "  --market_data_processes <n>       worker threads for qwp_market_data, 0-30 (default 0 = off)",
+                "  --core_processes <n>              worker threads for qwp_core_price, 0-30 (default 0 = off)",
                 "",
                 "Volume / time (each *_per_sec / *_eps is the table-wide total across its pool):",
                 "  --orders_min_per_sec <n>          qwp_trades orders/sec total (default 50); each order -> 1+ fills",
                 "  --orders_max_per_sec <n>          qwp_trades orders/sec total (default 200)",
                 "  --market_data_min_eps <n>         qwp_market_data snapshots/sec total (default 1200)",
                 "  --market_data_max_eps <n>         qwp_market_data snapshots/sec total (default 15000)",
+                "  --core_min_eps <n>                qwp_core_price top-of-book snapshots/sec total (default 700)",
+                "  --core_max_eps <n>                qwp_core_price top-of-book snapshots/sec total (default 1000)",
                 "  --min_levels <n> --max_levels <n> order-book depth per snapshot (default 40/40)",
                 "  --total_market_data_events <n>    max market_data rows (the dominant table; trades if md off); stops the run; 0 = unlimited",
                 "  --start_ts <iso>                  faster-than-life start (default: after last row / now)",
