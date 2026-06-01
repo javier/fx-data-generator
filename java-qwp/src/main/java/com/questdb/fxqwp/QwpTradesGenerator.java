@@ -659,6 +659,9 @@ public final class QwpTradesGenerator {
                     if (cfg.coreProcesses > 0) {
                         sb.append(String.format("  core %,d/s (%,d)", Math.round((nowCp - lastCp) / dt), nowCp));
                     }
+                    long totDelta = (nowT - lastT) + (nowMd - lastMd) + (nowCp - lastCp);
+                    long totRows = nowT + nowMd + nowCp;
+                    sb.append(String.format("  total %,d/s (%,d)", Math.round(totDelta / dt), totRows));
                     System.out.println(sb);
                     lastMs = now;
                     lastT = nowT;
