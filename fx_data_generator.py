@@ -6,6 +6,7 @@ import random
 import multiprocessing as mp
 from multiprocessing import Event
 import numpy as np
+import pandas as pd
 import datetime
 from questdb.ingress import Sender, TimestampNanos
 import psycopg as pg
@@ -218,115 +219,142 @@ def execute_order_against_orderbook(order, bids, asks, levels, pip):
 
 class SortedEmitter:
     """
-    Buffers rows for market_data, core_price, and fx_trades, sorts them by timestamp,
-    and writes them out in order.
+    Buffers rows for market_data, core_price, and fx_trades and writes each buffer
+    out in a single batched sender.dataframe() call (serialized by the questdb
+    client's native code) instead of one sender.row() call per row.
+
+    Performance notes vs the previous implementation (same external behaviour):
+    - Buffers are no longer sorted by timestamp before sending. QuestDB's O3
+      ingestion reorders out-of-order rows server-side, so the client-side sort
+      was pure overhead; the final table contents are identical.
+    - emit_market() takes ownership of the bids/asks arrays (callers pass fresh
+      per-event arrays), so the per-row numpy copies are gone.
+    - Rows are accumulated column-wise so the flush can hand contiguous columns
+      straight to pandas without per-row dict churn.
     """
 
     def __init__(self, sender, buffer_limit, suffix):
         self.sender = sender
         self.buffer_limit = buffer_limit
         self.suffix = suffix
-        self._md = []   # market_data buffer
-        self._cp = []   # core_price buffer
-        self._tr = []   # fx_trades buffer
+        self._md = {"ts": [], "symbol": [], "bids": [], "asks": [],
+                    "best_bid": [], "best_ask": []}
+        self._cp = {"ts": [], "symbol": [], "ecn": [], "reason": [],
+                    "bid_price": [], "bid_volume": [], "ask_price": [], "ask_volume": [],
+                    "indicator1": [], "indicator2": []}
+        self._tr = {"ts": [], "symbol": [], "ecn": [], "side": [], "counterparty": [],
+                    "trade_id": [], "passive": [], "price": [], "quantity": [], "order_id": []}
 
     # --- Market data rows --- #
     def emit_market(self, ts_ns, symbol, bids, asks):
-        self._md.append({
-            "ts": ts_ns,
-            "symbol": symbol,
-            "bids": bids.copy(),   # numpy copy
-            "asks": asks.copy()
-        })
-        if len(self._md) >= self.buffer_limit:
+        b = self._md
+        b["ts"].append(ts_ns)
+        b["symbol"].append(symbol)
+        b["bids"].append(bids)   # caller hands over a fresh array (no copy needed)
+        b["asks"].append(asks)
+        b["best_bid"].append(float(bids[0][0]))
+        b["best_ask"].append(float(asks[0][0]))
+        if len(b["ts"]) >= self.buffer_limit:
             self._flush_md()
 
     # --- Core price rows --- #
     def emit_core(self, ts_ns, symbol, ecn, reason, columns):
-        self._cp.append({
-            "ts": ts_ns,
-            "symbol": symbol,
-            "ecn": ecn,
-            "reason": reason,
-            "columns": columns,
-        })
-        if len(self._cp) >= self.buffer_limit:
+        b = self._cp
+        b["ts"].append(ts_ns)
+        b["symbol"].append(symbol)
+        b["ecn"].append(ecn)
+        b["reason"].append(reason)
+        b["bid_price"].append(columns["bid_price"])
+        b["bid_volume"].append(columns["bid_volume"])
+        b["ask_price"].append(columns["ask_price"])
+        b["ask_volume"].append(columns["ask_volume"])
+        b["indicator1"].append(columns["indicator1"])
+        b["indicator2"].append(columns["indicator2"])
+        if len(b["ts"]) >= self.buffer_limit:
             self._flush_cp()
 
     # --- Trade rows --- #
     def emit_trade(self, ts_ns, symbol, ecn, trade_id, side, passive, price, quantity, counterparty, order_id):
-        self._tr.append({
-            "ts": ts_ns,
-            "symbol": symbol,
-            "ecn": ecn,
-            "trade_id": trade_id,
-            "side": side,
-            "passive": passive,
-            "price": price,
-            "quantity": quantity,
-            "counterparty": counterparty,
-            "order_id": order_id,
-        })
-        if len(self._tr) >= self.buffer_limit:
+        b = self._tr
+        b["ts"].append(ts_ns)
+        b["symbol"].append(symbol)
+        b["ecn"].append(ecn)
+        b["side"].append(side)
+        b["counterparty"].append(counterparty)
+        b["trade_id"].append(trade_id)
+        b["passive"].append(passive)
+        b["price"].append(price)
+        b["quantity"].append(quantity)
+        b["order_id"].append(order_id)
+        if len(b["ts"]) >= self.buffer_limit:
             self._flush_tr()
 
     # --- Flush methods --- #
     def _flush_md(self):
-        if not self._md:
+        b = self._md
+        if not b["ts"]:
             return
-        self._md.sort(key=lambda r: r["ts"])
-        tbl = table_name("market_data", self.suffix)
-        for r in self._md:
-            self.sender.row(
-                tbl,
-                symbols={"symbol": r["symbol"]},
-                columns={"bids": r["bids"], "asks": r["asks"],
-                         "best_bid": float(r["bids"][0][0]),
-                         "best_ask": float(r["asks"][0][0])},
-                at=TimestampNanos(r["ts"])
-            )
+        df = pd.DataFrame({
+            "symbol": pd.Categorical(b["symbol"]),
+            "bids": b["bids"],
+            "asks": b["asks"],
+            "best_bid": np.asarray(b["best_bid"], dtype=np.float64),
+            "best_ask": np.asarray(b["best_ask"], dtype=np.float64),
+            "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
+        })
+        self.sender.dataframe(df, table_name=table_name("market_data", self.suffix),
+                              symbols=["symbol"], at="ts")
         self.sender.flush()
-        self._md.clear()
+        for v in b.values():
+            v.clear()
 
         # Also flush core_price and fx_trades to keep all tables synchronized
         self._flush_cp()
         self._flush_tr()
 
     def _flush_cp(self):
-        if not self._cp:
+        b = self._cp
+        if not b["ts"]:
             return
-        self._cp.sort(key=lambda r: r["ts"])
-        tbl = table_name("core_price", self.suffix)
-        for r in self._cp:
-            self.sender.row(
-                tbl,
-                symbols={"symbol": r["symbol"], "ecn": r["ecn"], "reason": r["reason"]},
-                columns=r["columns"],
-                at=TimestampNanos(r["ts"])
-            )
+        df = pd.DataFrame({
+            "symbol": pd.Categorical(b["symbol"]),
+            "ecn": pd.Categorical(b["ecn"]),
+            "reason": pd.Categorical(b["reason"]),
+            "bid_price": np.asarray(b["bid_price"], dtype=np.float64),
+            "bid_volume": np.asarray(b["bid_volume"], dtype=np.int64),
+            "ask_price": np.asarray(b["ask_price"], dtype=np.float64),
+            "ask_volume": np.asarray(b["ask_volume"], dtype=np.int64),
+            "indicator1": np.asarray(b["indicator1"], dtype=np.float64),
+            "indicator2": np.asarray(b["indicator2"], dtype=np.float64),
+            "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
+        })
+        self.sender.dataframe(df, table_name=table_name("core_price", self.suffix),
+                              symbols=["symbol", "ecn", "reason"], at="ts")
         self.sender.flush()
-        self._cp.clear()
+        for v in b.values():
+            v.clear()
 
     def _flush_tr(self):
-        if not self._tr:
+        b = self._tr
+        if not b["ts"]:
             return
-        self._tr.sort(key=lambda r: r["ts"])
-        tbl = table_name("fx_trades", self.suffix)
-        for r in self._tr:
-            self.sender.row(
-                tbl,
-                symbols={"symbol": r["symbol"], "ecn": r["ecn"], "side": r["side"], "counterparty": r["counterparty"]},
-                columns={
-                    "trade_id": r["trade_id"],
-                    "passive": r["passive"],
-                    "price": r["price"],
-                    "quantity": r["quantity"],
-                    "order_id": r["order_id"],
-                },
-                at=TimestampNanos(r["ts"])
-            )
+        df = pd.DataFrame({
+            "symbol": pd.Categorical(b["symbol"]),
+            "ecn": pd.Categorical(b["ecn"]),
+            "side": pd.Categorical(b["side"]),
+            "counterparty": pd.Categorical(b["counterparty"]),
+            "trade_id": b["trade_id"],
+            "passive": np.asarray(b["passive"], dtype=bool),
+            "price": np.asarray(b["price"], dtype=np.float64),
+            "quantity": np.asarray(b["quantity"], dtype=np.float64),
+            "order_id": b["order_id"],
+            "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
+        })
+        self.sender.dataframe(df, table_name=table_name("fx_trades", self.suffix),
+                              symbols=["symbol", "ecn", "side", "counterparty"], at="ts")
         self.sender.flush()
-        self._tr.clear()
+        for v in b.values():
+            v.clear()
 
     # --- flush all before exit --- #
     def flush_all(self):
@@ -746,121 +774,153 @@ def generate_events_for_second(
 
     # ECN pool
     ecn_pool = ["LMAX", "EBS", "Hotspot", "Currenex"]
+    reason_pool = ["normal", "news_event", "liquidity_event"]
+    n_pairs = len(fx_pairs)
+
+    # Vectorized generation: offsets, symbol picks, level counts, level prices and
+    # ladder volumes are drawn in bulk with numpy instead of per-event Python loops.
+    # Semantics are unchanged: per-symbol events interpolate bid/ask between the
+    # second's open and close state by event ordinal (first event = open, last =
+    # close, exactly), level i sits i pips away from the best, and volumes come
+    # from the same ladder bands as get_random_volume_for_level().
+
+    # Ladder bands as vectors so volumes can be drawn one level-column at a time.
+    vol_lo = np.empty(max_levels, dtype=np.int64)
+    vol_hi = np.empty(max_levels, dtype=np.int64)
+    vol_lo[0] = ladder[0] // 2
+    vol_hi[0] = ladder[0]
+    for i in range(1, max_levels):
+        vol_lo[i] = ladder[i - 1]
+        vol_hi[i] = ladder[i]
+
+    def draw_volumes(count):
+        # (count, max_levels) matrix of ladder-band volumes. float64 because the
+        # book arrays are ingested as DOUBLE[][] (as before).
+        vols = np.empty((count, max_levels), dtype=np.float64)
+        for i in range(max_levels):
+            vols[:, i] = np.random.randint(vol_lo[i], vol_hi[i] + 1, count)
+        return vols
+
+    level_pips = np.arange(max_levels, dtype=np.float64)
+
+    def interp_open_close(symbol, n):
+        # Interpolated best bid/ask per event ordinal, first/last pinned exactly
+        # to the open/close state (the OHLC continuity guarantee).
+        o = open_state_for_second[symbol]
+        c = close_state_for_second[symbol]
+        if n == 1:
+            return np.array([o["bid_price"]]), np.array([o["ask_price"]])
+        frac = np.arange(n, dtype=np.float64) / (n - 1)
+        bid = o["bid_price"] + frac * (c["bid_price"] - o["bid_price"])
+        ask = o["ask_price"] + frac * (c["ask_price"] - o["ask_price"])
+        bid[0] = o["bid_price"]
+        bid[-1] = c["bid_price"]
+        ask[0] = o["ask_price"]
+        ask[-1] = c["ask_price"]
+        return bid, ask
+
+    def price_grids(bid_vec, ask_vec, pip):
+        # Level i price = best -/+ i pips, quantized exactly like quantize_to_pip():
+        # round(round(p / pip) * pip, decimals).
+        decimals = abs(int(round(math.log10(pip))))
+        steps = level_pips * pip
+        pb = np.round(np.round((bid_vec[:, None] - steps) / pip) * pip, decimals)
+        pa = np.round(np.round((ask_vec[:, None] + steps) / pip) * pip, decimals)
+        return pb, pa
 
     # --- Generate market_data events (LOTS of them - orderbook updates) ---
-    offsets_market = sorted(random.randint(0, 999_999_999) for _ in range(market_event_count))
-    symbol_choices_market = random.choices(fx_pairs, k=market_event_count)
+    if market_event_count > 0:
+        offsets_market = np.sort(np.random.randint(0, 1_000_000_000, market_event_count, dtype=np.int64))
+        sym_idx_market = np.random.randint(0, n_pairs, market_event_count)
+        levels_market = np.random.randint(min_levels, max_levels + 1, market_event_count)
+        md_bid_vols = draw_volumes(market_event_count)
+        md_ask_vols = draw_volumes(market_event_count)
+        row_ts_market = ts + offsets_market
 
-    # Track how many events per symbol for interpolation
-    symbol_event_indices = {symbol: [] for symbol, *_ in fx_pairs}
-    for i, (symbol, *_) in enumerate(symbol_choices_market):
-        symbol_event_indices[symbol].append(i)
-
-    for symbol, indices in symbol_event_indices.items():
-        n_events = len(indices)
-        if n_events == 0:
-            continue
-        for j, i in enumerate(indices):
-            offset = offsets_market[i]
-            _, low, high, precision, pip, rank = [v for v in fx_pairs if v[0] == symbol][0]
-            levels = random.randint(min_levels, max_levels)
-            bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-
-            if j == 0:
-                state = open_state_for_second[symbol]
-            elif j == n_events - 1:
-                state = close_state_for_second[symbol]
-            else:
-                frac = j / (n_events - 1)
-                state = {
-                    "bid_price": open_state_for_second[symbol]["bid_price"] + frac * (close_state_for_second[symbol]["bid_price"] - open_state_for_second[symbol]["bid_price"]),
-                    "ask_price": open_state_for_second[symbol]["ask_price"] + frac * (close_state_for_second[symbol]["ask_price"] - open_state_for_second[symbol]["ask_price"]),
-                    "spread": open_state_for_second[symbol]["spread"],
-                    "indicator1": open_state_for_second[symbol]["indicator1"],
-                    "indicator2": open_state_for_second[symbol]["indicator2"],
-                }
-
-            generate_bids_asks(bids, asks, levels, state["bid_price"], state["ask_price"], precision, pip, ladder)
-            row_ts = ts + offset
-            if end_ns is not None and row_ts >= end_ns:
+        for k, (symbol, low, high, precision, pip, rank) in enumerate(fx_pairs):
+            idx = np.flatnonzero(sym_idx_market == k)
+            if idx.size == 0:
                 continue
-
-            emitter.emit_market(row_ts, symbol, bids, asks)
+            bid_vec, ask_vec = interp_open_close(symbol, idx.size)
+            pb, pa = price_grids(bid_vec, ask_vec, pip)
+            for j, e in enumerate(idx):
+                row_ts = int(row_ts_market[e])
+                if end_ns is not None and row_ts >= end_ns:
+                    continue
+                lv = levels_market[e]
+                bids = np.empty((2, lv))
+                bids[0] = pb[j, :lv]
+                bids[1] = md_bid_vols[e, :lv]
+                asks = np.empty((2, lv))
+                asks[0] = pa[j, :lv]
+                asks[1] = md_ask_vols[e, :lv]
+                emitter.emit_market(row_ts, symbol, bids, asks)
 
     # --- Generate core_price events (FEWER - BBO snapshots with metadata) ---
-    offsets_core = sorted(random.randint(0, 999_999_999) for _ in range(core_count))
-    symbol_choices_core = random.choices(fx_pairs, k=core_count)
-
     # Track generated core_price events for trade generation
     core_price_events = []
+    if core_count > 0:
+        offsets_core = np.sort(np.random.randint(0, 1_000_000_000, core_count, dtype=np.int64))
+        sym_idx_core = np.random.randint(0, n_pairs, core_count)
+        levels_core = np.random.randint(min_levels, max_levels + 1, core_count)
+        core_bid_vols = draw_volumes(core_count)
+        core_ask_vols = draw_volumes(core_count)
+        reason_idx = np.random.randint(0, len(reason_pool), core_count)
+        ecn_idx = np.random.randint(0, len(ecn_pool), core_count)
+        row_ts_core = ts + offsets_core
 
-    # Group core_price events by symbol for interpolation (same as market_data)
-    symbol_core_indices = {symbol: [] for symbol, *_ in fx_pairs}
-    for i, (symbol, *_) in enumerate(symbol_choices_core):
-        symbol_core_indices[symbol].append(i)
-
-    for symbol, indices in symbol_core_indices.items():
-        n_events = len(indices)
-        if n_events == 0:
-            continue
-
-        _, low, high, precision, pip, rank = [v for v in fx_pairs if v[0] == symbol][0]
-
-        for j, i in enumerate(indices):
-            offset = offsets_core[i]
-            levels = random.randint(min_levels, max_levels)
-            bids, asks = prebuilt_bid_arrays[levels - 1], prebuilt_ask_arrays[levels - 1]
-
-            # Interpolate bid/ask prices between open and close states
-            if j == 0:
-                state = open_state_for_second[symbol]
-            elif j == n_events - 1:
-                state = close_state_for_second[symbol]
-            else:
-                frac = j / (n_events - 1)
-                state = {
-                    "bid_price": open_state_for_second[symbol]["bid_price"] + frac * (close_state_for_second[symbol]["bid_price"] - open_state_for_second[symbol]["bid_price"]),
-                    "ask_price": open_state_for_second[symbol]["ask_price"] + frac * (close_state_for_second[symbol]["ask_price"] - open_state_for_second[symbol]["ask_price"]),
-                    "spread": open_state_for_second[symbol]["spread"],
-                    "indicator1": open_state_for_second[symbol]["indicator1"],
-                    "indicator2": open_state_for_second[symbol]["indicator2"],
-                }
-
-            reason = random.choice(["normal", "news_event", "liquidity_event"])
-            ecn = random.choice(ecn_pool)
-            row_ts = ts + offset
-            if end_ns is not None and row_ts >= end_ns:
+        for k, (symbol, low, high, precision, pip, rank) in enumerate(fx_pairs):
+            idx = np.flatnonzero(sym_idx_core == k)
+            n_events = idx.size
+            if n_events == 0:
                 continue
+            o_state = open_state_for_second[symbol]
+            c_state = close_state_for_second[symbol]
+            ind1_open = float(round(o_state["indicator1"], 3))
+            ind2_open = float(round(o_state["indicator2"], 3))
+            ind1_close = float(round(c_state["indicator1"], 3))
+            ind2_close = float(round(c_state["indicator2"], 3))
+            bid_vec, ask_vec = interp_open_close(symbol, n_events)
+            pb, pa = price_grids(bid_vec, ask_vec, pip)
+            for j, e in enumerate(idx):
+                row_ts = int(row_ts_core[e])
+                if end_ns is not None and row_ts >= end_ns:
+                    continue
+                ecn = ecn_pool[ecn_idx[e]]
+                reason = reason_pool[reason_idx[e]]
+                last = j == n_events - 1
 
-            generate_bids_asks(bids, asks, levels, state["bid_price"], state["ask_price"], precision, pip, ladder)
+                # Core price always uses level 0 (best bid/offer); indicators come
+                # from the open state for all but the last event (which is close).
+                emitter.emit_core(
+                    row_ts,
+                    symbol,
+                    ecn,
+                    reason,
+                    {
+                        "bid_price": float(pb[j, 0]),  # Level 0 = Best bid
+                        "bid_volume": int(core_bid_vols[e, 0]),
+                        "ask_price": float(pa[j, 0]),  # Level 0 = Best ask
+                        "ask_volume": int(core_ask_vols[e, 0]),
+                        "indicator1": ind1_close if last else ind1_open,
+                        "indicator2": ind2_close if last else ind2_open,
+                    }
+                )
 
-            # Core price always uses level 0 (best bid/offer)
-            emitter.emit_core(
-                row_ts,
-                symbol,
-                ecn,
-                reason,
-                {
-                    "bid_price": float(bids[0][0]),  # Level 0 = Best bid
-                    "bid_volume": int(bids[1][0]),
-                    "ask_price": float(asks[0][0]),  # Level 0 = Best ask
-                    "ask_volume": int(asks[1][0]),
-                    "indicator1": float(round(state["indicator1"], 3)),
-                    "indicator2": float(round(state["indicator2"], 3))
-                }
-            )
-
-            # Store this core_price event for potential trade generation
-            core_price_events.append({
-                "timestamp": row_ts,
-                "symbol": symbol,
-                "ecn": ecn,
-                "bids": bids.copy(),
-                "asks": asks.copy(),
-                "levels": levels,
-                "pip": pip,
-                "rank": rank
-            })
+                # Store this core_price event for potential trade generation. The
+                # book is stashed as (prices, volumes) row views into the grids, so
+                # a trade executes against exactly the book whose level 0 was
+                # published in the core_price row.
+                core_price_events.append({
+                    "timestamp": row_ts,
+                    "symbol": symbol,
+                    "ecn": ecn,
+                    "bids": (pb[j], core_bid_vols[e]),
+                    "asks": (pa[j], core_ask_vols[e]),
+                    "levels": int(levels_core[e]),
+                    "pip": pip,
+                    "rank": rank
+                })
 
     # --- Generate trades from core_price events ---
     if orders_count > 0 and lei_pool and core_price_events:
