@@ -395,7 +395,7 @@ def mv_retention_clause(short_ttl, enterprise, oss_ttl, enterprise_policy):
     return f'TTL {oss_ttl}'
 
 
-TABLE_ENTERPRISE_POLICY = 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 3 months'
+TABLE_ENTERPRISE_POLICY = 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 3 months'
 
 
 def ensure_tables_exist(args, suffix):
