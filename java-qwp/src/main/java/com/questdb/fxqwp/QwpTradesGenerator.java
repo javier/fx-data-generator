@@ -58,7 +58,7 @@ public final class QwpTradesGenerator {
     private static final int SYM_BITS = 6;
     private static final long SYM_MASK = (1L << SYM_BITS) - 1;
     private static final String ENTERPRISE_POLICY =
-            "TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 3 months";
+            "TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 3 months";
 
     private enum Kind { TRADES, MARKET_DATA, CORE_PRICE }
 

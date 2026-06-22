@@ -467,7 +467,7 @@ def ensure_materialized_views_exist(args, suffix):
                 avg(ask_price) AS avg_ask
             FROM {table_name('core_price', suffix)}
             SAMPLE BY 1s
-        ) PARTITION BY HOUR {rc('4 HOURS', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
+        ) PARTITION BY HOUR {rc('4 HOURS', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
@@ -485,7 +485,7 @@ def ensure_materialized_views_exist(args, suffix):
                 avg(ask_price) AS avg_ask
             FROM {table_name('core_price', suffix)}
             SAMPLE BY 1d
-        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1s', suffix)} AS (
@@ -494,7 +494,7 @@ def ensure_materialized_views_exist(args, suffix):
                 last(best_ask) AS ask
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1s
-        ) PARTITION BY HOUR {rc('3 DAYS', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
+        ) PARTITION BY HOUR {rc('3 DAYS', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -504,7 +504,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM {table_name('bbo_1s', suffix)}
             SAMPLE BY 1m
-        ) PARTITION BY DAY {rc('3 DAYS', 'TO parquet 1 day, DROP NATIVE 7 days, DROP LOCAL 12 months')};
+        ) PARTITION BY DAY {rc('3 DAYS', 'TO REMOTE 1 day, TO PARQUET 7 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -514,7 +514,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM  {table_name('bbo_1m', suffix)}
             SAMPLE BY 1h
-        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -524,7 +524,7 @@ def ensure_materialized_views_exist(args, suffix):
                 min(ask) AS ask
             FROM {table_name('bbo_1h', suffix)}
             SAMPLE BY 1d
-        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -537,7 +537,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1m
-        ) PARTITION BY HOUR {rc('1 DAY', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
+        ) PARTITION BY HOUR {rc('1 DAY', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -551,7 +551,7 @@ def ensure_materialized_views_exist(args, suffix):
 
             FROM {table_name('market_data_ohlc_1m', suffix)}
             SAMPLE BY 15m
-        ) PARTITION BY HOUR {rc('2 DAYS', 'TO parquet 1 days, DROP NATIVE 7 days, DROP LOCAL 12 months')};
+        ) PARTITION BY HOUR {rc('2 DAYS', 'TO REMOTE 1 day, TO PARQUET 7 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -564,7 +564,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(bids[2][1]) AS total_volume
             FROM {table_name('market_data', suffix)}
             SAMPLE BY 1d
-        ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
+        ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -577,7 +577,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(quantity) AS total_volume
             FROM {table_name('fx_trades', suffix)}
             SAMPLE BY 1m
-        ) PARTITION BY HOUR {rc('2 DAYS', 'TO parquet 1 hour, DROP NATIVE 2 days, DROP LOCAL 12 months')};
+        ) PARTITION BY HOUR {rc('2 DAYS', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
 
         conn.execute(f"""
@@ -590,7 +590,7 @@ def ensure_materialized_views_exist(args, suffix):
                 SUM(total_volume) AS total_volume
             FROM {table_name('fx_trades_ohlc_1m', suffix)}
             SAMPLE BY 1d
-       ) PARTITION BY MONTH {rc('1 MONTH', 'TO parquet 1 month, DROP NATIVE 1 month, DROP LOCAL 12 months')};
+       ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
 
