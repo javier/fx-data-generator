@@ -1,24 +1,33 @@
 tables();
 
+
 --show tables;
 -- dataset intro
 select * from market_data order by timestamp desc;
+select * from core_price order by timestamp desc;
+select * from fx_trades order by timestamp desc;
 
 select * from market_data  where timestamp in '$yesterday';
 select * from core_price where timestamp  in '$yesterday';
 select * from fx_trades where timestamp in '$yesterday';
 
+select * from market_data where timestamp in '$now-4h..$now';
 
 select * from market_data
 where symbol in 'GBPUSD' and timestamp in  '$today'
 limit -10;
 
-select * from market_data
+select * from fx_trades
 where symbol in 'GBPUSD'
-and  timestamp IN '2026-02-24#XNYS';
+and  timestamp IN '$yesterday#XNYS'
+limit -1
+;
 
 select first(timestamp), last(timestamp) from fx_trades
-WHERE timestamp IN '2026-02-19#XNYS';
+WHERE symbol in 'GBPUSD'
+and timestamp IN '$yesterday#XNYS'
+--and timestamp IN '2026-04-22#XNYS'
+;
 
 
 select timestamp, symbol,
@@ -37,7 +46,7 @@ select * from core_price latest by symbol;
 select * from core_price latest by symbol, ecn;
 
 select * from core_price latest by symbol, ecn
-where timestamp < '2026-02-11';
+where timestamp < '2026-06-10';
 
 
 -- parquet
@@ -49,6 +58,7 @@ table_partitions('fx_trades');
 select timestamp, count(), symbol,
     avg(bid_price) as bprice, avg(ask_price) as aprice
 from core_price  sample by 1d;
+
 
 with parts as (
     select name, last(isParquet) from table_partitions('core_price')
@@ -76,32 +86,39 @@ sample by 1d;
             avg(best_bid) as avgr,
             sum(bids[2][1]) as volume
         from market_data
-        where timestamp  in '$today'
-        and   symbol = 'USDJPY'
-        sample by 15m;
+        where timestamp  in '$yesterday'
+        and   symbol = 'GBPUSD'
+        sample by 1m;
+
+select * from market_data
+        where timestamp  in '2026-05';
 
 -- mat views
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS 'market_data_ohlc_1m'
-    WITH BASE 'market_data' REFRESH IMMEDIATE AS (
-
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'market_data_ohlc_1m' WITH BASE 'market_data' REFRESH IMMEDIATE AS (
             SELECT timestamp, symbol,
-                first(best_bid) AS open,
-                max(best_bid) AS high,
-                min(best_bid) AS low,
-                last(best_bid) AS close,
+                first(bids[1][1]) AS open,
+                max(bids[1][1]) AS high,
+                min(bids[1][1]) AS low,
+                last(bids[1][1]) AS close,
                 SUM(bids[2][1]) AS total_volume
             FROM market_data
             SAMPLE BY 1m
 
-) PARTITION BY HOUR TTL 2 DAYS
+) PARTITION BY HOUR
+TTL 1y
 OWNED BY 'admin';
 
+  materialized_views();
 
+select * from market_data_ohlc_1m where
+symbol = 'GBPUSD' AND timestamp in '$today' order by timestamp desc;
 
- select * from market_data_ohlc_1m where
-symbol = 'GBPUSD' AND timestamp in '$today';
+select timestamp, avg(open), last(close) from market_data_ohlc_1m
+where timestamp in '$now - 2m..$now';
 
+select * from bbo_1s
+where timestamp in '$today'
+order by timestamp desc, symbol asc ;
 
 select * from market_data_ohlc_1m
 where timestamp in '$today'
@@ -109,36 +126,46 @@ order by timestamp desc, symbol asc ;
 
 
 
--- TTL and cascading
-CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1s'
-    WITH BASE 'market_data' REFRESH IMMEDIATE AS (
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1s' WITH BASE 'market_data' REFRESH IMMEDIATE AS (
             SELECT timestamp, symbol,
-                last(best_bid) AS bid,
-                last(best_ask) AS ask
+                last(bids[1][1]) AS bid,
+                last(asks[1][1]) AS ask
             FROM market_data
             SAMPLE BY 1s
-) PARTITION BY HOUR TTL 3 DAYS
+
+) PARTITION BY HOUR
+TTL 3d
 OWNED BY 'admin';
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1m'
-WITH BASE 'bbo_1s' REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+
+
+
+
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1m' WITH BASE 'bbo_1s' REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
                 min(ask) AS ask
             FROM bbo_1s
             SAMPLE BY 1m
-) PARTITION BY DAY TTL 7 DAYS
+
+) PARTITION BY DAY
+TTL 1y
 OWNED BY 'admin';
 
+select * from bbo_1m
+where timestamp in '$today'
+order by timestamp desc, symbol asc ;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1h'
-WITH BASE 'bbo_1m' REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
+CREATE MATERIALIZED VIEW IF NOT EXISTS 'bbo_1h' WITH BASE 'bbo_1m' REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
                 min(ask) AS ask
             FROM  bbo_1m
             SAMPLE BY 1h
-) PARTITION BY MONTH TTL 1 MONTH
+
+) PARTITION BY MONTH
+TTL 1y
 OWNED BY 'admin';
 
 
@@ -259,14 +286,23 @@ SELECT timestamp, symbol,
     cum_volumes, target_level, asks[1, target_level] price
 FROM q2;
 
+select * from core_price where timestamp in '$yesterday';
+select * from fx_trades where timestamp in '$yesterday';
+select * from market_data where timestamp in '$yesterday';
 
-select * from core_price asof join market_data on symbol
-where core_price.symbol = 'GBPUSD'  and core_price.timestamp in '$today';
+select * from core_price
+    asof join market_data on symbol
+    where core_price.symbol = 'GBPUSD'
+        and core_price.timestamp in '$yesterday';
 
-select * from fx_trades asof join core_price on symbol asof join market_data on symbol
-where fx_trades.symbol = 'GBPUSD'  and fx_trades.timestamp in '$today';
+select * from fx_trades
+    asof join core_price on symbol
+    asof join market_data on symbol
+    where fx_trades.symbol = 'GBPUSD'
+        and fx_trades.timestamp in '$yesterday';
 
--- Use ASOF JOIN to pair each trade with the most recent order book snapshot, then calculate slippage in basis points
+-- Use ASOF JOIN to pair each trade with the most recent order book snapshot,
+-- then calculate slippage in basis points
 SELECT
     t.timestamp,
     t.symbol,
@@ -281,10 +317,10 @@ SELECT
     (m.best_bid + m.best_ask) / 2 AS mid,
     (m.best_ask - m.best_bid) AS spread,
     CASE t.side
-        WHEN 'buy'  THEN (t.price - (m.best_bid + m.best_ask) / 2)
-                         / ((m.best_bid + m.best_ask) / 2) * 10000
-        WHEN 'sell' THEN ((m.best_bid + m.best_ask) / 2 - t.price)
-                         / ((m.best_bid + m.best_ask) / 2) * 10000
+        WHEN 'buy'  THEN (t.price - mid)
+                         / (mid) * 10000
+        WHEN 'sell' THEN (mid - t.price)
+                         / (mid) * 10000
     END AS slippage_bps,
     CASE t.side
         WHEN 'buy'  THEN (t.price - m.best_ask) / m.best_ask * 10000
@@ -294,7 +330,6 @@ FROM fx_trades t
 ASOF JOIN market_data m ON (symbol)
 WHERE t.timestamp IN '$yesterday'
 ORDER BY t.timestamp;
-
 
 /* Find the minimum ask and maximum bid in
 the 10 seconds before and after each trade
@@ -311,7 +346,7 @@ WINDOW JOIN core_price p
     ON (symbol)
     RANGE BETWEEN 10 seconds PRECEDING AND 10 seconds FOLLOWING
     EXCLUDE PREVAILING
-WHERE t.timestamp IN '$today';
+WHERE t.timestamp IN '$yesterday';
 
 -- fixed horizons
 SELECT
@@ -323,8 +358,8 @@ SELECT
     sum(t.quantity) AS total_volume
 FROM fx_trades t
 HORIZON JOIN market_data m ON (symbol)
-    LIST (0, 1s, 5s, 10s,
-          30s, 1m, 5m) AS h
+    LIST (-10s,0, 1s, 5s, 10s,
+           1m, 5m) AS h
 WHERE t.side = 'buy'
     AND t.timestamp IN '$yesterday'
 GROUP BY t.symbol, t.counterparty, horizon_sec
@@ -332,26 +367,74 @@ ORDER BY t.symbol, t.counterparty, horizon_sec;
 
 
 
+
 -- horizon at 30s for 10 minutes
 SELECT
     t.symbol,
-    h.offset / 1000000000 AS horizon_sec,
-    count() AS n,
+    h.offset / 1000000000 AS horizon_sec,   count() AS n,
     avg(((m.best_bid + m.best_ask) / 2 - t.price) / t.price * 10000) AS avg_markout_bps,
     sum(((m.best_bid + m.best_ask) / 2 - t.price) * t.quantity) AS total_pnl
 FROM fx_trades t
 HORIZON JOIN market_data m ON (symbol)
-    RANGE FROM 0s TO 10m STEP 30s AS h
+    RANGE FROM -1m TO 5m STEP 30s AS h
 WHERE t.side = 'buy'
   AND t.timestamp IN '$yesterday'
 GROUP BY t.symbol, horizon_sec
 ORDER BY t.symbol, horizon_sec;
+
+SELECT
+    t.symbol,
+    h.offset / 1000000000 AS horizon_sec,  count() AS n,
+    avg(((m.best_bid + m.best_ask) / 2 - t.price) / t.price * 10000) AS avg_markout_bps,
+    sum(((m.best_bid + m.best_ask) / 2 - t.price) * t.quantity) AS total_pnl
+FROM fx_trades t
+HORIZON JOIN market_data m ON (symbol)
+    RANGE FROM -1m TO 5m STEP 30s AS h
+WHERE t.side = 'buy'
+  AND t.timestamp IN '2026-05-30'
+GROUP BY t.symbol, horizon_sec
+ORDER BY t.symbol, horizon_sec;
+
 
 
 --------------------------------------------
 -- demo end --
 --------------------------------------------------
 
+--- dedup
+;
+
+drop table trades_test;
+CREATE TABLE 'trades_test' (
+	timestamp TIMESTAMP_NS,
+	symbol SYMBOL,
+	price DOUBLE
+) timestamp(timestamp) PARTITION BY HOUR
+DEDUP UPSERT KEYS(timestamp,symbol);
+
+
+
+
+
+
+
+insert into trades_test values ('2026-02-27T00:00:00', 'EURUSD', 1);
+select * from trades_test;
+
+
+
+
+insert into trades_test values ('2026-02-27T01:00:00', 'EURUSD', 2);
+select * from trades_test;
+
+
+
+
+insert into trades_test values ('2026-02-27T01:00:00', 'EURUSD', 3);
+select * from trades_test;
+insert into trades_test values ('2026-02-27T01:00:00', 'GBPUSD', 4);
+select * from trades_test;
+insert into trades_test values ('2026-02-27T01:00:00', 'GBPUSD', 5);
 
 -- just another asof join
 
@@ -365,7 +448,18 @@ select bids[1][insertion_point(bids[2], bid_volume)],
         insertion_point(bids[2], bid_volume), *
 from p asof join market_data on symbol TOLERANCE 1s;
 
-select * from _query_trace;
+
+
+
+
+select * from _query_trace where principal <> 'admin';
+
+
+
+
+
+select ts, principal, count(), sum(execution_micros) from _query_trace
+sample by 1h;
 
 --------------------------------------------
 -- demo end --
