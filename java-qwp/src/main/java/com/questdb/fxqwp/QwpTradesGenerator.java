@@ -143,12 +143,11 @@ public final class QwpTradesGenerator {
         createTables();
         createViews();
 
-        // 3) Start point (data clock). resolveStartNanos enforces the same overlap
-        //    safety as Python: advance/abort in faster-than-life, wait in real-time.
+        // 3) Start point (data clock). Faster-than-life resumes each pool from ITS
+        //    OWN table's max (per-pool, below); real-time uses one global start via
+        //    resolveStartNanos (it waits past the latest row so the wall-paced pools
+        //    stay in lockstep and never desync).
         Long endNs = cfg.endTs == null ? null : isoToNanos(cfg.endTs);
-        long startNs = resolveStartNanos(endNs);
-
-        // 4) Build the two pools and run them.
         boolean realtime = "real-time".equals(cfg.mode);
         long wallStartMs = System.currentTimeMillis();
         long t0 = System.nanoTime();
@@ -163,13 +162,47 @@ public final class QwpTradesGenerator {
         Thread yahooRefresher = (realtime && !cfg.noYahoo && !cfg.incremental)
                 ? startYahooRefresher(wallStartMs) : null;
 
+        // 4) Build the three pools and run them.
         List<Thread> workers = new ArrayList<>();
-        workers.addAll(spawnPool(Kind.TRADES, cfg.tradesProcesses, cfg.tradesMinPerSec,
-                cfg.tradesMaxPerSec, startNs, endNs, wallStartMs));
-        workers.addAll(spawnPool(Kind.MARKET_DATA, cfg.marketDataProcesses, cfg.marketDataMinEps,
-                cfg.marketDataMaxEps, startNs, endNs, wallStartMs));
-        workers.addAll(spawnPool(Kind.CORE_PRICE, cfg.coreProcesses, cfg.coreMinEps,
-                cfg.coreMaxEps, startNs, endNs, wallStartMs));
+        if (realtime) {
+            long startNs = resolveStartNanos(endNs);
+            workers.addAll(spawnPool(Kind.TRADES, cfg.tradesProcesses, cfg.tradesMinPerSec,
+                    cfg.tradesMaxPerSec, startNs, endNs, wallStartMs));
+            workers.addAll(spawnPool(Kind.MARKET_DATA, cfg.marketDataProcesses, cfg.marketDataMinEps,
+                    cfg.marketDataMaxEps, startNs, endNs, wallStartMs));
+            workers.addAll(spawnPool(Kind.CORE_PRICE, cfg.coreProcesses, cfg.coreMinEps,
+                    cfg.coreMaxEps, startNs, endNs, wallStartMs));
+        } else {
+            // Faster-than-life: pools race at different data-clock rates (heavy
+            // market_data lags the light trades/core_price). A single global-max
+            // resume would advance the slower pools over data they never wrote ->
+            // gaps. Resume each pool from its own table's last row instead, and skip
+            // any pool already filled past --end_ts rather than aborting the whole run.
+            if (cfg.tradesProcesses > 0) {
+                Long ts = poolStartFtl(Kind.TRADES, endNs);
+                if (ts != null) {
+                    workers.addAll(spawnPool(Kind.TRADES, cfg.tradesProcesses, cfg.tradesMinPerSec,
+                            cfg.tradesMaxPerSec, ts, endNs, wallStartMs));
+                }
+            }
+            if (cfg.marketDataProcesses > 0) {
+                Long ms = poolStartFtl(Kind.MARKET_DATA, endNs);
+                if (ms != null) {
+                    workers.addAll(spawnPool(Kind.MARKET_DATA, cfg.marketDataProcesses, cfg.marketDataMinEps,
+                            cfg.marketDataMaxEps, ms, endNs, wallStartMs));
+                }
+            }
+            if (cfg.coreProcesses > 0) {
+                Long cs = poolStartFtl(Kind.CORE_PRICE, endNs);
+                if (cs != null) {
+                    workers.addAll(spawnPool(Kind.CORE_PRICE, cfg.coreProcesses, cfg.coreMinEps,
+                            cfg.coreMaxEps, cs, endNs, wallStartMs));
+                }
+            }
+            if (workers.isEmpty()) {
+                System.out.println("[INFO] All enabled pools are already filled to --end_ts. Nothing to do.");
+            }
+        }
         for (Thread th : workers) {
             th.join();
         }
@@ -1240,6 +1273,61 @@ public final class QwpTradesGenerator {
             System.exit(0);
         }
         return startNs;
+    }
+
+    /**
+     * Faster-than-life resume start (nanos) for one pool, from THAT pool's own table
+     * max so each table fills continuously from where it left off, with no cross-table
+     * gap and no overlap. Returns {@code null} if the pool is already filled to
+     * {@code endNs} (skip it, do not abort the whole run). An explicit {@code --start_ts}
+     * is honored but never moves a pool backward over data it already wrote.
+     */
+    private Long poolStartFtl(Kind kind, Long endNs) {
+        Long latest = poolMaxNanos(kind);
+        long startNs = cfg.startTs != null ? isoToNanos(cfg.startTs)
+                : (latest != null ? nextSecond(latest) : nowNs());
+        if (latest != null) {
+            long resume = nextSecond(latest);   // skip the partial last second (no re-emit)
+            if (resume > startNs) {
+                startNs = resume;
+            }
+        }
+        // Exactly one line per pool: skip if already filled, else announce the resume.
+        if (endNs != null && startNs >= endNs) {
+            System.out.printf("[INFO] %s: already filled to --end_ts (%s); skipping.%n",
+                    poolName(kind), cfg.endTs);
+            return null;
+        }
+        if (latest != null) {
+            System.out.printf("[INFO] %s: resuming from %s (past its own last row).%n",
+                    poolName(kind), nanosToIso(startNs));
+        }
+        return startNs;
+    }
+
+    private static String poolName(Kind kind) {
+        switch (kind) {
+            case TRADES: return "trades";
+            case MARKET_DATA: return "market_data";
+            default: return "core_price";
+        }
+    }
+
+    /** max(timestamp) in nanos for the table a pool writes, or null if empty. */
+    private Long poolMaxNanos(Kind kind) {
+        switch (kind) {
+            case TRADES:
+                return readMaxTimestampNanos(cfg.tradesTable(), false);   // TIMESTAMP_NS
+            case MARKET_DATA:
+                return readMaxTimestampNanos(cfg.marketDataTable(), true);
+            default:
+                return readMaxTimestampNanos(cfg.corePriceTable(), true);
+        }
+    }
+
+    /** Next whole-second boundary strictly after {@code ns}. */
+    private static long nextSecond(long ns) {
+        return ((ns / NANOS_PER_SEC) + 1) * NANOS_PER_SEC;
     }
 
     /** Latest timestamp (nanos) across every enabled table, or null if all empty. */
