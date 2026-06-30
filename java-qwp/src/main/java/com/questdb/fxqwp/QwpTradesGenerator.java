@@ -67,9 +67,15 @@ public final class QwpTradesGenerator {
     private final String[] leiPool;
     private final long[] ladder = FxUniverse.makeVolumeLadder();
 
-    // Read-only initial mid per global pair index (computed once from Yahoo/template/
+    // Read-only initial state per global pair index (computed once from Yahoo/template/
     // incremental). Both pools seed their deterministic walk from the same values.
+    // initialSpreadPips/initialInd* stay at their sentinels unless incremental seeding
+    // fills them from core_price, so the non-incremental defaults (4 pips, 0.2, 0.5) are
+    // untouched. See seedInitialStateFromDb and the worker constructor.
     private final double[] initialMid;
+    private final int[] initialSpreadPips;   // 0 => use the default (4 pips)
+    private final double[] initialInd1;      // < 0 => use the default (0.2)
+    private final double[] initialInd2;      // < 0 => use the default (0.5)
     private final int totalAllWeight; // sum of (11 - rank) across all pairs
 
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -93,6 +99,11 @@ public final class QwpTradesGenerator {
         this.leiPool = FxUniverse.generateLeiPool(cfg.leiPoolSize);
         int n = pairs.size();
         this.initialMid = new double[n];
+        this.initialSpreadPips = new int[n];     // all 0 => default spread until seeded
+        this.initialInd1 = new double[n];
+        this.initialInd2 = new double[n];
+        java.util.Arrays.fill(this.initialInd1, -1.0); // < 0 => default until seeded
+        java.util.Arrays.fill(this.initialInd2, -1.0);
         int acc = 0;
         for (int i = 0; i < n; i++) {
             acc += (11 - pairs.get(i).rank);
@@ -128,7 +139,7 @@ public final class QwpTradesGenerator {
 
         // 1) Reference data → initial mid per symbol (shared, read-only).
         if (cfg.incremental) {
-            seedInitialMidFromDb();
+            seedInitialStateFromDb();
         } else if (!cfg.noYahoo) {
             new YahooFinance().refreshBrackets(pairs, 1.0, Long.MIN_VALUE); // startup: reset timeline
         }
@@ -404,12 +415,15 @@ public final class QwpTradesGenerator {
                 int g = owned[j];
                 walkRng[j] = new SplittableRandom(WALK_SEED_BASE + GOLDEN * g);
                 walkMid[j] = initialMid[g];
-                walkSp[j] = 4;
+                // Spread/indicators default to the Python template (4 pips, 0.2, 0.5) unless
+                // incremental seeding filled the initial* arrays from core_price, in which
+                // case continue from the last stored state so the seam stays continuous.
+                walkSp[j] = initialSpreadPips[g] > 0 ? initialSpreadPips[g] : 4;
                 // Distinct seed from walkRng so the indicator draws never shift the
-                // mid/spread stream. Initial values match the Python template (0.2, 0.5).
+                // mid/spread stream.
                 indRng[j] = new SplittableRandom((WALK_SEED_BASE * 31 + 0x5DEECE66DL) + GOLDEN * g);
-                walkInd1[j] = 0.2;
-                walkInd2[j] = 0.5;
+                walkInd1[j] = initialInd1[g] >= 0 ? initialInd1[g] : 0.2;
+                walkInd2[j] = initialInd2[g] >= 0 ? initialInd2[g] : 0.5;
             }
         }
 
@@ -438,7 +452,7 @@ public final class QwpTradesGenerator {
                         // Data-second index, identical across pools for the same
                         // secondStartNs -> deterministic bracket lookup -> consistent walk.
                         long k = (secondStartNs - base) / NANOS_PER_SEC;
-                        beginSecond(k, 5.0);
+                        beginSecond(k, 7.0); // real-time drift, matches the Python real-time path (FTL uses 5.0)
                         long sliceEnd = sliceNs;
                         while (true) {
                             emitSlice(sender, table, secondStartNs, sliceEnd);
@@ -466,7 +480,7 @@ public final class QwpTradesGenerator {
                             break;
                         }
                         long k = (secondStartNs - base) / NANOS_PER_SEC;
-                        beginSecond(k, 5.0);
+                        beginSecond(k, 5.0); // faster-than-life drift, matches the Python precompute path
                         emitSlice(sender, table, secondStartNs, NANOS_PER_SEC);
                         endSecond();
                         secondStartNs += NANOS_PER_SEC;
@@ -997,46 +1011,114 @@ public final class QwpTradesGenerator {
         }
     }
 
+    // Deferred-start anchor shared by every REFRESH EVERY view, matching the Python DDL.
+    private static final String MV_DEFERRED = "DEFERRED START '2025-06-01T00:00:00.000000Z'";
+
     /**
-     * Optional materialized views over market_data (Python parity, suffix-aware):
-     * a 1m OHLC (REFRESH IMMEDIATE), a 15m OHLC cascading off the 1m view
-     * (REFRESH EVERY 5m), and an hourly BBO (REFRESH EVERY 10m). Retention is TTL via
-     * {@link #mvRetentionClause(String)}. The views are owned by the connecting user
-     * (no OWNED BY clause), so creation never needs admin/superuser privileges.
+     * The full Python-parity materialized-view set (prefix/suffix-aware), byte-faithful
+     * to {@code ensure_materialized_views_exist} in the Python generator: same column
+     * expressions, SAMPLE BY cadences, REFRESH/DEFERRED-START clauses, PARTITION BY, and
+     * per-view TTL (via {@link #mvRetentionClause(String)} — matviews take TTL only, never
+     * STORAGE POLICY). Views are gated on their base pool being enabled so a disabled pool
+     * never triggers a create against a missing table. Owned by the connecting user (no
+     * OWNED BY), so creation needs no admin/superuser privileges.
      */
     private void createViews() {
         if (!cfg.createViews) {
             return;
         }
-        if (cfg.marketDataProcesses <= 0) {
-            System.out.println("[INFO] --create_views set but the market_data pool is off; skipping views "
-                    + "(they read from " + cfg.marketDataTable() + ").");
-            return;
+        // core_price views (open/high/low/close mid, spread, bid/ask stats).
+        if (cfg.coreProcesses > 0) {
+            String cp = cfg.corePriceTable();
+            execDdl(cfg.viewName("core_price_1s"), corePriceView(cfg.viewName("core_price_1s"),
+                    "", cp, "1s", "HOUR", "4 HOURS"));
+            execDdl(cfg.viewName("core_price_1d"), corePriceView(cfg.viewName("core_price_1d"),
+                    "REFRESH EVERY 1h " + MV_DEFERRED + " ", cp, "1d", "MONTH", "1 MONTH"));
+        } else {
+            System.out.println("[INFO] --create_views: core_price pool off; skipping core_price_1s/1d.");
         }
-        String md = cfg.marketDataTable();
-        String md1m = "qwp_market_data_ohlc_1m" + cfg.suffix;
-        String md15m = "qwp_market_data_ohlc_15m" + cfg.suffix;
-        String bbo1h = "qwp_bbo_1h" + cfg.suffix;
-        String ttl = mvRetentionClause("3 DAYS");
+        // market_data views: BBO ladder (1s -> 1m -> 1h -> 1d) and OHLC (1m, 15m, 1d).
+        if (cfg.marketDataProcesses > 0) {
+            String md = cfg.marketDataTable();
+            String bbo1s = cfg.viewName("bbo_1s");
+            String bbo1m = cfg.viewName("bbo_1m");
+            String bbo1h = cfg.viewName("bbo_1h");
+            String bbo1d = cfg.viewName("bbo_1d");
+            execDdl(bbo1s, "CREATE MATERIALIZED VIEW IF NOT EXISTS " + bbo1s + " AS ("
+                    + "SELECT timestamp, symbol, last(best_bid) AS bid, last(best_ask) AS ask "
+                    + "FROM " + md + " SAMPLE BY 1s) PARTITION BY HOUR" + mvRetentionClause("3 DAYS"));
+            execDdl(bbo1m, bboCascade(bbo1m, bbo1s, "1m", "DAY", "REFRESH EVERY 1m " + MV_DEFERRED + " ", "3 DAYS"));
+            execDdl(bbo1h, bboCascade(bbo1h, bbo1m, "1h", "MONTH", "REFRESH EVERY 10m " + MV_DEFERRED + " ", "1 MONTH"));
+            execDdl(bbo1d, bboCascade(bbo1d, bbo1h, "1d", "MONTH", "REFRESH EVERY 1h " + MV_DEFERRED + " ", "1 MONTH"));
 
-        execDdl(md1m, "CREATE MATERIALIZED VIEW IF NOT EXISTS '" + md1m + "' WITH BASE '" + md + "' REFRESH IMMEDIATE AS ("
+            String mdOhlc1m = cfg.viewName("market_data_ohlc_1m");
+            String mdOhlc15m = cfg.viewName("market_data_ohlc_15m");
+            String mdOhlc1d = cfg.viewName("market_data_ohlc_1d");
+            execDdl(mdOhlc1m, mdOhlcFromBook(mdOhlc1m, "", md, "1m", "HOUR", "1 DAY"));
+            execDdl(mdOhlc15m, ohlcRollup(mdOhlc15m, mdOhlc1m, "15m", "HOUR", "", "2 DAYS"));
+            execDdl(mdOhlc1d, mdOhlcFromBook(mdOhlc1d, "REFRESH EVERY 1h " + MV_DEFERRED + " ", md, "1d", "MONTH", "1 MONTH"));
+        } else {
+            System.out.println("[INFO] --create_views: market_data pool off; skipping bbo_* and market_data_ohlc_* views.");
+        }
+        // fx_trades views: traded-price OHLC (1m, 1d).
+        if (cfg.tradesProcesses > 0) {
+            String tr = cfg.tradesTable();
+            String trOhlc1m = cfg.viewName("fx_trades_ohlc_1m");
+            String trOhlc1d = cfg.viewName("fx_trades_ohlc_1d");
+            execDdl(trOhlc1m, "CREATE MATERIALIZED VIEW IF NOT EXISTS " + trOhlc1m + " AS ("
+                    + "SELECT timestamp, symbol, first(price) AS open, max(price) AS high, "
+                    + "min(price) AS low, last(price) AS close, SUM(quantity) AS total_volume "
+                    + "FROM " + tr + " SAMPLE BY 1m) PARTITION BY HOUR" + mvRetentionClause("2 DAYS"));
+            execDdl(trOhlc1d, ohlcRollup(trOhlc1d, trOhlc1m, "1d", "MONTH",
+                    "REFRESH EVERY 1h " + MV_DEFERRED + " ", "1 MONTH"));
+        } else {
+            System.out.println("[INFO] --create_views: trades pool off; skipping fx_trades_ohlc_* views.");
+        }
+    }
+
+    /** core_price OHLC-mid + spread + bid/ask stats view (Python core_price_1s/1d). */
+    private String corePriceView(String name, String refresh, String base, String sampleBy,
+                                 String partitionBy, String ossTtl) {
+        return "CREATE MATERIALIZED VIEW IF NOT EXISTS " + name + " " + refresh + "AS ("
                 + "SELECT timestamp, symbol, "
-                + "first(best_bid) AS open, max(best_bid) AS high, min(best_bid) AS low, last(best_bid) AS close, "
-                + "SUM(bids[2][1]) AS total_volume "
-                + "FROM " + md + " SAMPLE BY 1m"
-                + ") PARTITION BY HOUR" + ttl);
+                + "first((bid_price + ask_price)/2) AS open_mid, "
+                + "max((bid_price + ask_price)/2) AS high_mid, "
+                + "min((bid_price + ask_price)/2) AS low_mid, "
+                + "last((bid_price + ask_price)/2) AS close_mid, "
+                + "last(ask_price) - last(bid_price) AS last_spread, "
+                + "max(bid_price) AS max_bid, min(bid_price) AS min_bid, avg(bid_price) AS avg_bid, "
+                + "max(ask_price) AS max_ask, min(ask_price) AS min_ask, avg(ask_price) AS avg_ask "
+                + "FROM " + base + " SAMPLE BY " + sampleBy
+                + ") PARTITION BY " + partitionBy + mvRetentionClause(ossTtl);
+    }
 
-        execDdl(md15m, "CREATE MATERIALIZED VIEW IF NOT EXISTS '" + md15m + "' WITH BASE '" + md1m + "' REFRESH EVERY 5m AS ("
-                + "SELECT timestamp, symbol, "
-                + "first(open) AS open, max(high) AS high, min(low) AS low, last(close) AS close, "
-                + "SUM(total_volume) AS total_volume "
-                + "FROM " + md1m + " SAMPLE BY 15m"
-                + ") PARTITION BY HOUR" + ttl);
+    /** BBO rollup cascading off the previous BBO view (Python bbo_1m/1h/1d). */
+    private String bboCascade(String name, String base, String sampleBy, String partitionBy,
+                              String refresh, String ossTtl) {
+        return "CREATE MATERIALIZED VIEW IF NOT EXISTS " + name + " " + refresh + "AS ("
+                + "SELECT timestamp, symbol, max(bid) AS bid, min(ask) AS ask "
+                + "FROM " + base + " SAMPLE BY " + sampleBy
+                + ") PARTITION BY " + partitionBy + mvRetentionClause(ossTtl);
+    }
 
-        execDdl(bbo1h, "CREATE MATERIALIZED VIEW IF NOT EXISTS '" + bbo1h + "' REFRESH EVERY 10m AS ("
-                + "SELECT timestamp, symbol, max(best_bid) AS bid, min(best_ask) AS ask "
-                + "FROM " + md + " SAMPLE BY 1h"
-                + ") PARTITION BY DAY" + ttl);
+    /** OHLC straight off the order book best_bid (Python market_data_ohlc_1m/1d). */
+    private String mdOhlcFromBook(String name, String refresh, String base, String sampleBy,
+                                  String partitionBy, String ossTtl) {
+        return "CREATE MATERIALIZED VIEW IF NOT EXISTS " + name + " " + refresh + "AS ("
+                + "SELECT timestamp, symbol, first(best_bid) AS open, max(best_bid) AS high, "
+                + "min(best_bid) AS low, last(best_bid) AS close, SUM(bids[2][1]) AS total_volume "
+                + "FROM " + base + " SAMPLE BY " + sampleBy
+                + ") PARTITION BY " + partitionBy + mvRetentionClause(ossTtl);
+    }
+
+    /** OHLC rollup off a finer OHLC view (Python market_data_ohlc_15m, fx_trades_ohlc_1d). */
+    private String ohlcRollup(String name, String base, String sampleBy, String partitionBy,
+                              String refresh, String ossTtl) {
+        return "CREATE MATERIALIZED VIEW IF NOT EXISTS " + name + " " + refresh + "AS ("
+                + "SELECT timestamp, symbol, first(open) AS open, max(high) AS high, "
+                + "min(low) AS low, last(close) AS close, SUM(total_volume) AS total_volume "
+                + "FROM " + base + " SAMPLE BY " + sampleBy
+                + ") PARTITION BY " + partitionBy + mvRetentionClause(ossTtl);
     }
 
     private void execDdl(String table, String ddl) {
@@ -1399,16 +1481,22 @@ public final class QwpTradesGenerator {
         return ns;
     }
 
-    /** Incremental: seed initial mids from the last stored trade prices. */
-    private void seedInitialMidFromDb() {
-        System.out.println("[INFO] incremental: seeding mids from last stored prices in " + cfg.tradesTable());
+    /**
+     * Incremental: seed the full initial state (mid, spread, indicators) from the last
+     * stored core_price row per symbol. Mirrors the Python {@code load_initial_state},
+     * which reads {@code symbol, bid_price, ask_price, indicator1, indicator2 ... LATEST
+     * BY symbol} from core_price so the resumed walk continues bid/ask/spread/indicators
+     * without a step at the seam. Symbols with no prior row keep the template defaults.
+     */
+    private void seedInitialStateFromDb() {
+        System.out.println("[INFO] incremental: seeding state from last stored core_price rows in " + cfg.corePriceTable());
         Map<String, Integer> idx = new HashMap<>();
         for (int i = 0; i < pairs.size(); i++) {
             idx.put(pairs.get(i).symbol, i);
         }
         try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg.queryClientConfig())) {
             client.connect();
-            client.execute("SELECT symbol, price FROM " + cfg.tradesTable()
+            client.execute("SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM " + cfg.corePriceTable()
                             + " LATEST ON timestamp PARTITION BY symbol",
                     new QwpColumnBatchHandler() {
                         @Override
@@ -1418,11 +1506,20 @@ public final class QwpTradesGenerator {
                                 if (i == null) {
                                     return;
                                 }
-                                double px = row.getDoubleValue(1);
-                                if (px > 0) {
+                                double bid = row.getDoubleValue(1);
+                                double ask = row.getDoubleValue(2);
+                                double ind1 = row.getDoubleValue(3);
+                                double ind2 = row.getDoubleValue(4);
+                                if (bid > 0 && ask > 0) {
                                     FxPair p = pairs.get(i);
-                                    initialMid[i] = FxUniverse.quantizeToPip(px, p.pip, p.precision);
-                                    p.resetBracket(px * 0.99, px * 1.01);
+                                    double mid = (bid + ask) / 2.0;
+                                    initialMid[i] = FxUniverse.quantizeToPip(mid, p.pip, p.precision);
+                                    // Spread in whole pips, clamped to the same 1..8 band the walk uses.
+                                    int sp = (int) Math.round((ask - bid) / p.pip);
+                                    initialSpreadPips[i] = Math.max(1, Math.min(8, sp));
+                                    initialInd1[i] = Math.max(0.0, Math.min(1.0, ind1));
+                                    initialInd2[i] = Math.max(0.0, Math.min(1.0, ind2));
+                                    p.resetBracket(mid * 0.99, mid * 1.01);
                                 }
                             });
                         }

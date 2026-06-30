@@ -74,7 +74,8 @@ public final class Cli {
     public boolean incremental = false;        // seed state from last stored prices, skip Yahoo
     public boolean shortTtl = false;
     public boolean enterprise = false;
-    public boolean createViews = false;        // create market_data OHLC/BBO matviews
+    public boolean createViews = true;         // create the Python-parity matviews (default on, like Python)
+    public String prefix = "qwp_";             // table-name prefix; set "" to match the Python table names exactly
     public String suffix = "";                 // table-name suffix (parity with Python)
     public int leiPoolSize = 2000;
 
@@ -218,6 +219,9 @@ public final class Cli {
                 case "create_views":
                     i = boolFlag(args, i, v -> c.createViews = v);
                     break;
+                case "prefix":
+                    c.prefix = req(args, ++i, raw);
+                    break;
                 case "suffix":
                     c.suffix = req(args, ++i, raw);
                     break;
@@ -312,18 +316,26 @@ public final class Cli {
         if ("faster-than-life".equals(mode) && totalTrades <= 0 && endTs == null && runSecs <= 0) {
             fail("faster-than-life requires a bound: set --total_market_data_events > 0, --end_ts, or --run_secs");
         }
+        if ("real-time".equals(mode) && incremental) {
+            fail("--incremental is not allowed in real-time mode (real-time syncs live quotes from Yahoo)");
+        }
     }
 
     public String tradesTable() {
-        return "qwp_trades" + suffix;
+        return prefix + "fx_trades" + suffix;
     }
 
     public String marketDataTable() {
-        return "qwp_market_data" + suffix;
+        return prefix + "market_data" + suffix;
     }
 
     public String corePriceTable() {
-        return "qwp_core_price" + suffix;
+        return prefix + "core_price" + suffix;
+    }
+
+    /** View/base name with the same prefix+suffix scheme as the tables (stem has no leading prefix). */
+    public String viewName(String stem) {
+        return prefix + stem + suffix;
     }
 
     public int tradesCommitIntervalMs() {
@@ -483,11 +495,12 @@ public final class Cli {
                 "  --yahoo_refresh_secs <n>          real-time Yahoo refresh interval (default 300)",
                 "  --realtime_lookahead_secs <n>     real-time: stamp events n s ahead of wall-clock (default 2)",
                 "  --no_yahoo                        skip Yahoo, use template brackets (offline)",
-                "  --incremental [true|false]        seed prices from last stored row, skip Yahoo",
-                "  --short_ttl [true|false]          attach retention to the table",
-                "  --enterprise [true|false]         with --short_ttl, use STORAGE POLICY instead of TTL",
-                "  --create_views [true|false]       create market_data OHLC (1m/15m) + hourly BBO matviews",
-                "  --suffix <s>                      append suffix to the table name (-> qwp_trades<s>)",
+                "  --incremental [true|false]        seed state from last stored core_price row, skip Yahoo (faster-than-life only)",
+                "  --short_ttl [true|false]          attach retention to the tables/views",
+                "  --enterprise [true|false]         with --short_ttl, use STORAGE POLICY instead of TTL on base tables",
+                "  --create_views [true|false]       create the full Python-parity matview set (default true)",
+                "  --prefix <s>                      table-name prefix (default 'qwp_'); set '' to match the Python names exactly",
+                "  --suffix <s>                      append suffix to the table name (-> <prefix>fx_trades<s>)",
                 "  --lei_pool_size <n>               distinct counterparties (default 2000)",
                 "  --chunk_seconds <n>               accepted but unused (state is streamed per-second)")));
     }

@@ -8,6 +8,8 @@ This script generates highly realistic, multi-level FX market data and ingests i
 
 Designed for **stress testing**, **benchmarking**, and **live demo scenarios**, it supports both wall-clock-paced ("real-time") and maximum-throughput ("faster-than-life") simulation with multi-process orchestration, pip-accurate pricing, WAL backpressure detection, and robust state management.
 
+> **Java sibling (QWP):** [`java-qwp/`](java-qwp/README.md) is a Java generator that ingests the **same three tables and the same materialized views** over QuestDB's QWP (WebSocket) protocol. This Python generator is authoritative; the two are **dataset-compatible** — run the Java one with `--prefix ""` and matching EPS flags and you can backfill with one and continue (or go live) with the other on the same tables. See its README for the interchangeability runbook.
+
 ---
 
 ## Features

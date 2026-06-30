@@ -2,21 +2,27 @@
 
 A synthetic **FX market-data generator** that ingests into QuestDB over **QWP**
 (the WebSocket binary protocol of the QuestDB Java client), HA-aware across a fleet
-of hosts. It can populate three tables, each with its own pool of worker threads:
+of hosts. It can populate three tables, each with its own pool of worker threads
+(names shown with the default `--prefix qwp_`):
 
-- **`qwp_trades`** — trade prints (schema identical to the Python `fx_trades`).
+- **`qwp_fx_trades`** — trade prints (schema identical to the Python `fx_trades`).
 - **`qwp_market_data`** — full order-book snapshots (identical to the Python
   `market_data`: `bids`/`asks` as `DOUBLE[][]`, plus `best_bid`/`best_ask`).
 - **`qwp_core_price`** — top-of-book snapshots with metadata (identical to the
   Python `core_price`: best `bid_price`/`ask_price` + volumes, `ecn`, `reason`,
   `indicator1`/`indicator2`).
 
-It is a simplified sibling of the Python FX data generator
-(`../fx_data_generator.py`). Differences by design:
+It is a sibling of the Python FX data generator (`../fx_data_generator.py`) and is
+**dataset-compatible** with it: set `--prefix ""` and the table/view names, schemas,
+and the full materialized-view set match the Python generator exactly, so you can
+backfill with one and continue with the other on the same tables (see
+[Interchangeability with the Python generator](#interchangeability-with-the-python-generator)).
+Design points:
 
-- **Three tables, optional materialized views** — `qwp_trades`, `qwp_market_data`,
-  `qwp_core_price`; with `--create_views` it also builds three matviews over
-  `qwp_market_data` (1m + 15m OHLC and an hourly BBO, see below).
+- **Three tables, full Python-parity materialized views** — `<prefix>fx_trades`,
+  `<prefix>market_data`, `<prefix>core_price`; with `--create_views` (default
+  **true**) it also builds the same 11 matviews the Python generator creates (BBO
+  ladder, market-data OHLC, core-price OHLC-mid, and trade OHLC — see below).
 - **Independent per-table pools:** `--trades_processes` workers feed `qwp_trades`,
   `--market_data_processes` workers feed `qwp_market_data`, `--core_processes`
   workers feed `qwp_core_price`. Each pool snake-drafts the symbols across its own
@@ -44,7 +50,7 @@ It is a simplified sibling of the Python FX data generator
 ## Table schemas
 
 ```sql
-CREATE TABLE IF NOT EXISTS qwp_trades (
+CREATE TABLE IF NOT EXISTS qwp_fx_trades (
     timestamp    TIMESTAMP_NS, symbol SYMBOL, ecn SYMBOL, trade_id UUID,
     side SYMBOL, passive BOOLEAN, price DOUBLE, quantity DOUBLE,
     counterparty SYMBOL, order_id UUID
@@ -66,27 +72,42 @@ CREATE TABLE IF NOT EXISTS qwp_core_price (
 
 (Real DDL also carries the Python PARQUET column encodings.) The generator creates
 whichever tables its enabled pools need over QWP. Retention is attached only with
-`--short_ttl` (`TTL 1 MONTH`/`3 DAYS`, or `STORAGE POLICY(...)` with `--enterprise`).
-`--suffix` applies to all three names (`qwp_trades<s>`, `qwp_market_data<s>`,
-`qwp_core_price<s>`).
+`--short_ttl` (`TTL 1 MONTH`/`3 DAYS`, or `STORAGE POLICY(...)` with `--enterprise`
+on the base tables — matviews always take TTL). Table/view names are
+`<prefix><stem><suffix>`: `--prefix` (default `qwp_`, set `""` to match the Python
+names) and `--suffix` (default empty) both concatenate **verbatim**, so the trades
+table is `<prefix>fx_trades<suffix>`, e.g. `qwp_fx_trades` by default or `fx_trades`
+with `--prefix ""`.
 
-### Materialized views (`--create_views`)
+### Materialized views (`--create_views`, default on)
 
-With `--create_views true` the generator also creates three matviews over
-`qwp_market_data<s>` (suffix threaded through, the 15m view cascades off the 1m):
+With `--create_views true` (the default, matching Python) the generator creates the
+**same 11 matviews as the Python generator** — prefix/suffix threaded through every
+name, and each view gated on its base pool being enabled (a disabled pool's views are
+skipped, not errored). The cascades and per-view TTL/partitions are byte-faithful to
+the Python DDL:
 
-| view | base | refresh | content |
+| view (`<prefix>…<suffix>`) | base | refresh | content |
 | --- | --- | --- | --- |
-| `qwp_market_data_ohlc_1m<s>` | `qwp_market_data<s>` | IMMEDIATE | 1m OHLC of `best_bid` + Σ best-bid volume |
-| `qwp_market_data_ohlc_15m<s>` | the 1m view | EVERY 5m | 15m OHLC rolled up from the 1m view |
-| `qwp_bbo_1h<s>` | `qwp_market_data<s>` | EVERY 10m | hourly max bid / min ask |
+| `core_price_1s` | `core_price` | immediate | 1s OHLC-mid, spread, bid/ask stats |
+| `core_price_1d` | `core_price` | EVERY 1h (deferred) | 1d OHLC-mid, spread, bid/ask stats |
+| `bbo_1s` | `market_data` | immediate | 1s last bid / last ask |
+| `bbo_1m` | `bbo_1s` | EVERY 1m (deferred) | 1m max bid / min ask |
+| `bbo_1h` | `bbo_1m` | EVERY 10m (deferred) | 1h max bid / min ask |
+| `bbo_1d` | `bbo_1h` | EVERY 1h (deferred) | 1d max bid / min ask |
+| `market_data_ohlc_1m` | `market_data` | immediate | 1m OHLC of `best_bid` + Σ best-bid volume |
+| `market_data_ohlc_15m` | the 1m view | immediate | 15m OHLC rolled up from the 1m view |
+| `market_data_ohlc_1d` | `market_data` | EVERY 1h (deferred) | 1d OHLC of `best_bid` + Σ volume |
+| `fx_trades_ohlc_1m` | `fx_trades` | immediate | 1m OHLC of traded `price` + Σ quantity |
+| `fx_trades_ohlc_1d` | the 1m view | EVERY 1h (deferred) | 1d OHLC rolled up from the 1m view |
 
-All use `CREATE ... IF NOT EXISTS` (idempotent — to redefine one, drop it first).
-Retention follows Python: matviews always take **TTL** (not STORAGE POLICY, which
-QuestDB doesn't yet support on views) when `--short_ttl` is set, via a helper that's
-ready to switch to storage policies once enterprise matviews support them. The views
-are owned by the connecting (ingest) user — no `OWNED BY` clause — so creation never
-requires admin/superuser privileges.
+All use `CREATE ... IF NOT EXISTS` (idempotent — to redefine one, drop it first; the
+**first** generator to run fixes the definition, so keep both engines on the same
+build for byte-identical DDL). Retention follows Python: matviews always take **TTL**
+(not STORAGE POLICY, which QuestDB doesn't yet support on views) when `--short_ttl`
+is set, with per-view TTLs matching the Python generator. The views are owned by the
+connecting (ingest) user — no `OWNED BY` clause — so creation never requires
+admin/superuser privileges.
 
 ## Prerequisites
 
@@ -220,7 +241,7 @@ mvn -q -f ./pom.xml compile exec:java -Dexec.args="--mode real-time \
 Verify (HTTP query endpoint, any node — add the `--suffix` for the throughput run):
 
 ```bash
-curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20FROM%20qwp_trades"
+curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20FROM%20qwp_fx_trades"
 curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20FROM%20qwp_market_data"
 curl -s "http://172.31.42.41:9000/exec?query=SELECT%20count()%20FROM%20qwp_core_price"
 ```
@@ -272,6 +293,38 @@ Intra-second events interpolate each symbol's best bid/ask between its open and 
 state, with the **first and last event pinned exactly to open/close**, so
 `close(second t) == open(second t+1)` holds in the emitted rows — OHLC candles join
 cleanly with no false gaps.
+
+## Interchangeability with the Python generator
+
+This generator and the Python `fx_data_generator.py` are **dataset-compatible**: you
+can backfill with one and continue (or go live) with the other on the **same tables**,
+and downstream views stay consistent. To share tables, run this generator with
+`--prefix ""` so the names match the Python generator exactly (`fx_trades`,
+`market_data`, `core_price`, and the 11 views). The Python generator is authoritative;
+schemas, view DDL, the symbol universe, ECN/reason/counterparty pools, the volume
+ladder, and the price/spread/indicator walks all mirror it.
+
+For a genuinely seamless dataset, also align:
+
+- **Event density (most important).** Per-second row counts come from the EPS / orders
+  flags, **not** from the existing data. Run both engines with the **same**
+  `--core_min_eps/--core_max_eps`, `--market_data_min_eps/--market_data_max_eps` and
+  `--orders_min_per_sec/--orders_max_per_sec` (and `--min_levels/--max_levels`), or the
+  row density will step at the hand-off even though prices stay continuous.
+- **Continuation seed.** Use `--incremental true` (faster-than-life) on the continuing
+  run: it seeds mid/spread/indicators from the last stored `core_price` row per symbol
+  — exactly like the Python `--incremental` — so `open(seam) == close(prev)` holds and
+  OHLC candles join cleanly. Real-time never uses incremental on either engine; it
+  reseeds from live Yahoo quotes, so a faster-than-life → live transition deliberately
+  snaps to the real market (identical behaviour on both).
+- **Same build / flags.** Views are `IF NOT EXISTS` (the first creator fixes the
+  definition), and `--enterprise/--short_ttl/--prefix/--suffix` must match across the
+  engines so both address the same tables with the same schema.
+
+Because both engines reconstruct `market_data` and `core_price` from a **single**
+`core_price` seed, the order-book `best_bid` can step a few pips at the seam to realign
+with `core_price`. This is the same on either engine (it is how the Python generator's
+own incremental restart behaves) and is bounded by the spread.
 
 ## Parameters
 
@@ -329,10 +382,11 @@ depends on the mode:
 | `--yahoo_refresh_secs <n>` | 300 | real-time Yahoo refresh interval |
 | `--realtime_lookahead_secs <n>` | 2 | real-time: stamp rows n s ahead of wall-clock so the live dashboard stays ahead of WAL apply lag |
 | `--no_yahoo` | off | skip Yahoo, use template brackets (offline) |
-| `--incremental [true\|false]` | false | seed mids from last stored trade, skip Yahoo |
-| `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise) |
-| `--create_views [true\|false]` | false | build the market_data OHLC (1m/15m) + hourly BBO matviews |
-| `--suffix <s>` | none | tables become `qwp_trades<s>` / `qwp_market_data<s>` / `qwp_core_price<s>` |
+| `--incremental [true\|false]` | false | seed full state (mid, spread, indicators) from the last stored `core_price` row, skip Yahoo; **faster-than-life only** (rejected in real-time, which always syncs live quotes) |
+| `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise on the base tables) |
+| `--create_views [true\|false]` | **true** | build the full Python-parity matview set (11 views) |
+| `--prefix <s>` | `qwp_` | table-name prefix (verbatim); set `""` to match the Python names exactly |
+| `--suffix <s>` | none | suffix (verbatim); tables become `<prefix>fx_trades<s>` / `<prefix>market_data<s>` / `<prefix>core_price<s>` |
 | `--lei_pool_size <n>` | 2000 | distinct counterparties |
 
 ### Accepted but unused / unsupported
