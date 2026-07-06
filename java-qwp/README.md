@@ -113,9 +113,12 @@ admin/superuser privileges.
 
 - **Java 17+** and **Maven 3+**.
 - A running **QuestDB** that speaks **QWP over WebSocket**, protocol-compatible
-  with client `1.3.2`. QWP shares the HTTP port (default `9000`).
-- The **`org.questdb:questdb-client:1.3.2`** dependency — resolved automatically
-  from **Maven Central**, no local build needed.
+  with client `1.3.6-SNAPSHOT`. QWP shares the HTTP port (default `9000`).
+- The **`org.questdb:questdb-client:1.3.6-SNAPSHOT`** dependency. This build carries
+  the QWP HA/role-failover and durable-ack support used here and is **not on Maven
+  Central**, so install it locally first (`mvn clean install` from the
+  `java-questdb-client` checkout). Override with `-Dquestdb.client.version=...` to pin
+  another build.
 
 ## Build
 
@@ -263,6 +266,15 @@ All hosts share **one** credential set and **one** transport scheme:
   Spill files are purged automatically once the data is acknowledged (only tiny
   `.lock` stubs remain). Size the S&F volume for your worst outage: at ~1M rows/sec a
   30s stop buffers a few GB.
+- **Durable ack (`--durable_ack`, default off).** By default spilled frames are
+  released on a normal ack (the node received them). With `--durable_ack true` the
+  sender instead holds each frame until a **durable, replicated** ack, so a failover
+  cannot lose rows the old primary accepted but had not yet replicated to the node
+  that gets promoted. This is **Enterprise-only** — OSS servers reject it during the
+  WebSocket upgrade — and is independent of `--enterprise` (which only drives table
+  retention), so enable it explicitly for no-loss HA. On promotion the client detects
+  the new writable primary via its role header, reconnects, and replays the still-held
+  frames.
 - **WAL backpressure:** a monitor polls `wal_tables()` for each enabled table and
   pauses **only that table's pool** when its `sequencerTxn - writerTxn` lag exceeds
   the high-water threshold — `3 × processes` above 2 workers, `5 × processes` at or
@@ -410,6 +422,6 @@ ILP/PG-transport flags (`--protocol`, `--pg_port`, `--ilp_user`, `--token_x`,
   keep an eye on the WAL lag. Separate tables/pools and modest per-table worker
   counts keep O3 low.
 - **Protocol compatibility:** QWP is a development wire protocol; the server must
-  be protocol-compatible with client `1.3.2`.
+  be protocol-compatible with client `1.3.6-SNAPSHOT`.
 - Java uses its own truststore — no macOS certifi workaround needed.
 ```

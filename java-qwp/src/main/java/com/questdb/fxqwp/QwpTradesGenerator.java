@@ -922,6 +922,13 @@ public final class QwpTradesGenerator {
         }
         final AtomicLong lastConnLogMs = new AtomicLong(0);
         final String who = tag(kind) + workerId;
+        // Enterprise-only: hold spilled frames until a durable (replicated) ack, so a failover
+        // cannot lose rows the old primary accepted but had not yet replicated. OSS rejects this
+        // during the WS upgrade, so it is off by default and gated behind its own --durable_ack
+        // flag (independent of --enterprise).
+        if (cfg.durableAck) {
+            b.requestDurableAck(true);
+        }
         b.storeAndForwardDir(sfPath)
                 .senderId(cfg.senderId + "-" + who)
                 .transactional(true)

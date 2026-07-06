@@ -36,6 +36,7 @@ public final class Cli {
     public String sfDir = "/tmp/qwp_trades_sf";
     public String senderId = "qwp-fx-trades";
     public int autoFlushBytes = 524288;   // QWP sender auto-flush size (bytes); 512 KiB, safely under the ~1MB WS frame cap
+    public boolean durableAck = false;    // QWP: hold store-and-forward frames until a durable (replicated) ack. Enterprise-only (OSS rejects it during the WS upgrade). Independent of --enterprise.
 
     // --- mode / volume / time ------------------------------------------------
     public String mode = null;                 // real-time | faster-than-life (required)
@@ -128,6 +129,9 @@ public final class Cli {
                 case "auto_flush_bytes":
                 case "autoflush_bytes":
                     c.autoFlushBytes = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "durable_ack":
+                    i = boolFlag(args, i, v -> c.durableAck = v);
                     break;
 
                 // ---- mode / volume / time ----
@@ -468,6 +472,7 @@ public final class Cli {
                 "  --sf_dir <dir>                    store-and-forward dir (default /tmp/qwp_trades_sf)",
                 "  --sender_id <id>                  store-and-forward sender id (default qwp-fx-trades)",
                 "  --auto_flush_bytes <n>            QWP sender auto-flush size in bytes (default 524288 = 512 KiB)",
+                "  --durable_ack [true|false]        hold store-and-forward frames until a durable (replicated) ack; Enterprise-only, default false (OSS rejects it)",
                 "",
                 "Pools (one thread set per table; symbols snake-drafted across each pool):",
                 "  --trades_processes <n>            worker threads for qwp_trades, 0-30 (default 1; 0 = off)",
