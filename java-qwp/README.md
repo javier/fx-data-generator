@@ -350,8 +350,8 @@ Option names accept Python underscore form (`--start_ts`) or kebab form
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--trades_processes <n>` | 1 | worker threads for `qwp_trades`, 0–30 (0 = off) |
-| `--market_data_processes <n>` | 0 | worker threads for `qwp_market_data`, 0–30 (0 = off) |
-| `--core_processes <n>` | 0 | worker threads for `qwp_core_price`, 0–30 (0 = off) |
+| `--market_data_processes <n>` | 1 | worker threads for `qwp_market_data`, 0–30 (0 = off) |
+| `--core_processes <n>` | 1 | worker threads for `qwp_core_price`, 0–30 (0 = off) |
 
 ### Volume / time (each rate is the **table-wide total** across that pool)
 

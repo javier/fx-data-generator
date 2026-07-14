@@ -1,6 +1,8 @@
 import argparse
 import time
 import sys
+import os
+import tempfile
 import math
 import random
 import multiprocessing as mp
@@ -403,16 +405,17 @@ def ensure_tables_exist(args, suffix):
     short_ttl = args.short_ttl
     enterprise = args.enterprise
     with pg.connect(conn_str, autocommit=True) as conn:
-        conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
-            timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
-            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
-            bids DOUBLE[][] PARQUET(default, zstd(4)),
-            asks DOUBLE[][] PARQUET(default, zstd(4)),
-            best_bid DOUBLE PARQUET(default, zstd(4)),
-            best_ask DOUBLE PARQUET(default, zstd(4))
-        ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
-        """)
+        if not getattr(args, "no_market_data", False):
+            conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
+                timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+                symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+                bids DOUBLE[][] PARQUET(default, zstd(4)),
+                asks DOUBLE[][] PARQUET(default, zstd(4)),
+                best_bid DOUBLE PARQUET(default, zstd(4)),
+                best_ask DOUBLE PARQUET(default, zstd(4))
+            ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
+            """)
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('core_price', suffix)} (
             timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
@@ -450,6 +453,8 @@ def ensure_materialized_views_exist(args, suffix):
     # To re-enable storage policies for matviews, swap the lambdas below.
     # rc = lambda oss_ttl, ep: retention_clause(short_ttl, enterprise, oss_ttl, ep)
     rc = lambda oss_ttl, ep: mv_retention_clause(short_ttl, enterprise, oss_ttl, ep)
+    # bbo_* and market_data_ohlc_* views read from market_data; skip them when it is disabled.
+    _md = not getattr(args, "no_market_data", False)
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1s', suffix)}  AS (
@@ -487,7 +492,7 @@ def ensure_materialized_views_exist(args, suffix):
             SAMPLE BY 1d
         ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1s', suffix)} AS (
             SELECT timestamp, symbol,
                 last(best_bid) AS bid,
@@ -497,7 +502,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY HOUR {rc('3 DAYS', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1m', suffix)} REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -507,7 +512,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY DAY {rc('3 DAYS', 'TO REMOTE 1 day, TO PARQUET 7 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1h', suffix)} REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -517,7 +522,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -527,7 +532,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1m', suffix)}  AS (
             SELECT timestamp, symbol,
                 first(best_bid) AS open,
@@ -540,7 +545,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY HOUR {rc('1 DAY', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_15m', suffix)} AS (
             SELECT timestamp, symbol,
                 first(open) AS open,
@@ -554,7 +559,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY HOUR {rc('2 DAYS', 'TO REMOTE 1 day, TO PARQUET 7 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 first(best_bid) AS open,
@@ -1010,6 +1015,28 @@ def ingest_worker(
 
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;auto_flush_interval={auto_flush_interval};" if not args.token else f"https::addr={args.host}:9000;token={args.token};tls_verify=unsafe_off;auto_flush_interval={auto_flush_interval};"
+    elif args.protocol == "qwp":
+        # QWP/WebSocket. Same Sender.from_conf() + dataframe() API as ILP; only the conf
+        # differs. QWP has its own versioning, so protocol_version is NOT set (it errors on
+        # QWP). Each worker gets a unique sender_id + store-and-forward dir so un-acked frames
+        # survive reconnects/failover without colliding between processes.
+        scheme = "qwpwss" if args.qwp_tls else "qwpws"
+        sender_id = f"fx-{process_idx}"
+        sf_dir = os.path.join(args.store_forward_dir, sender_id)
+        os.makedirs(sf_dir, exist_ok=True)
+        parts = [f"{scheme}::addr={args.host}:9000;", "auto_flush=off;"]
+        if args.token:
+            parts.append(f"token={args.token};")
+        if args.qwp_tls:
+            parts.append("tls_verify=unsafe_off;")
+        parts.append(f"sender_id={sender_id};")
+        parts.append(f"sf_dir={sf_dir};")
+        parts.append("reconnect_max_duration_millis=300000;")
+        parts.append("reconnect_initial_backoff_millis=100;")
+        parts.append("reconnect_max_backoff_millis=5000;")
+        if args.durable_ack:
+            parts.append("request_durable_ack=on;")
+        conf = "".join(parts)
     else:
         conf = f"tcp::addr={args.host}:9009;protocol_version=2;auto_flush_interval={auto_flush_interval};" if not args.token else f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;auto_flush_interval={auto_flush_interval};"
 
@@ -1042,7 +1069,8 @@ def ingest_worker(
                     end_ns, args.suffix, False,
                     orders_total, lei_pool
                 )
-                sent += market_total
+                # Stop budget counts core_price events when market_data is disabled.
+                sent += core_total if args.no_market_data else market_total
 
                 if (end_ns and ts >= end_ns) or (sent >= total_events):
                     emitter.flush_all()
@@ -1065,7 +1093,7 @@ def ingest_worker(
             while not (end_ns and ts >= end_ns) and (total_events == 0 or sent < total_events):
                 fx_pairs_snapshot = list(fx_pairs)
                 wait_if_paused(pause_event, process_idx)
-                market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+                market_total = 0 if args.no_market_data else random.randint(args.market_data_min_eps, args.market_data_max_eps)
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
                 orders_total = random.randint(args.orders_min_per_sec, args.orders_max_per_sec)
 
@@ -1084,7 +1112,8 @@ def ingest_worker(
                     orders_total, lei_pool
                 )
                 current_state = close_state
-                sent += market_total
+                # Stop budget counts core_price events when market_data is disabled.
+                sent += core_total if args.no_market_data else market_total
                 ts += int(1e9)
                 sec_idx += 1
 
@@ -1095,6 +1124,12 @@ def ingest_worker(
                 if sleep_for > 0:
                     time.sleep(sleep_for)
             emitter.flush_all()
+
+        # QWP/WebSocket: drain outstanding store-and-forward frames (wait for acks)
+        # before the sender closes, so a clean exit does not lose buffered rows.
+        if args.protocol == "qwp":
+            emitter.flush_all()
+            sender.close_drain()
 
     # ... main event loop ends here ...
 
@@ -1115,9 +1150,11 @@ def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
     threshold = 3 * processes
     last_logged_paused = False
 
+    # Watch the busiest table for WAL lag: market_data normally, core_price when it is disabled.
+    mon_table = table_name('core_price' if getattr(args, "no_market_data", False) else 'market_data', suffix)
     with pg.connect(conn_str, autocommit=True) as conn:
         while True:
-            cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{table_name('market_data', suffix)}'")
+            cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'")
             row = cur.fetchone()
             if row:
                 seq, wrt = row
@@ -1165,10 +1202,21 @@ def main():
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
     parser.add_argument("--token", default=None)
+    parser.add_argument("--token_file", default=None,
+                        help="read the (bearer) token from this file, trimmed; overrides --token. "
+                             "Keeps the token off the command line. Used by http/qwp auth.")
     parser.add_argument("--token_x", default=None)
     parser.add_argument("--token_y", default=None)
     parser.add_argument("--ilp_user", default="admin")
-    parser.add_argument("--protocol", choices=["http", "tcp"], default="http")
+    parser.add_argument("--protocol", choices=["http", "tcp", "qwp"], default="http")
+    parser.add_argument("--qwp_tls", type=lambda x: str(x).lower() == 'true', default=False,
+                        help="QWP only: use qwpwss (TLS) instead of qwpws, with tls_verify=unsafe_off")
+    parser.add_argument("--durable_ack", type=lambda x: str(x).lower() == 'true', default=False,
+                        help="QWP only: request_durable_ack=on so a failover cannot lose acked-but-"
+                             "unreplicated rows (Enterprise). Independent of --enterprise.")
+    parser.add_argument("--store_forward_dir", default=os.path.join(tempfile.gettempdir(), "fx_qwp_sf"),
+                        help="QWP only: base dir for per-worker store-and-forward spill; each worker "
+                             "gets a <dir>/fx-<idx> subdir (default: <tmp>/fx_qwp_sf)")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1200)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
@@ -1178,6 +1226,12 @@ def main():
     parser.add_argument("--start_ts", type=str)
     parser.add_argument("--end_ts", type=str)
     parser.add_argument("--processes", type=int, default=1)
+    parser.add_argument("--market_data_processes", type=int, default=None,
+                        help="Parity shim for the Java per-pool flag. Only 0 is accepted, and it "
+                             "DISABLES market_data (send only core_price + fx_trades, for fast "
+                             "two-table demos). Any non-zero value is rejected: Python drives all "
+                             "pools with a single --processes. When 0, the stop budget "
+                             "(--total_market_data_events) counts core_price events instead.")
     parser.add_argument("--min_levels", type=int, default=40)
     parser.add_argument("--max_levels", type=int, default=40)
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)
@@ -1194,6 +1248,20 @@ def main():
 
     args = parser.parse_args()
     suffix = args.suffix
+
+    # Token file wins over inline --token (keeps the token off the command line).
+    if args.token_file:
+        with open(args.token_file) as tf:
+            args.token = tf.read().strip()
+
+    # --market_data_processes is a parity shim for the Java per-pool count. Python has no
+    # per-pool worker split (one --processes drives every table), so only 0 is meaningful:
+    # it disables market_data entirely (core_price + fx_trades still flow). Reject any other value.
+    if args.market_data_processes is not None and args.market_data_processes != 0:
+        print("ERROR: --market_data_processes only accepts 0 in the Python generator (which disables "
+              "market_data). Per-pool worker counts are Java-only; use --processes for parallelism.")
+        sys.exit(1)
+    args.no_market_data = (args.market_data_processes == 0)
 
     # Parse ts ONCE
     if args.start_ts:
@@ -1216,8 +1284,10 @@ def main():
             print("ERROR: --total_market_data_events must be set to a positive integer in faster-than-life mode.")
             exit(1)
 
-    # Validate event rate hierarchy: market_data > core_price > orders
-    if args.market_data_min_eps <= args.core_max_eps:
+    # Validate event rate hierarchy: market_data > core_price > orders.
+    # When market_data is disabled, its EPS is unused, so skip that half of the check
+    # (demos deliberately push core_price EPS high).
+    if not args.no_market_data and args.market_data_min_eps <= args.core_max_eps:
         print(f"ERROR: market_data_min_eps ({args.market_data_min_eps}) must be greater than core_max_eps ({args.core_max_eps}).")
         print("Market data events should always be more frequent than core price events.")
         exit(1)
@@ -1233,7 +1303,8 @@ def main():
     # Connect and get latest timestamps
     conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str) as conn:
-        latest_market_ns = get_latest_timestamp_ns(conn, table_name('market_data', suffix))
+        # market_data may not exist when disabled (--market_data_processes 0); skip its lookup.
+        latest_market_ns = None if args.no_market_data else get_latest_timestamp_ns(conn, table_name('market_data', suffix))
         latest_core_ns = get_latest_timestamp_ns(conn, table_name('core_price', suffix))
 
     max_latest_ns = max(x for x in [latest_market_ns, latest_core_ns] if x is not None) if (latest_market_ns is not None or latest_core_ns is not None) else None
@@ -1348,14 +1419,19 @@ def main():
                 print(f"[INFO] Reached end_ts limit at {len(full_per_second_plan)} seconds ({events_so_far} events). "
                       f"Requested {args.total_market_data_events} events but time window only allows {events_so_far}.")
                 break
-            market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+            # When market_data is disabled, plan tuples carry 0 market events and the stop
+            # budget (--total_market_data_events) is measured in core_price events instead.
+            market_total = 0 if args.no_market_data else random.randint(args.market_data_min_eps, args.market_data_max_eps)
             core_total = random.randint(args.core_min_eps, args.core_max_eps)
             full_per_second_plan.append((market_total, core_total))
-            events_so_far += market_total
+            events_so_far += core_total if args.no_market_data else market_total
         overage = events_so_far - args.total_market_data_events
         if overage > 0 and (max_seconds_from_window is None or len(full_per_second_plan) < max_seconds_from_window):
             market_total, core_total = full_per_second_plan[-1]
-            full_per_second_plan[-1] = (market_total - overage, core_total)
+            if args.no_market_data:
+                full_per_second_plan[-1] = (market_total, core_total - overage)
+            else:
+                full_per_second_plan[-1] = (market_total - overage, core_total)
 
         total_seconds = len(full_per_second_plan)
         if total_seconds == 0:
@@ -1377,10 +1453,11 @@ def main():
 
             # Slice the plan for this chunk
             chunk_plan = full_per_second_plan[chunk_start_sec:chunk_end_sec]
-            chunk_events = sum(market for market, _ in chunk_plan)
+            chunk_events = sum((c if args.no_market_data else m) for m, c in chunk_plan)
+            chunk_label = "core_price" if args.no_market_data else "market_data"
 
             print(f"[CHUNK {chunk_idx + 1}/{num_chunks}] Seconds {chunk_start_sec}-{chunk_end_sec - 1}, "
-                  f"{chunk_events} market_data events, starting at {ns_to_iso(chunk_start_ns)}")
+                  f"{chunk_events} {chunk_label} events, starting at {ns_to_iso(chunk_start_ns)}")
 
             # Precompute state for this chunk only (using carry_forward_state for continuity)
             open_per_second, close_per_second = precompute_open_close_state(
@@ -1414,7 +1491,7 @@ def main():
                     args=(
                         args,
                         worker_plans[process_idx],
-                        sum(market for market, _ in worker_plans[process_idx]),
+                        sum((c if args.no_market_data else m) for m, c in worker_plans[process_idx]),
                         chunk_start_ns,
                         effective_end_ns,
                         global_states,

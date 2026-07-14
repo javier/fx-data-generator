@@ -46,8 +46,8 @@ public final class Cli {
     public String startTs = null;              // ISO-8601 start (faster-than-life)
     public String endTs = null;                // ISO-8601 max timestamp (upper bound)
     public int tradesProcesses = 1;            // worker threads for qwp_trades (0 = off)
-    public int marketDataProcesses = 0;        // worker threads for qwp_market_data (0 = off)
-    public int coreProcesses = 0;              // worker threads for qwp_core_price (0 = off)
+    public int marketDataProcesses = 1;        // worker threads for qwp_market_data (0 = off)
+    public int coreProcesses = 1;              // worker threads for qwp_core_price (0 = off)
     public int runSecs = 0;                    // wall-clock run cap in seconds; 0 = no cap
     public int commitIntervalMs = 1000;        // transaction rate: commit (flush) cadence in ms (global default)
     // Per-pool commit-cadence overrides; 0 = inherit commitIntervalMs.
@@ -485,8 +485,8 @@ public final class Cli {
                 "",
                 "Pools (one thread set per table; symbols snake-drafted across each pool):",
                 "  --trades_processes <n>            worker threads for qwp_trades, 0-30 (default 1; 0 = off)",
-                "  --market_data_processes <n>       worker threads for qwp_market_data, 0-30 (default 0 = off)",
-                "  --core_processes <n>              worker threads for qwp_core_price, 0-30 (default 0 = off)",
+                "  --market_data_processes <n>       worker threads for qwp_market_data, 0-30 (default 1; 0 = off)",
+                "  --core_processes <n>              worker threads for qwp_core_price, 0-30 (default 1; 0 = off)",
                 "",
                 "Volume / time (each *_per_sec / *_eps is the table-wide total across its pool):",
                 "  --orders_min_per_sec <n>          qwp_trades orders/sec total (default 50); each order -> 1+ fills",

@@ -129,11 +129,15 @@ order_id UUID  -- Multiple trades can share same order_id (partial fills)
 | `--pg_port`                  | str/int   | `8812`        | PostgreSQL port for QuestDB metadata queries                                                   |
 | `--user`                     | str       | `admin`       | Database user for metadata                                                                     |
 | `--password`                 | str       | `quest`       | Password for metadata                                                                          |
-| `--token`                    | str       | None          | ILP authentication token (JWK) for HTTP/HTTPS                                                  |
+| `--token`                    | str       | None          | ILP/QWP authentication token (JWK) for HTTP/HTTPS/QWP                                          |
+| `--token_file`               | str       | None          | Read the token from this file (trimmed); overrides `--token`, keeps it off the command line    |
 | `--token_x`                  | str       | None          | JWK token X coordinate (for tcps)                                                              |
 | `--token_y`                  | str       | None          | JWK token Y coordinate (for tcps)                                                              |
 | `--ilp_user`                 | str       | `admin`       | ILP/HTTP ingestion user                                                                        |
-| `--protocol`                 | str       | `http`        | `tcp` or `http` (`tcps`/`https` if token present)                                             |
+| `--protocol`                 | str       | `http`        | `http`, `tcp`, or `qwp` (QWP/WebSocket). `tcps`/`https` used automatically if a token is present |
+| `--qwp_tls`                  | bool      | `false`       | QWP only: use `qwpwss` (TLS) instead of `qwpws`, with `tls_verify=unsafe_off`                  |
+| `--durable_ack`              | bool      | `false`       | QWP only: `request_durable_ack=on` so a failover cannot lose acked-but-unreplicated rows (Enterprise) |
+| `--store_forward_dir`        | str       | `<tmp>/fx_qwp_sf` | QWP only: base dir for per-worker store-and-forward spill (each worker gets an `fx-<idx>` subdir) |
 | `--mode`                     | str       | **Required**  | `real-time` (wall clock) or `faster-than-life` (max speed)                                     |
 | `--market_data_min_eps`      | int       | `1200`        | Min `market_data` events/sec (must be > `core_max_eps`)                                        |
 | `--market_data_max_eps`      | int       | `15000`       | Max `market_data` events/sec                                                                   |
@@ -147,6 +151,7 @@ order_id UUID  -- Multiple trades can share same order_id (partial fills)
 | `--end_ts`                   | str       | None          | Simulation end time (ISO8601)                                                                  |
 | `--chunk_seconds`            | int       | `900`         | Max seconds to precompute per chunk in faster-than-life mode (limits memory usage)             |
 | `--processes`                | int       | `1`           | Number of worker processes (real-time allows only 1)                                           |
+| `--market_data_processes`    | int       | None          | Parity shim for the Java per-pool flag. **Only `0` is accepted**, and it disables `market_data` (send only `core_price` + `fx_trades`, e.g. fast two-table demos). Any non-zero value is rejected. When `0`, the stop budget (`--total_market_data_events`) counts `core_price` events |
 | `--min_levels`               | int       | `40`          | Min orderbook levels                                                                           |
 | `--max_levels`               | int       | `40`          | Max orderbook levels                                                                           |
 | `--incremental`              | bool      | `false`       | Load last state from DB to continue appending (faster-than-life only)                          |
@@ -161,7 +166,9 @@ The script enforces a hierarchy to maintain realism:
 - `market_data_min_eps` > `core_max_eps` (orderbooks update faster than BBO snapshots)
 - `core_min_eps` > `orders_max_per_sec` (more price updates than trades)
 
-Violating these constraints will cause the script to exit with an error message.
+Violating these constraints will cause the script to exit with an error message. When
+`market_data` is disabled (`--market_data_processes 0`), the first check is skipped so
+demos can push `core_price` EPS as high as they like.
 
 ---
 
@@ -259,6 +266,42 @@ python fx_data_generator.py \
   --processes 1 \
   --total_market_data_events 100_000_000 \
   --lei_pool_size 2000
+```
+
+### QWP/WebSocket ingestion (multi-host HA)
+
+QWP rides the same port `9000`. Pass a comma-separated `--host` for automatic
+failover across nodes; each worker keeps its own store-and-forward spool and replays
+un-acked frames on reconnect. `--durable_ack true` guards against losing
+acked-but-unreplicated rows across a failover (Enterprise).
+
+```bash
+python fx_data_generator.py \
+  --protocol qwp \
+  --host node1:9000,node2:9000,node3:9000 \
+  --qwp_tls true --token_file "$HOME/qwp_token.txt" --durable_ack true \
+  --mode real-time \
+  --market_data_min_eps 1200 --market_data_max_eps 2500 \
+  --core_min_eps 700 --core_max_eps 1000 \
+  --orders_min_per_sec 5 --orders_max_per_sec 30 \
+  --min_levels 40 --max_levels 40 \
+  --processes 1 --total_market_data_events 800_000_000
+```
+
+### Two-table demo (disable `market_data`)
+
+For a fast-ingest demo into just `core_price` + `fx_trades`, pass
+`--market_data_processes 0`. The `market_data` table and its `bbo_*` / `market_data_ohlc_*`
+views are not created, and the stop budget (`--total_market_data_events`) counts
+`core_price` events. Core EPS can be pushed high (the market > core check is skipped).
+
+```bash
+python fx_data_generator.py \
+  --protocol qwp --host 127.0.0.1 \
+  --market_data_processes 0 \
+  --core_min_eps 2000 --core_max_eps 4000 \
+  --orders_min_per_sec 5 --orders_max_per_sec 30 \
+  --mode real-time --processes 1 --total_market_data_events 100_000_000
 ```
 
 ---
