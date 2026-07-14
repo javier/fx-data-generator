@@ -235,10 +235,14 @@ class SortedEmitter:
       straight to pandas without per-row dict churn.
     """
 
-    def __init__(self, sender, buffer_limit, suffix):
+    def __init__(self, sender, buffer_limit, suffix, no_market_data=False):
         self.sender = sender
         self.buffer_limit = buffer_limit
         self.suffix = suffix
+        # When market_data is disabled it no longer drives _flush_md (which used to flush
+        # all three tables together), so flush trades alongside core_price to keep low-volume
+        # trades visible promptly instead of waiting for the (now large) trades buffer to fill.
+        self.no_market_data = no_market_data
         self._md = {"ts": [], "symbol": [], "bids": [], "asks": [],
                     "best_bid": [], "best_ask": []}
         self._cp = {"ts": [], "symbol": [], "ecn": [], "reason": [],
@@ -336,6 +340,10 @@ class SortedEmitter:
         for v in b.values():
             v.clear()
 
+        # With market_data off, ride core_price's flush cadence so trades stay fresh.
+        if self.no_market_data:
+            self._flush_tr()
+
     def _flush_tr(self):
         b = self._tr
         if not b["ts"]:
@@ -390,6 +398,34 @@ def pg_host(host):
     """
     first = host.split(",")[0].strip()
     return first.rsplit(":", 1)[0] if ":" in first else first
+
+def compute_buffer_limit(args):
+    """Rows buffered per table before a flush (= one WAL commit).
+
+    Base is 1000 (real-time) / 10000 (faster-than-life). When market_data is disabled,
+    core_price becomes the lead table and can run at very high EPS; keep the per-flush
+    batch large enough to hold ~10 flushes/sec so we don't spam tiny commits (which is
+    what makes QuestDB's WAL apply fall behind and trips the backpressure monitor).
+    """
+    base = 1000 if args.mode == "real-time" else 10000
+    if getattr(args, "no_market_data", False):
+        base = max(base, args.core_max_eps // 10)
+    return base
+
+def compute_wal_threshold(args, buffer_limit):
+    """WAL apply-lag threshold (in un-applied transactions) before the monitor pauses.
+
+    Market-on keeps the proven 3*processes (market_data commits slowly). When market_data
+    is disabled, core_price leads and commits far more often, so a threshold of 3 is a
+    hair-trigger: default to ~10s of the lead table's commit rate instead. Override with
+    --wal_lag_threshold.
+    """
+    if args.wal_lag_threshold is not None:
+        return args.wal_lag_threshold
+    if getattr(args, "no_market_data", False):
+        commit_rate = max(1, args.core_max_eps // buffer_limit)   # commits/sec
+        return min(1000, max(3 * args.processes, 10 * commit_rate))
+    return 3 * args.processes
 
 def get_latest_timestamp_ns(conn, table):
     cur = conn.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp DESC LIMIT 1")
@@ -1032,10 +1068,7 @@ def ingest_worker(
     global_sec_idx_offset, # only meaningful in faster-than-life
     lei_pool
 ):
-    if args.mode=="real-time":
-        buffer_limit=1000
-    else:
-        buffer_limit=10000
+    buffer_limit = compute_buffer_limit(args)
 
     auto_flush_interval = buffer_limit * 2  # safety net in the ILP client
 
@@ -1077,7 +1110,8 @@ def ingest_worker(
     last_close_per_symbol = {}
 
     with Sender.from_conf(conf) as sender:
-        emitter = SortedEmitter(sender, buffer_limit=buffer_limit, suffix=args.suffix)
+        emitter = SortedEmitter(sender, buffer_limit=buffer_limit, suffix=args.suffix,
+                                no_market_data=args.no_market_data)
         wall_start = None  # for real-time alignment
 
         if args.mode == "faster-than-life":
@@ -1170,15 +1204,15 @@ def ingest_worker(
 
     sys.exit(0)
 
-def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
+def wal_monitor(args, pause_event, threshold, suffix='', interval=5):
     import time
     import psycopg as pg
     conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
-    threshold = 3 * processes
     last_logged_paused = False
 
     # Watch the busiest table for WAL lag: market_data normally, core_price when it is disabled.
     mon_table = table_name('core_price' if getattr(args, "no_market_data", False) else 'market_data', suffix)
+    print(f"[WAL MONITOR] Watching {mon_table} with lag threshold {threshold}")
     with pg.connect(conn_str, autocommit=True) as conn:
         while True:
             cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'")
@@ -1254,11 +1288,16 @@ def main():
     parser.add_argument("--end_ts", type=str)
     parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--market_data_processes", type=int, default=None,
-                        help="Parity shim for the Java per-pool flag. Only 0 is accepted, and it "
-                             "DISABLES market_data (send only core_price + fx_trades, for fast "
-                             "two-table demos). Any non-zero value is rejected: Python drives all "
-                             "pools with a single --processes. When 0, the stop budget "
-                             "(--total_market_data_events) counts core_price events instead.")
+                        help="Toggle for the market_data table (parity shim for the Java per-pool "
+                             "flag). 0 = disable market_data (send only core_price + fx_trades, for "
+                             "fast two-table demos); 1 = enable (default). Other values are rejected: "
+                             "Python has a single shared pool, so use --processes for parallelism. "
+                             "When 0, the stop budget (--total_market_data_events) counts core_price "
+                             "events instead.")
+    parser.add_argument("--wal_lag_threshold", type=int, default=None,
+                        help="Pause ingestion when the monitored table's WAL apply lag exceeds this "
+                             "many transactions (default: 3*processes with market_data on; ~10s of "
+                             "core_price's commit rate when market_data is disabled).")
     parser.add_argument("--min_levels", type=int, default=40)
     parser.add_argument("--max_levels", type=int, default=40)
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)
@@ -1281,12 +1320,13 @@ def main():
         with open(args.token_file) as tf:
             args.token = tf.read().strip()
 
-    # --market_data_processes is a parity shim for the Java per-pool count. Python has no
-    # per-pool worker split (one --processes drives every table), so only 0 is meaningful:
-    # it disables market_data entirely (core_price + fx_trades still flow). Reject any other value.
-    if args.market_data_processes is not None and args.market_data_processes != 0:
-        print("ERROR: --market_data_processes only accepts 0 in the Python generator (which disables "
-              "market_data). Per-pool worker counts are Java-only; use --processes for parallelism.")
+    # --market_data_processes is a toggle for the market_data table (parity shim for the Java
+    # per-pool count). Python has one shared pool, so only 0 (disable) and 1 (enable) are
+    # meaningful; reject anything else. When 0, market_data is dropped and core_price + fx_trades
+    # still flow.
+    if args.market_data_processes is not None and args.market_data_processes not in (0, 1):
+        print("ERROR: --market_data_processes accepts only 0 (disable market_data) or 1 (enable) in "
+              "the Python generator. Per-pool worker counts are Java-only; use --processes for parallelism.")
         sys.exit(1)
     args.no_market_data = (args.market_data_processes == 0)
 
@@ -1421,9 +1461,13 @@ def main():
             state = load_initial_state_from_brackets(fx_pairs)
 
     pause_event = Event()
+    _buffer_limit = compute_buffer_limit(args)
+    _wal_threshold = compute_wal_threshold(args, _buffer_limit)
+    print(f"[INFO] Flush buffer_limit={_buffer_limit} rows; WAL lag threshold={_wal_threshold} "
+          f"(watching {'core_price' if args.no_market_data else 'market_data'})")
     wal_proc = mp.Process(
         target=wal_monitor,
-        args=(args, pause_event, args.processes),
+        args=(args, pause_event, _wal_threshold),
         kwargs={'suffix': suffix}
     )
     wal_proc.start()
