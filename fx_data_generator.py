@@ -365,6 +365,32 @@ class SortedEmitter:
         self._flush_tr()
 
 
+def qwp_addr_list(host, default_port=9000):
+    """Build a QWP addr= value from --host, supporting multi-host HA failover.
+
+    Accepts a single bare host ("h" -> "h:9000"), a single host:port, or a
+    comma-separated list ("h1:9000,h2:9000,h3") where any entry missing a port
+    gets default_port. The QWP client rotates across the listed nodes and replays
+    store-and-forward frames on the one that is (or becomes) the writable primary.
+    """
+    out = []
+    for h in host.split(","):
+        h = h.strip()
+        if not h:
+            continue
+        out.append(h if ":" in h else f"{h}:{default_port}")
+    return ",".join(out)
+
+def pg_host(host):
+    """First bare hostname from --host (strip :port and any extra hosts).
+
+    PG-wire metadata/DDL/WAL connections target a single node, and DDL must land on the
+    writable primary, so put the primary first in a multi-host --host list. QWP ingest
+    itself still fails over across every host via qwp_addr_list().
+    """
+    first = host.split(",")[0].strip()
+    return first.rsplit(":", 1)[0] if ":" in first else first
+
 def get_latest_timestamp_ns(conn, table):
     cur = conn.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp DESC LIMIT 1")
     row = cur.fetchone()
@@ -401,7 +427,7 @@ TABLE_ENTERPRISE_POLICY = 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 3 mon
 
 
 def ensure_tables_exist(args, suffix):
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     short_ttl = args.short_ttl
     enterprise = args.enterprise
     with pg.connect(conn_str, autocommit=True) as conn:
@@ -446,7 +472,7 @@ def ensure_tables_exist(args, suffix):
         """)
 
 def ensure_materialized_views_exist(args, suffix):
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     short_ttl = args.short_ttl
     enterprise = args.enterprise
     # Storage policies are not yet supported on materialized views in QuestDB.
@@ -602,7 +628,7 @@ def ensure_materialized_views_exist(args, suffix):
 # used only with incremental mode
 def load_initial_state(args, suffix):
     state = {}
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str) as conn:
         cur = conn.execute(f"SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM {table_name('core_price', suffix)} LATEST BY symbol")
         for row in cur.fetchall():
@@ -1024,7 +1050,8 @@ def ingest_worker(
         sender_id = f"fx-{process_idx}"
         sf_dir = os.path.join(args.store_forward_dir, sender_id)
         os.makedirs(sf_dir, exist_ok=True)
-        parts = [f"{scheme}::addr={args.host}:9000;", "auto_flush=off;"]
+        # --host may be a comma-separated host:port list for multi-host HA failover.
+        parts = [f"{scheme}::addr={qwp_addr_list(args.host)};", "auto_flush=off;"]
         if args.token:
             parts.append(f"token={args.token};")
         if args.qwp_tls:
@@ -1146,7 +1173,7 @@ def ingest_worker(
 def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
     import time
     import psycopg as pg
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     threshold = 3 * processes
     last_logged_paused = False
 
@@ -1301,7 +1328,7 @@ def main():
         ensure_materialized_views_exist(args, suffix)
 
     # Connect and get latest timestamps
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str) as conn:
         # market_data may not exist when disabled (--market_data_processes 0); skip its lookup.
         latest_market_ns = None if args.no_market_data else get_latest_timestamp_ns(conn, table_name('market_data', suffix))

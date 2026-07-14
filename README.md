@@ -125,7 +125,7 @@ order_id UUID  -- Multiple trades can share same order_id (partial fills)
 
 | Argument                     | Type      | Default       | Description                                                                                    |
 |------------------------------|-----------|---------------|------------------------------------------------------------------------------------------------|
-| `--host`                     | str       | `127.0.0.1`   | Host/IP of QuestDB instance                                                                    |
+| `--host`                     | str       | `127.0.0.1`   | Host/IP of QuestDB. For QWP, a comma-separated `host:port` list enables multi-host HA failover (a bare host gets `:9000`). DDL/metadata use the **first** entry, so list the writable primary first |
 | `--pg_port`                  | str/int   | `8812`        | PostgreSQL port for QuestDB metadata queries                                                   |
 | `--user`                     | str       | `admin`       | Database user for metadata                                                                     |
 | `--password`                 | str       | `quest`       | Password for metadata                                                                          |
@@ -270,10 +270,12 @@ python fx_data_generator.py \
 
 ### QWP/WebSocket ingestion (multi-host HA)
 
-QWP rides the same port `9000`. Pass a comma-separated `--host` for automatic
-failover across nodes; each worker keeps its own store-and-forward spool and replays
-un-acked frames on reconnect. `--durable_ack true` guards against losing
-acked-but-unreplicated rows across a failover (Enterprise).
+QWP rides the same port `9000`. Pass a comma-separated `host:port` `--host` for automatic
+failover across nodes: the client rotates to the writable primary and replays each
+worker's store-and-forward spool on reconnect (no need to re-point the generator when a
+replica is promoted). `--durable_ack true` guards against losing acked-but-unreplicated
+rows across a failover (Enterprise). DDL/metadata (PG-wire, port `8812`) use the **first**
+host, so list the primary first.
 
 ```bash
 python fx_data_generator.py \
