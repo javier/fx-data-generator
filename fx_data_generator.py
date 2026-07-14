@@ -427,6 +427,23 @@ def compute_wal_threshold(args, buffer_limit):
         return min(1000, max(3 * args.processes, 10 * commit_rate))
     return 3 * args.processes
 
+def lerp_state(open_state, close_state, f):
+    """Linearly interpolate every per-symbol state field between open and close at fraction f
+    in [0,1]. Used to slice a real-time second into sub-windows: because the second's events
+    already interpolate open->close linearly, slicing on this same line reproduces the exact
+    price/indicator trajectory and keeps slice boundaries continuous (sub_close[k] == sub_open[k+1]).
+    """
+    out = {}
+    for sym, o in open_state.items():
+        c = close_state[sym]
+        out[sym] = {k: o[k] + f * (c[k] - o[k]) for k in o}
+    return out
+
+def slice_count(total, n, s):
+    """Split `total` events across `n` slices, spreading the remainder over the first slices so
+    counts are as even as possible (slice index s in [0, n))."""
+    return total // n + (1 if s < (total % n) else 0)
+
 def get_latest_timestamp_ns(conn, table):
     cur = conn.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp DESC LIMIT 1")
     row = cur.fetchone()
@@ -826,10 +843,11 @@ def generate_events_for_second(
     suffix="",
     real_time=True,
     orders_count=0,
-    lei_pool=None
+    lei_pool=None,
+    window_ns=1_000_000_000
 ):
     """
-    Generate events for a single second:
+    Generate events for a single second (or a sub-slice of one when window_ns < 1e9):
     - market_data: Many events (full depth orderbook updates)
     - core_price: Fewer events (BBO snapshots with indicators)
     - fx_trades: Execute against orderbooks, timestamped after corresponding core_price
@@ -897,7 +915,7 @@ def generate_events_for_second(
 
     # --- Generate market_data events (LOTS of them - orderbook updates) ---
     if market_event_count > 0:
-        offsets_market = np.sort(np.random.randint(0, 1_000_000_000, market_event_count, dtype=np.int64))
+        offsets_market = np.sort(np.random.randint(0, window_ns, market_event_count, dtype=np.int64))
         sym_idx_market = np.random.randint(0, n_pairs, market_event_count)
         levels_market = np.random.randint(min_levels, max_levels + 1, market_event_count)
         md_bid_vols = draw_volumes(market_event_count)
@@ -927,7 +945,7 @@ def generate_events_for_second(
     # Track generated core_price events for trade generation
     core_price_events = []
     if core_count > 0:
-        offsets_core = np.sort(np.random.randint(0, 1_000_000_000, core_count, dtype=np.int64))
+        offsets_core = np.sort(np.random.randint(0, window_ns, core_count, dtype=np.int64))
         sym_idx_core = np.random.randint(0, n_pairs, core_count)
         levels_core = np.random.randint(min_levels, max_levels + 1, core_count)
         core_bid_vols = draw_volumes(core_count)
@@ -1151,6 +1169,14 @@ def ingest_worker(
             wall_start = time.time()
             last_refresh = time.time()
 
+            # Optional sub-second slicing: split each real-time second into fixed-duration slices
+            # so rows arrive smoothly (~every slice_ms) instead of in one burst per second. Off by
+            # default (n_slices == 1 reproduces the original per-second behaviour exactly).
+            slice_ms = max(0, getattr(args, "realtime_slice_ms", 0) or 0)
+            n_slices = max(1, 1000 // slice_ms) if slice_ms else 1
+            slice_ns = 1_000_000_000 // n_slices
+            slices_done = 0
+
             while not (end_ns and ts >= end_ns) and (total_events == 0 or sent < total_events):
                 fx_pairs_snapshot = list(fx_pairs)
                 wait_if_paused(pause_event, process_idx)
@@ -1158,32 +1184,44 @@ def ingest_worker(
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
                 orders_total = random.randint(args.orders_min_per_sec, args.orders_max_per_sec)
 
-
                 # At the beginning of the second: capture OPEN state
                 open_state = {k: v.copy() for k, v in current_state.items()}
                 # Evolve for close (to be used as interpolation target)
                 close_state = evolve_state_one_tick(current_state, fx_pairs_snapshot, 7.0)
 
-                generate_events_for_second(
-                    ts, market_total, core_total, fx_pairs_snapshot,
-                    open_state, close_state, emitter, ladder,
-                    args.min_levels, args.max_levels,
-                    prebuilt_bids, prebuilt_asks,
-                    end_ns, args.suffix, True,
-                    orders_total, lei_pool
-                )
+                for s in range(n_slices):
+                    # Sub-window open/close land on the same open->close line, so the price
+                    # trajectory and second-boundary continuity are identical to the unsliced case.
+                    if n_slices == 1:
+                        s_open, s_close, s_window = open_state, close_state, 1_000_000_000
+                    else:
+                        s_open = lerp_state(open_state, close_state, s / n_slices)
+                        s_close = lerp_state(open_state, close_state, (s + 1) / n_slices)
+                        s_window = slice_ns
+                    generate_events_for_second(
+                        ts + s * slice_ns, slice_count(market_total, n_slices, s),
+                        slice_count(core_total, n_slices, s), fx_pairs_snapshot,
+                        s_open, s_close, emitter, ladder,
+                        args.min_levels, args.max_levels,
+                        prebuilt_bids, prebuilt_asks,
+                        end_ns, args.suffix, True,
+                        slice_count(orders_total, n_slices, s), lei_pool,
+                        window_ns=s_window
+                    )
+                    # Push this slice out now so delivery is smooth, then align to its wall-clock boundary.
+                    if n_slices > 1:
+                        emitter.flush_all()
+                    slices_done += 1
+                    next_tick = wall_start + slices_done * slice_ns / 1_000_000_000
+                    sleep_for = next_tick - time.time()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+
                 current_state = close_state
                 # Stop budget counts core_price events when market_data is disabled.
                 sent += core_total if args.no_market_data else market_total
                 ts += int(1e9)
                 sec_idx += 1
-
-                # Wall clock alignment
-                next_tick = wall_start + sec_idx
-                now = time.time()
-                sleep_for = next_tick - now
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
             emitter.flush_all()
 
         # QWP/WebSocket: drain outstanding store-and-forward frames (wait for acks)
@@ -1298,6 +1336,11 @@ def main():
                         help="Pause ingestion when the monitored table's WAL apply lag exceeds this "
                              "many transactions (default: 3*processes with market_data on; ~10s of "
                              "core_price's commit rate when market_data is disabled).")
+    parser.add_argument("--realtime_slice_ms", type=int, default=0,
+                        help="Real-time only: split each second into slices of this many ms and "
+                             "flush after each, so rows arrive smoothly instead of one burst/sec "
+                             "(e.g. 100 = 10 evenly-spaced flushes/sec). 0 (default) = off. Ignored "
+                             "in faster-than-life.")
     parser.add_argument("--min_levels", type=int, default=40)
     parser.add_argument("--max_levels", type=int, default=40)
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)

@@ -39,4 +39,5 @@ PY="${PY:-python}"
   --create_views false \
   --incremental false \
   --lei_pool_size 2000 \
+  --realtime_slice_ms 100 \
   --suffix ""
