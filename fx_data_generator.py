@@ -245,9 +245,12 @@ class SortedEmitter:
         self.no_market_data = no_market_data
         self._md = {"ts": [], "symbol": [], "bids": [], "asks": [],
                     "best_bid": [], "best_ask": []}
-        self._cp = {"ts": [], "symbol": [], "ecn": [], "reason": [],
-                    "bid_price": [], "bid_volume": [], "ask_price": [], "ask_volume": [],
-                    "indicator1": [], "indicator2": []}
+        # core_price is accumulated as a list of column-array chunks (one chunk per
+        # emit_core_bulk call, i.e. per symbol per second) and concatenated at flush.
+        # This replaces a per-event dict-append path: at high core EPS the per-row
+        # Python overhead dominated generation (see emit_core_bulk / generate).
+        self._cp_chunks = []
+        self._cp_n = 0
         self._tr = {"ts": [], "symbol": [], "ecn": [], "side": [], "counterparty": [],
                     "trade_id": [], "passive": [], "price": [], "quantity": [], "order_id": []}
 
@@ -263,20 +266,16 @@ class SortedEmitter:
         if len(b["ts"]) >= self.buffer_limit:
             self._flush_md()
 
-    # --- Core price rows --- #
-    def emit_core(self, ts_ns, symbol, ecn, reason, columns):
-        b = self._cp
-        b["ts"].append(ts_ns)
-        b["symbol"].append(symbol)
-        b["ecn"].append(ecn)
-        b["reason"].append(reason)
-        b["bid_price"].append(columns["bid_price"])
-        b["bid_volume"].append(columns["bid_volume"])
-        b["ask_price"].append(columns["ask_price"])
-        b["ask_volume"].append(columns["ask_volume"])
-        b["indicator1"].append(columns["indicator1"])
-        b["indicator2"].append(columns["indicator2"])
-        if len(b["ts"]) >= self.buffer_limit:
+    # --- Core price rows (bulk) --- #
+    def emit_core_bulk(self, ts, symbol, ecn, reason, bid_price, bid_volume,
+                       ask_price, ask_volume, indicator1, indicator2):
+        # Each argument is a numpy column covering all of one symbol's core_price
+        # events for the second (or sub-slice). Columns are stashed as-is and
+        # concatenated once at flush, so there is no per-row Python work here.
+        self._cp_chunks.append((ts, symbol, ecn, reason, bid_price, bid_volume,
+                                ask_price, ask_volume, indicator1, indicator2))
+        self._cp_n += len(ts)
+        if self._cp_n >= self.buffer_limit:
             self._flush_cp()
 
     # --- Trade rows --- #
@@ -319,26 +318,27 @@ class SortedEmitter:
         self._flush_tr()
 
     def _flush_cp(self):
-        b = self._cp
-        if not b["ts"]:
+        if not self._cp_chunks:
             return
+        cols = list(zip(*self._cp_chunks))
+        cat = lambda i: cols[i][0] if len(cols[i]) == 1 else np.concatenate(cols[i])
         df = pd.DataFrame({
-            "symbol": pd.Categorical(b["symbol"]),
-            "ecn": pd.Categorical(b["ecn"]),
-            "reason": pd.Categorical(b["reason"]),
-            "bid_price": np.asarray(b["bid_price"], dtype=np.float64),
-            "bid_volume": np.asarray(b["bid_volume"], dtype=np.int64),
-            "ask_price": np.asarray(b["ask_price"], dtype=np.float64),
-            "ask_volume": np.asarray(b["ask_volume"], dtype=np.int64),
-            "indicator1": np.asarray(b["indicator1"], dtype=np.float64),
-            "indicator2": np.asarray(b["indicator2"], dtype=np.float64),
-            "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
+            "symbol": pd.Categorical(cat(1)),
+            "ecn": pd.Categorical(cat(2)),
+            "reason": pd.Categorical(cat(3)),
+            "bid_price": cat(4).astype(np.float64, copy=False),
+            "bid_volume": cat(5).astype(np.int64),
+            "ask_price": cat(6).astype(np.float64, copy=False),
+            "ask_volume": cat(7).astype(np.int64),
+            "indicator1": cat(8).astype(np.float64, copy=False),
+            "indicator2": cat(9).astype(np.float64, copy=False),
+            "ts": pd.to_datetime(cat(0).astype(np.int64, copy=False), unit="ns"),
         })
         self.sender.dataframe(df, table_name=table_name("core_price", self.suffix),
                               symbols=["symbol", "ecn", "reason"], at="ts")
         self.sender.flush()
-        for v in b.values():
-            v.clear()
+        self._cp_chunks = []
+        self._cp_n = 0
 
         # With market_data off, ride core_price's flush cadence so trades stay fresh.
         if self.no_market_data:
@@ -942,8 +942,14 @@ def generate_events_for_second(
                 emitter.emit_market(row_ts, symbol, bids, asks)
 
     # --- Generate core_price events (FEWER - BBO snapshots with metadata) ---
-    # Track generated core_price events for trade generation
-    core_price_events = []
+    # Per symbol, every core_price column is computed vectorized and the whole
+    # block is handed to the emitter in one emit_core_bulk() call. We keep each
+    # symbol's book arrays so trades can sample from them lazily: only the handful
+    # of events that are actually traded need a materialized book, instead of one
+    # dict per core event (which dominated generation at high core EPS).
+    ecn_arr = np.asarray(ecn_pool)
+    reason_arr = np.asarray(reason_pool)
+    symbol_books = []  # (symbol, pb, pa, bid_vols, ask_vols, levels, ts, ecn, pip, rank, n)
     if core_count > 0:
         offsets_core = np.sort(np.random.randint(0, window_ns, core_count, dtype=np.int64))
         sym_idx_core = np.random.randint(0, n_pairs, core_count)
@@ -967,55 +973,75 @@ def generate_events_for_second(
             ind2_close = float(round(c_state["indicator2"], 3))
             bid_vec, ask_vec = interp_open_close(symbol, n_events)
             pb, pa = price_grids(bid_vec, ask_vec, pip)
-            for j, e in enumerate(idx):
-                row_ts = int(row_ts_core[e])
-                if end_ns is not None and row_ts >= end_ns:
-                    continue
-                ecn = ecn_pool[ecn_idx[e]]
-                reason = reason_pool[reason_idx[e]]
-                last = j == n_events - 1
 
-                # Core price always uses level 0 (best bid/offer); indicators come
-                # from the open state for all but the last event (which is close).
-                emitter.emit_core(
-                    row_ts,
-                    symbol,
-                    ecn,
-                    reason,
-                    {
-                        "bid_price": float(pb[j, 0]),  # Level 0 = Best bid
-                        "bid_volume": int(core_bid_vols[e, 0]),
-                        "ask_price": float(pa[j, 0]),  # Level 0 = Best ask
-                        "ask_volume": int(core_ask_vols[e, 0]),
-                        "indicator1": ind1_close if last else ind1_open,
-                        "indicator2": ind2_close if last else ind2_open,
-                    }
-                )
+            # Indicators use the open state for every event except the last, which
+            # uses the close state (first event = open, last event = close), exactly
+            # as the per-event path did.
+            ind1 = np.full(n_events, ind1_open, dtype=np.float64)
+            ind2 = np.full(n_events, ind2_open, dtype=np.float64)
+            ind1[-1] = ind1_close
+            ind2[-1] = ind2_close
 
-                # Store this core_price event for potential trade generation. The
-                # book is stashed as (prices, volumes) row views into the grids, so
-                # a trade executes against exactly the book whose level 0 was
-                # published in the core_price row.
-                core_price_events.append({
-                    "timestamp": row_ts,
-                    "symbol": symbol,
-                    "ecn": ecn,
-                    "bids": (pb[j], core_bid_vols[e]),
-                    "asks": (pa[j], core_ask_vols[e]),
-                    "levels": int(levels_core[e]),
-                    "pip": pip,
-                    "rank": rank
-                })
+            ts_sym = row_ts_core[idx]
+            ecn_sym = ecn_arr[ecn_idx[idx]]
+            reason_sym = reason_arr[reason_idx[idx]]
+            bvols = core_bid_vols[idx]
+            avols = core_ask_vols[idx]
+            lvls = levels_core[idx]
+
+            # In faster-than-life the time window can end mid-second; drop events at
+            # or past end_ns (the per-event path skipped them with `continue`). The
+            # interpolation and indicators were computed over the full event set
+            # first, so surviving events keep identical values.
+            if end_ns is not None:
+                keep = ts_sym < end_ns
+                if not keep.all():
+                    if not keep.any():
+                        continue
+                    pb = pb[keep]; pa = pa[keep]
+                    ts_sym = ts_sym[keep]; ecn_sym = ecn_sym[keep]; reason_sym = reason_sym[keep]
+                    bvols = bvols[keep]; avols = avols[keep]; lvls = lvls[keep]
+                    ind1 = ind1[keep]; ind2 = ind2[keep]
+                    n_events = ts_sym.size
+
+            # Core price always uses level 0 (best bid/offer).
+            emitter.emit_core_bulk(
+                ts_sym, np.full(n_events, symbol), ecn_sym, reason_sym,
+                pb[:, 0], bvols[:, 0], pa[:, 0], avols[:, 0], ind1, ind2,
+            )
+
+            # Book kept as (prices, volumes) row views into the grids, so a sampled
+            # trade executes against exactly the book whose level 0 was published.
+            symbol_books.append((symbol, pb, pa, bvols, avols, lvls, ts_sym,
+                                 ecn_sym, pip, rank, n_events))
 
     # --- Generate trades from core_price events ---
-    if orders_count > 0 and lei_pool and core_price_events:
+    # Weight orders by liquidity rank (lower rank = more liquid = higher weight).
+    # The per-event weight is (11 - rank); since rank is constant within a symbol,
+    # weighting each symbol by (11 - rank) * n_events and then drawing a uniform
+    # event inside the chosen symbol reproduces the identical per-event selection
+    # distribution, while materializing a book only for the events actually traded.
+    total_core = sum(bk[10] for bk in symbol_books)
+    if orders_count > 0 and lei_pool and total_core > 0:
         # Cap orders to available core_price events to avoid excessive duplication
-        actual_orders_count = min(orders_count, len(core_price_events))
+        actual_orders_count = min(orders_count, total_core)
+        sym_weights = [(11 - bk[9]) * bk[10] for bk in symbol_books]
+        chosen_books = random.choices(symbol_books, weights=sym_weights, k=actual_orders_count)
 
-        # Select exactly actual_orders_count events, weighted by liquidity rank
-        # Lower rank = more liquid = higher weight
-        weights = [(11 - cp_event["rank"]) for cp_event in core_price_events]
-        selected_events = random.choices(core_price_events, weights=weights, k=actual_orders_count)
+        selected_events = []
+        for bk in chosen_books:
+            symbol, pb, pa, bvols, avols, lvls, ts_sym, ecn_sym, pip, rank, n_events = bk
+            p = random.randrange(n_events)
+            selected_events.append({
+                "timestamp": int(ts_sym[p]),
+                "symbol": symbol,
+                "ecn": str(ecn_sym[p]),
+                "bids": (pb[p], bvols[p]),
+                "asks": (pa[p], avols[p]),
+                "levels": int(lvls[p]),
+                "pip": pip,
+                "rank": rank,
+            })
 
         for cp_event in selected_events:
             # Check if we have room for trades within this second
