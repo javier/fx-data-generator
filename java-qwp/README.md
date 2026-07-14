@@ -13,7 +13,7 @@ of hosts. It can populate three tables, each with its own pool of worker threads
   `indicator1`/`indicator2`).
 
 It is a sibling of the Python FX data generator (`../fx_data_generator.py`) and is
-**dataset-compatible** with it: set `--prefix ""` and the table/view names, schemas,
+**dataset-compatible** with it: set `--prefix none` and the table/view names, schemas,
 and the full materialized-view set match the Python generator exactly, so you can
 backfill with one and continue with the other on the same tables (see
 [Interchangeability with the Python generator](#interchangeability-with-the-python-generator)).
@@ -74,10 +74,12 @@ CREATE TABLE IF NOT EXISTS qwp_core_price (
 whichever tables its enabled pools need over QWP. Retention is attached only with
 `--short_ttl` (`TTL 1 MONTH`/`3 DAYS`, or `STORAGE POLICY(...)` with `--enterprise`
 on the base tables — matviews always take TTL). Table/view names are
-`<prefix><stem><suffix>`: `--prefix` (default `qwp_`, set `""` to match the Python
+`<prefix><stem><suffix>`: `--prefix` (default `qwp_`, use `none` to match the Python
 names) and `--suffix` (default empty) both concatenate **verbatim**, so the trades
 table is `<prefix>fx_trades<suffix>`, e.g. `qwp_fx_trades` by default or `fx_trades`
-with `--prefix ""`.
+with `--prefix none`. (`none` and `-` are sentinels for an empty prefix; a literal
+`""` also works when you invoke the class directly, but `mvn exec:java` drops empty
+quoted `-Dexec.args` tokens, so prefer `none` there.)
 
 ### Materialized views (`--create_views`, default on)
 
@@ -311,7 +313,7 @@ cleanly with no false gaps.
 This generator and the Python `fx_data_generator.py` are **dataset-compatible**: you
 can backfill with one and continue (or go live) with the other on the **same tables**,
 and downstream views stay consistent. To share tables, run this generator with
-`--prefix ""` so the names match the Python generator exactly (`fx_trades`,
+`--prefix none` so the names match the Python generator exactly (`fx_trades`,
 `market_data`, `core_price`, and the 11 views). The Python generator is authoritative;
 schemas, view DDL, the symbol universe, ECN/reason/counterparty pools, the volume
 ladder, and the price/spread/indicator walks all mirror it.
@@ -397,7 +399,7 @@ depends on the mode:
 | `--incremental [true\|false]` | false | seed full state (mid, spread, indicators) from the last stored `core_price` row, skip Yahoo; **faster-than-life only** (rejected in real-time, which always syncs live quotes) |
 | `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise on the base tables) |
 | `--create_views [true\|false]` | **true** | build the full Python-parity matview set (11 views) |
-| `--prefix <s>` | `qwp_` | table-name prefix (verbatim); set `""` to match the Python names exactly |
+| `--prefix <s>` | `qwp_` | table-name prefix (verbatim); use `none` (or `-`, or `""`) to match the Python names exactly |
 | `--suffix <s>` | none | suffix (verbatim); tables become `<prefix>fx_trades<s>` / `<prefix>market_data<s>` / `<prefix>core_price<s>` |
 | `--lei_pool_size <n>` | 2000 | distinct counterparties |
 

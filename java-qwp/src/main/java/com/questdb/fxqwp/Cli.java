@@ -224,7 +224,7 @@ public final class Cli {
                     i = boolFlag(args, i, v -> c.createViews = v);
                     break;
                 case "prefix":
-                    c.prefix = req(args, ++i, raw);
+                    c.prefix = normalizePrefix(req(args, ++i, raw));
                     break;
                 case "suffix":
                     c.suffix = req(args, ++i, raw);
@@ -426,6 +426,15 @@ public final class Cli {
         return out;
     }
 
+    /**
+     * Normalize the --prefix value. "none" (or "-") maps to an empty prefix so the tables use the
+     * exact Python names. This sentinel exists because mvn exec:java whitespace-tokenizes
+     * -Dexec.args and drops empty quoted tokens, so `--prefix ''` cannot reach the program that way.
+     */
+    private static String normalizePrefix(String v) {
+        return ("none".equalsIgnoreCase(v) || "-".equals(v)) ? "" : v;
+    }
+
     private static String req(String[] args, int i, String flag) {
         if (i >= args.length) {
             fail("missing value for " + flag);
@@ -504,7 +513,7 @@ public final class Cli {
                 "  --short_ttl [true|false]          attach retention to the tables/views",
                 "  --enterprise [true|false]         with --short_ttl, use STORAGE POLICY instead of TTL on base tables",
                 "  --create_views [true|false]       create the full Python-parity matview set (default true)",
-                "  --prefix <s>                      table-name prefix (default 'qwp_'); set '' to match the Python names exactly",
+                "  --prefix <s>                      table-name prefix (default 'qwp_'); use 'none' (or '') to match the Python names exactly",
                 "  --suffix <s>                      append suffix to the table name (-> <prefix>fx_trades<s>)",
                 "  --lei_pool_size <n>               distinct counterparties (default 2000)",
                 "  --chunk_seconds <n>               accepted but unused (state is streamed per-second)")));
