@@ -2,6 +2,7 @@ import argparse
 import time
 import sys
 import os
+import signal
 import tempfile
 import math
 import random
@@ -15,6 +16,13 @@ import psycopg as pg
 import yfinance as yf
 import hashlib
 import uuid
+
+# QWP/WebSocket caps each encoded message (one flush frame) at ~2 MiB. Keep every
+# flush comfortably under that so a single large batch never overflows the frame:
+# core_price at very high EPS, or wide market_data order books, would otherwise
+# raise "encoded message size ... exceeds maximum configured allowed size".
+QWP_MAX_FRAME_BYTES = 2_097_138
+SAFE_FRAME_BYTES = 1_800_000
 
 FX_PAIRS = [
     # (symbol, low, high, precision, pip, rank)
@@ -294,11 +302,32 @@ class SortedEmitter:
         if len(b["ts"]) >= self.buffer_limit:
             self._flush_tr()
 
+    # --- Framed send: never let one flush exceed the QWP frame limit --- #
+    def _send_df(self, df, table, symbols, bytes_per_row):
+        """Send df in one dataframe()/flush() when it fits a single QWP frame, else
+        split it into row-slices that each stay under SAFE_FRAME_BYTES. bytes_per_row
+        is a conservative per-row encoded-size estimate for this table."""
+        n = len(df)
+        if n == 0:
+            return
+        max_rows = max(1, SAFE_FRAME_BYTES // bytes_per_row)
+        if n <= max_rows:
+            self.sender.dataframe(df, table_name=table, symbols=symbols, at="ts")
+            self.sender.flush()
+            return
+        for start in range(0, n, max_rows):
+            self.sender.dataframe(df.iloc[start:start + max_rows],
+                                  table_name=table, symbols=symbols, at="ts")
+            self.sender.flush()
+
     # --- Flush methods --- #
     def _flush_md(self):
         b = self._md
         if not b["ts"]:
             return
+        # Order-book rows carry two DOUBLE[][] arrays; per-row size grows with depth,
+        # so size the frame budget from the widest book in this batch.
+        maxlv = max(a.shape[1] for a in b["bids"])
         df = pd.DataFrame({
             "symbol": pd.Categorical(b["symbol"]),
             "bids": b["bids"],
@@ -307,9 +336,7 @@ class SortedEmitter:
             "best_ask": np.asarray(b["best_ask"], dtype=np.float64),
             "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
         })
-        self.sender.dataframe(df, table_name=table_name("market_data", self.suffix),
-                              symbols=["symbol"], at="ts")
-        self.sender.flush()
+        self._send_df(df, table_name("market_data", self.suffix), ["symbol"], 40 * maxlv + 128)
         for v in b.values():
             v.clear()
 
@@ -334,9 +361,8 @@ class SortedEmitter:
             "indicator2": cat(9).astype(np.float64, copy=False),
             "ts": pd.to_datetime(cat(0).astype(np.int64, copy=False), unit="ns"),
         })
-        self.sender.dataframe(df, table_name=table_name("core_price", self.suffix),
-                              symbols=["symbol", "ecn", "reason"], at="ts")
-        self.sender.flush()
+        self._send_df(df, table_name("core_price", self.suffix),
+                      ["symbol", "ecn", "reason"], 40)
         self._cp_chunks = []
         self._cp_n = 0
 
@@ -360,9 +386,8 @@ class SortedEmitter:
             "order_id": b["order_id"],
             "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
         })
-        self.sender.dataframe(df, table_name=table_name("fx_trades", self.suffix),
-                              symbols=["symbol", "ecn", "side", "counterparty"], at="ts")
-        self.sender.flush()
+        self._send_df(df, table_name("fx_trades", self.suffix),
+                      ["symbol", "ecn", "side", "counterparty"], 96)
         for v in b.values():
             v.clear()
 
@@ -410,6 +435,9 @@ def compute_buffer_limit(args):
     base = 1000 if args.mode == "real-time" else 10000
     if getattr(args, "no_market_data", False):
         base = max(base, args.core_max_eps // 10)
+        # Keep one flush within a single QWP frame (~2 MiB): at very high core EPS an
+        # uncapped batch (e.g. 100k rows) encodes past the WebSocket message limit.
+        base = min(base, SAFE_FRAME_BYTES // 40)
     return base
 
 def compute_wal_threshold(args, buffer_limit):
@@ -734,14 +762,16 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
         out.append((symbol, low, high, precision, pip, rank))
     return out
 
-def fx_pairs_refresher(shared_fx_pairs, interval=300, bracket_pct=1.0, first_ready_event=None):
-    while True:
+def fx_pairs_refresher(shared_fx_pairs, interval=300, bracket_pct=1.0, first_ready_event=None,
+                       shutdown_event=None):
+    _ignore_sigint()
+    while not _shutting_down(shutdown_event):
         new_fx_pairs = fetch_fx_pairs_from_yahoo(list(shared_fx_pairs), bracket_pct)
         for i in range(len(shared_fx_pairs)):
             shared_fx_pairs[i] = new_fx_pairs[i]
         if first_ready_event is not None and not first_ready_event.is_set():
             first_ready_event.set()
-        time.sleep(interval)
+        _interruptible_sleep(shutdown_event, interval)
 
 def quantize_to_pip(price, pip):
     decimals = abs(int(round(np.log10(pip))))
@@ -1098,6 +1128,41 @@ def wait_if_paused(pause_event, process_idx):
         print(f"[WORKER {process_idx}] Paused due to WAL lag (waiting for sequencerTxn==writerTxn)...")
         time.sleep(5)
 
+def _ignore_sigint():
+    """Child processes ignore Ctrl+C so it does not spray KeyboardInterrupt tracebacks;
+    the parent's handler sets the shared shutdown event and they exit via that instead."""
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass  # not on the main thread of a child; safe to ignore
+
+def _shutting_down(shutdown_event):
+    return shutdown_event is not None and shutdown_event.is_set()
+
+def _interruptible_sleep(shutdown_event, seconds):
+    """Sleep, but wake immediately if a shutdown is requested (so background
+    processes stop promptly on Ctrl+C instead of sitting in a long time.sleep)."""
+    if shutdown_event is not None:
+        shutdown_event.wait(seconds)
+    else:
+        time.sleep(seconds)
+
+def _install_parent_sigint(shutdown_event):
+    """Turn Ctrl+C in the parent into a graceful shutdown: the first signal asks the
+    workers to finish the current batch, flush/drain and exit; a second forces exit.
+    Child processes ignore SIGINT (see _ignore_sigint) and stop via shutdown_event."""
+    state = {"n": 0}
+    def handler(signum, frame):
+        state["n"] += 1
+        if state["n"] == 1:
+            print("\n[SHUTDOWN] Ctrl+C received - draining buffers and stopping cleanly "
+                  "(press Ctrl+C again to force).", flush=True)
+            shutdown_event.set()
+        else:
+            print("\n[SHUTDOWN] Forcing immediate exit.", flush=True)
+            os._exit(130)
+    signal.signal(signal.SIGINT, handler)
+
 def ingest_worker(
     args,
     per_second_plan,
@@ -1110,8 +1175,10 @@ def ingest_worker(
     processes,
     pause_event,
     global_sec_idx_offset, # only meaningful in faster-than-life
-    lei_pool
+    lei_pool,
+    shutdown_event=None
 ):
+    _ignore_sigint()
     buffer_limit = compute_buffer_limit(args)
 
     auto_flush_interval = buffer_limit * 2  # safety net in the ILP client
@@ -1161,6 +1228,9 @@ def ingest_worker(
         if args.mode == "faster-than-life":
             open_per_second, close_per_second = global_states
             for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
+                if _shutting_down(shutdown_event):
+                    emitter.flush_all()
+                    break
                 wait_if_paused(pause_event, process_idx)
 
                 open_state = open_per_second[sec_idx]
@@ -1204,6 +1274,8 @@ def ingest_worker(
             slices_done = 0
 
             while not (end_ns and ts >= end_ns) and (total_events == 0 or sent < total_events):
+                if _shutting_down(shutdown_event):
+                    break
                 fx_pairs_snapshot = list(fx_pairs)
                 wait_if_paused(pause_event, process_idx)
                 market_total = 0 if args.no_market_data else random.randint(args.market_data_min_eps, args.market_data_max_eps)
@@ -1242,6 +1314,8 @@ def ingest_worker(
                     sleep_for = next_tick - time.time()
                     if sleep_for > 0:
                         time.sleep(sleep_for)
+                    if _shutting_down(shutdown_event):
+                        break
 
                 current_state = close_state
                 # Stop budget counts core_price events when market_data is disabled.
@@ -1259,6 +1333,9 @@ def ingest_worker(
     # ... main event loop ends here ...
 
     # Print reason for exit
+    if _shutting_down(shutdown_event):
+        print(f"[WORKER {process_idx}] Shutdown requested; flushed and drained cleanly (last ts: {ns_to_iso(ts)}).")
+        sys.exit(0)
     if end_ns is not None and ts >= end_ns:
         print(f"[WORKER {process_idx}] Finished. Exiting because end_ts ({ns_to_iso(end_ns)}) was reached (last ts: {ns_to_iso(ts)}). Events sent from worker {sent} ")
     elif sent >= total_events:
@@ -1268,7 +1345,8 @@ def ingest_worker(
 
     sys.exit(0)
 
-def wal_monitor(args, pause_event, threshold, suffix='', interval=5):
+def wal_monitor(args, pause_event, threshold, suffix='', interval=5, shutdown_event=None):
+    _ignore_sigint()
     import time
     import psycopg as pg
     conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
@@ -1278,7 +1356,7 @@ def wal_monitor(args, pause_event, threshold, suffix='', interval=5):
     mon_table = table_name('core_price' if getattr(args, "no_market_data", False) else 'market_data', suffix)
     print(f"[WAL MONITOR] Watching {mon_table} with lag threshold {threshold}")
     with pg.connect(conn_str, autocommit=True) as conn:
-        while True:
+        while not _shutting_down(shutdown_event):
             cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'")
             row = cur.fetchone()
             if row:
@@ -1296,7 +1374,7 @@ def wal_monitor(args, pause_event, threshold, suffix='', interval=5):
                         print(f"[WAL MONITOR] Resuming ingestion: sequencerTxn={seq}, writerTxn={wrt}, lag={lag}")
                         pause_event.clear()
                         last_logged_paused = False
-            time.sleep(interval)
+            _interruptible_sleep(shutdown_event, interval)
 
 def parse_ts_arg(ts):
     # Accepts 2025-07-11T14:00:00, 2025-07-11T14:00:00Z, or 2025-07-11T14:00:00+00:00 as UTC
@@ -1493,6 +1571,9 @@ def main():
 
     # Build state
     manager = mp.Manager()
+    # Shared shutdown flag; Ctrl+C in the parent sets it and every child stops cleanly.
+    shutdown_event = mp.Event()
+    _install_parent_sigint(shutdown_event)
     refresher_proc = None
     if args.mode == "real-time":
         # Real-time uses a shared Manager list updated by Yahoo refresher
@@ -1517,7 +1598,8 @@ def main():
             first_ready_event = mp.Event()
             # Start the refresher
             refresher_proc = mp.Process(target=fx_pairs_refresher, args=(fx_pairs, args.yahoo_refresh_secs),
-                                        kwargs={'first_ready_event': first_ready_event})
+                                        kwargs={'first_ready_event': first_ready_event,
+                                                'shutdown_event': shutdown_event})
             refresher_proc.daemon = True
             refresher_proc.start()
             print("[INFO] Waiting for Yahoo FX brackets initial load...", flush=True)
@@ -1537,7 +1619,7 @@ def main():
     wal_proc = mp.Process(
         target=wal_monitor,
         args=(args, pause_event, _wal_threshold),
-        kwargs={'suffix': suffix}
+        kwargs={'suffix': suffix, 'shutdown_event': shutdown_event}
     )
     wal_proc.start()
 
@@ -1640,7 +1722,8 @@ def main():
                         args.processes,
                         pause_event,
                         global_sec_offsets[process_idx],
-                        lei_pool
+                        lei_pool,
+                        shutdown_event
                     )
                 )
                 p.start()
@@ -1649,6 +1732,11 @@ def main():
             # Wait for all workers to finish this chunk
             for p in pool:
                 p.join()
+
+            # Stop launching further chunks if Ctrl+C was pressed mid-chunk.
+            if _shutting_down(shutdown_event):
+                print("[SHUTDOWN] Stopping after current chunk.", flush=True)
+                break
 
             # Carry forward the final close state for continuity with next chunk
             carry_forward_state = close_per_second[-1]
@@ -1672,18 +1760,24 @@ def main():
                 1,  # processes
                 pause_event,
                 0,  # not needed for real-time
-                lei_pool
+                lei_pool,
+                shutdown_event
             )
         )
         p.start()
         p.join()
 
-    wal_proc.terminate()
-    wal_proc.join()
-
-    if refresher_proc is not None:
-        refresher_proc.terminate()
-        refresher_proc.join()
+    # Stop background processes. Set the flag (already set on a Ctrl+C shutdown, but
+    # also needed after a normal finish) so each exits its loop, then join with a short
+    # grace period and only hard-terminate if it is still blocked.
+    shutdown_event.set()
+    for proc in (wal_proc, refresher_proc):
+        if proc is None:
+            continue
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
 
 if __name__ == "__main__":
     main()
