@@ -17,12 +17,15 @@ import yfinance as yf
 import hashlib
 import uuid
 
-# QWP/WebSocket caps each encoded message (one flush frame) at ~2 MiB. Keep every
-# flush comfortably under that so a single large batch never overflows the frame:
-# core_price at very high EPS, or wide market_data order books, would otherwise
-# raise "encoded message size ... exceeds maximum configured allowed size".
+# QWP/WebSocket caps each encoded message (one flush frame) at ~2 MiB. A flush over
+# that raises "encoded message size ... exceeds maximum configured allowed size" AND
+# the client discards the buffer, so the overflow must be prevented up front, not
+# retried. SortedEmitter._send_df flushes by the live buffer size (len(sender)), so
+# SAFE_FRAME_BYTES is a target with generous headroom rather than a per-row guess.
 QWP_MAX_FRAME_BYTES = 2_097_138
-SAFE_FRAME_BYTES = 1_800_000
+SAFE_FRAME_BYTES = 1_400_000
+# Emitter buffer cap (rows) for memory / commit sizing; _send_df still frames each flush.
+MAX_BATCH_ROWS = 50_000
 
 FX_PAIRS = [
     # (symbol, low, high, precision, pip, rank)
@@ -304,21 +307,29 @@ class SortedEmitter:
 
     # --- Framed send: never let one flush exceed the QWP frame limit --- #
     def _send_df(self, df, table, symbols, bytes_per_row):
-        """Send df in one dataframe()/flush() when it fits a single QWP frame, else
-        split it into row-slices that each stay under SAFE_FRAME_BYTES. bytes_per_row
-        is a conservative per-row encoded-size estimate for this table."""
+        """Send df to QuestDB in frames that never exceed the QWP ~2 MiB message limit.
+
+        Rows are appended to the sender buffer in modest increments and flushed by the
+        ACTUAL staged buffer size (len(self.sender)) rather than a per-row byte guess,
+        so it is robust to however the columns actually encode over QWP. bytes_per_row
+        is only a rough per-table estimate used to size each append and a fallback row
+        cap (in case the buffer size is ever reported as 0). A flush that overran the
+        limit would be discarded by the client, so we must stay under it up front."""
         n = len(df)
         if n == 0:
             return
-        max_rows = max(1, SAFE_FRAME_BYTES // bytes_per_row)
-        if n <= max_rows:
-            self.sender.dataframe(df, table_name=table, symbols=symbols, at="ts")
-            self.sender.flush()
-            return
-        for start in range(0, n, max_rows):
-            self.sender.dataframe(df.iloc[start:start + max_rows],
-                                  table_name=table, symbols=symbols, at="ts")
-            self.sender.flush()
+        add_rows = max(1, 200_000 // bytes_per_row)                 # one append stays well under the budget
+        row_cap = max(add_rows, SAFE_FRAME_BYTES // bytes_per_row)  # fallback if len(sender) is unavailable
+        start = 0
+        staged = 0
+        while start < n:
+            end = min(start + add_rows, n)
+            self.sender.dataframe(df.iloc[start:end], table_name=table, symbols=symbols, at="ts")
+            staged += end - start
+            start = end
+            if start >= n or len(self.sender) >= SAFE_FRAME_BYTES or staged >= row_cap:
+                self.sender.flush()
+                staged = 0
 
     # --- Flush methods --- #
     def _flush_md(self):
@@ -336,7 +347,7 @@ class SortedEmitter:
             "best_ask": np.asarray(b["best_ask"], dtype=np.float64),
             "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
         })
-        self._send_df(df, table_name("market_data", self.suffix), ["symbol"], 40 * maxlv + 128)
+        self._send_df(df, table_name("market_data", self.suffix), ["symbol"], 48 * maxlv + 192)
         for v in b.values():
             v.clear()
 
@@ -362,7 +373,7 @@ class SortedEmitter:
             "ts": pd.to_datetime(cat(0).astype(np.int64, copy=False), unit="ns"),
         })
         self._send_df(df, table_name("core_price", self.suffix),
-                      ["symbol", "ecn", "reason"], 40)
+                      ["symbol", "ecn", "reason"], 80)
         self._cp_chunks = []
         self._cp_n = 0
 
@@ -387,7 +398,7 @@ class SortedEmitter:
             "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
         })
         self._send_df(df, table_name("fx_trades", self.suffix),
-                      ["symbol", "ecn", "side", "counterparty"], 96)
+                      ["symbol", "ecn", "side", "counterparty"], 128)
         for v in b.values():
             v.clear()
 
@@ -435,9 +446,9 @@ def compute_buffer_limit(args):
     base = 1000 if args.mode == "real-time" else 10000
     if getattr(args, "no_market_data", False):
         base = max(base, args.core_max_eps // 10)
-        # Keep one flush within a single QWP frame (~2 MiB): at very high core EPS an
-        # uncapped batch (e.g. 100k rows) encodes past the WebSocket message limit.
-        base = min(base, SAFE_FRAME_BYTES // 40)
+        # Bound the per-flush batch for memory / commit sizing. Frame safety (staying
+        # under the QWP ~2 MiB message limit) is enforced separately by _send_df.
+        base = min(base, MAX_BATCH_ROWS)
     return base
 
 def compute_wal_threshold(args, buffer_limit):
