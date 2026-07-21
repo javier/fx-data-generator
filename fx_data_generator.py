@@ -11,7 +11,7 @@ from multiprocessing import Event
 import numpy as np
 import pandas as pd
 import datetime
-from questdb.ingress import Sender, TimestampNanos
+from questdb import Sender, TimestampNanos
 import psycopg as pg
 import yfinance as yf
 import hashlib
@@ -1201,7 +1201,7 @@ def ingest_worker(
         # differs. QWP has its own versioning, so protocol_version is NOT set (it errors on
         # QWP). Each worker gets a unique sender_id + store-and-forward dir so un-acked frames
         # survive reconnects/failover without colliding between processes.
-        scheme = "qwpwss" if args.qwp_tls else "qwpws"
+        scheme = "wss" if args.qwp_tls else "ws"
         sender_id = f"fx-{process_idx}"
         sf_dir = os.path.join(args.store_forward_dir, sender_id)
         os.makedirs(sf_dir, exist_ok=True)
@@ -1424,7 +1424,7 @@ def main():
     parser.add_argument("--ilp_user", default="admin")
     parser.add_argument("--protocol", choices=["http", "tcp", "qwp"], default="http")
     parser.add_argument("--qwp_tls", type=lambda x: str(x).lower() == 'true', default=False,
-                        help="QWP only: use qwpwss (TLS) instead of qwpws, with tls_verify=unsafe_off")
+                        help="QWP only: use wss (TLS) instead of ws, with tls_verify=unsafe_off")
     parser.add_argument("--durable_ack", type=lambda x: str(x).lower() == 'true', default=False,
                         help="QWP only: request_durable_ack=on so a failover cannot lose acked-but-"
                              "unreplicated rows (Enterprise). Independent of --enterprise.")

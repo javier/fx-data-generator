@@ -135,7 +135,7 @@ order_id UUID  -- Multiple trades can share same order_id (partial fills)
 | `--token_y`                  | str       | None          | JWK token Y coordinate (for tcps)                                                              |
 | `--ilp_user`                 | str       | `admin`       | ILP/HTTP ingestion user                                                                        |
 | `--protocol`                 | str       | `http`        | `http`, `tcp`, or `qwp` (QWP/WebSocket). `tcps`/`https` used automatically if a token is present |
-| `--qwp_tls`                  | bool      | `false`       | QWP only: use `qwpwss` (TLS) instead of `qwpws`, with `tls_verify=unsafe_off`                  |
+| `--qwp_tls`                  | bool      | `false`       | QWP only: use `wss` (TLS) instead of `ws`, with `tls_verify=unsafe_off`                        |
 | `--durable_ack`              | bool      | `false`       | QWP only: `request_durable_ack=on` so a failover cannot lose acked-but-unreplicated rows (Enterprise) |
 | `--store_forward_dir`        | str       | `<tmp>/fx_qwp_sf` | QWP only: base dir for per-worker store-and-forward spill (each worker gets an `fx-<idx>` subdir) |
 | `--mode`                     | str       | **Required**  | `real-time` (wall clock) or `faster-than-life` (max speed)                                     |
