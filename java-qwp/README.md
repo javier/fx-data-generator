@@ -368,7 +368,9 @@ For a genuinely seamless dataset, also align:
   `--orders_min_per_sec/--orders_max_per_sec` (and `--min_levels/--max_levels`), or the
   row density will step at the hand-off even though prices stay continuous.
 - **Continuation seed.** Use `--incremental true` (faster-than-life) on the continuing
-  run: it seeds mid/spread/indicators from the last stored `core_price` row per symbol
+  run (when Python continues a Java backfill, also pass `--start_ts` at the end of the
+  backfill: Python's faster-than-life starts at "now" without it, while this generator
+  starts after the last row): it seeds mid/spread/indicators from the last stored `core_price` row per symbol
   — exactly like the Python `--incremental` — so `open(seam) == close(prev)` holds and
   OHLC candles join cleanly. Real-time never uses incremental on either engine; it
   reseeds from live Yahoo quotes, so a faster-than-life → live transition deliberately
