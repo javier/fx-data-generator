@@ -60,10 +60,10 @@ public final class QwpTradesGenerator {
     private static final String ENTERPRISE_POLICY =
             "TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 3 months";
 
-    private enum Kind { TRADES, MARKET_DATA, CORE_PRICE }
+    private enum Kind { TRADES, MARKET_DATA, CORE_PRICE, FORWARDS }
 
     private final Cli cfg;
-    private final List<FxPair> pairs = FxUniverse.defaultPairs();
+    private final List<FxPair> pairs;
     private final String[] leiPool;
     private final long[] ladder = FxUniverse.makeVolumeLadder();
 
@@ -84,18 +84,23 @@ public final class QwpTradesGenerator {
     private final AtomicBoolean pausedTrades = new AtomicBoolean(false);
     private final AtomicBoolean pausedMd = new AtomicBoolean(false);
     private final AtomicBoolean pausedCore = new AtomicBoolean(false);
+    // fx_forward_points is ~3% of core_price and is not WAL-monitored (as in Python); never set.
+    private final AtomicBoolean pausedFwd = new AtomicBoolean(false);
     private final AtomicLong tradesRows = new AtomicLong(0);
     private final AtomicLong mdRows = new AtomicLong(0);
     private final AtomicLong coreRows = new AtomicLong(0);
+    private final AtomicLong fwdRows = new AtomicLong(0);
     // Wall-clock ms when each pool's last worker finished — pools finish at different
     // times (the light tables cover the window first), so per-pool rate is rows over
     // that pool's own active span, not the whole run.
     private final AtomicLong tradesFinishMs = new AtomicLong(0);
     private final AtomicLong mdFinishMs = new AtomicLong(0);
     private final AtomicLong coreFinishMs = new AtomicLong(0);
+    private final AtomicLong fwdFinishMs = new AtomicLong(0);
 
     private QwpTradesGenerator(Cli cfg) {
         this.cfg = cfg;
+        this.pairs = FxUniverse.universe(cfg.metals);
         this.leiPool = FxUniverse.generateLeiPool(cfg.leiPoolSize);
         int n = pairs.size();
         this.initialMid = new double[n];
@@ -183,6 +188,7 @@ public final class QwpTradesGenerator {
                     cfg.marketDataMaxEps, startNs, endNs, wallStartMs));
             workers.addAll(spawnPool(Kind.CORE_PRICE, cfg.coreProcesses, cfg.coreMinEps,
                     cfg.coreMaxEps, startNs, endNs, wallStartMs));
+            workers.addAll(spawnPool(Kind.FORWARDS, cfg.forwards ? 1 : 0, 0, 0, startNs, endNs, wallStartMs));
         } else {
             // Faster-than-life: pools race at different data-clock rates (heavy
             // market_data lags the light trades/core_price). A single global-max
@@ -208,6 +214,12 @@ public final class QwpTradesGenerator {
                 if (cs != null) {
                     workers.addAll(spawnPool(Kind.CORE_PRICE, cfg.coreProcesses, cfg.coreMinEps,
                             cfg.coreMaxEps, cs, endNs, wallStartMs));
+                }
+            }
+            if (cfg.forwards) {
+                Long fs = poolStartFtl(Kind.FORWARDS, endNs);
+                if (fs != null) {
+                    workers.addAll(spawnPool(Kind.FORWARDS, 1, 0, 0, fs, endNs, wallStartMs));
                 }
             }
             if (workers.isEmpty()) {
@@ -245,6 +257,7 @@ public final class QwpTradesGenerator {
         printPoolDone("trades", tradesRows.get(), tradesFinishMs.get(), wallStartMs);
         printPoolDone("market_data", mdRows.get(), mdFinishMs.get(), wallStartMs);
         printPoolDone("core_price", coreRows.get(), coreFinishMs.get(), wallStartMs);
+        printPoolDone("fx_forward_points", fwdRows.get(), fwdFinishMs.get(), wallStartMs);
     }
 
     private List<Thread> spawnPool(Kind kind, int processes, int poolMin, int poolMax,
@@ -253,7 +266,9 @@ public final class QwpTradesGenerator {
         if (processes <= 0) {
             return threads;
         }
-        List<List<Integer>> assignment = snakeDraft(processes);
+        // Forwards: a single worker owning exactly the covered pairs (it replays their
+        // deterministic walks for the spot); the spot pools snake-draft the whole universe.
+        List<List<Integer>> assignment = kind == Kind.FORWARDS ? List.of(coveredPairIndices()) : snakeDraft(processes);
         logAssignment(kind, assignment);
         for (int w = 0; w < processes; w++) {
             Worker worker = new Worker(kind, w, assignment.get(w), poolMin, poolMax,
@@ -269,8 +284,27 @@ public final class QwpTradesGenerator {
         switch (kind) {
             case TRADES: return "t";
             case MARKET_DATA: return "md";
+            case FORWARDS: return "fw";
             default: return "cp";
         }
+    }
+
+    /** Global pair indices of the pairs with forward ladders, in ForwardsModel order. */
+    private List<Integer> coveredPairIndices() {
+        Map<String, Integer> idx = new HashMap<>();
+        for (int i = 0; i < pairs.size(); i++) {
+            idx.put(pairs.get(i).symbol, i);
+        }
+        List<Integer> out = new ArrayList<>();
+        for (String[] p : ForwardsModel.MAJORS) {
+            out.add(idx.get(p[0]));
+        }
+        if (cfg.metals) {
+            for (String[] p : ForwardsModel.METALS) {
+                out.add(idx.get(p[0]));
+            }
+        }
+        return out;
     }
 
     // ---------------------------------------------------------------- worker fleet
@@ -365,6 +399,10 @@ public final class QwpTradesGenerator {
         private double[] cBid;
         private double[] cAsk;
         private final long tsLookaheadNs;
+        // FORWARDS only: the ladder model and the planted bad point's timestamps (for the report).
+        private final ForwardsModel fwdModel;
+        private final List<Long> fwdBadTs = new ArrayList<>();
+        private final Map<String, Integer> ownedBySymbol = new HashMap<>();
 
         Worker(Kind kind, int id, List<Integer> ownedList, int poolMin, int poolMax,
                long startNs, Long endNs, long wallStartMs) {
@@ -415,25 +453,36 @@ public final class QwpTradesGenerator {
                 int g = owned[j];
                 walkRng[j] = new SplittableRandom(WALK_SEED_BASE + GOLDEN * g);
                 walkMid[j] = initialMid[g];
-                // Spread/indicators default to the Python template (4 pips, 0.2, 0.5) unless
-                // incremental seeding filled the initial* arrays from core_price, in which
-                // case continue from the last stored state so the seam stays continuous.
-                walkSp[j] = initialSpreadPips[g] > 0 ? initialSpreadPips[g] : 4;
+                // Spread/indicators default to the Python template (4 pips, 0.2, 0.5; a metal
+                // starts at the bottom of its spread band) unless incremental seeding filled the
+                // initial* arrays from core_price, in which case continue from the last stored
+                // state so the seam stays continuous.
+                FxPair pg = pairs.get(g);
+                walkSp[j] = initialSpreadPips[g] > 0 ? initialSpreadPips[g] : (pg.metal ? pg.spreadMinPips : 4);
+                ownedBySymbol.put(pg.symbol, j);
                 // Distinct seed from walkRng so the indicator draws never shift the
                 // mid/spread stream.
                 indRng[j] = new SplittableRandom((WALK_SEED_BASE * 31 + 0x5DEECE66DL) + GOLDEN * g);
                 walkInd1[j] = initialInd1[g] >= 0 ? initialInd1[g] : 0.2;
                 walkInd2[j] = initialInd2[g] >= 0 ? initialInd2[g] : 0.5;
             }
+            // Forward ladders on the same data clock as the rows this worker stamps. A fixed
+            // seed keeps the rate walk reproducible, like the per-symbol price walks.
+            this.fwdModel = kind == Kind.FORWARDS
+                    ? new ForwardsModel(cfg.metals, new SplittableRandom(WALK_SEED_BASE ^ 0xF0F0F0F0L),
+                            alignToSecond(startNs) + tsLookaheadNs, ForwardsModel.parseBadPointUtc(cfg.badPointUtc))
+                    : null;
         }
 
         @Override
         public void run() {
             String table = kind == Kind.TRADES ? cfg.tradesTable()
                     : kind == Kind.MARKET_DATA ? cfg.marketDataTable()
+                    : kind == Kind.FORWARDS ? cfg.forwardPointsTable()
                     : cfg.corePriceTable();
             int commitMs = kind == Kind.TRADES ? cfg.tradesCommitIntervalMs()
                     : kind == Kind.MARKET_DATA ? cfg.marketDataCommitIntervalMs()
+                    : kind == Kind.FORWARDS ? cfg.commitIntervalMs
                     : cfg.coreCommitIntervalMs();
             boolean realtime = "real-time".equals(cfg.mode);
             try (Sender sender = buildSender(kind, id)) {
@@ -453,6 +502,7 @@ public final class QwpTradesGenerator {
                         // secondStartNs -> deterministic bracket lookup -> consistent walk.
                         long k = (secondStartNs - base) / NANOS_PER_SEC;
                         beginSecond(k, 7.0); // real-time drift, matches the Python real-time path (FTL uses 5.0)
+                        emitForwards(sender, table, secondStartNs);
                         long sliceEnd = sliceNs;
                         while (true) {
                             emitSlice(sender, table, secondStartNs, sliceEnd);
@@ -481,6 +531,7 @@ public final class QwpTradesGenerator {
                         }
                         long k = (secondStartNs - base) / NANOS_PER_SEC;
                         beginSecond(k, 5.0); // faster-than-life drift, matches the Python precompute path
+                        emitForwards(sender, table, secondStartNs);
                         emitSlice(sender, table, secondStartNs, NANOS_PER_SEC);
                         endSecond();
                         secondStartNs += NANOS_PER_SEC;
@@ -500,6 +551,74 @@ public final class QwpTradesGenerator {
                 finishMsFor(kind).accumulateAndGet(System.currentTimeMillis(), Math::max);
                 bidArrays.values().forEach(DoubleArray::close);
                 askArrays.values().forEach(DoubleArray::close);
+                if (fwdModel != null) {
+                    reportBadPoints();
+                }
+            }
+        }
+
+        /**
+         * FORWARDS only: emit the ladders due in this data-second. Spot for each ladder is the
+         * pair's own mid at that instant, interpolated on the second's open->close line of the
+         * same deterministic walk the spot pools use, so outrights match core_price.
+         */
+        private void emitForwards(Sender sender, String table, long secondStartNs) {
+            if (fwdModel == null) {
+                return;
+            }
+            long t0 = secondStartNs + tsLookaheadNs;
+            for (ForwardsModel.Emission e : fwdModel.emissions(t0, t0 + NANOS_PER_SEC)) {
+                if (endNs != null && e.ts >= endNs) {
+                    stop = true;
+                    return;
+                }
+                int j = ownedBySymbol.get(e.symbol);
+                FxPair p = pairs.get(owned[j]);
+                double f = Math.min(1.0, Math.max(0.0, (double) (e.ts - t0) / NANOS_PER_SEC));
+                double om = (oBid[j] + oAsk[j]) / 2.0;
+                double cm = (cBid[j] + cAsk[j]) / 2.0;
+                // Reference spot rounded to 1/100 pip, the value the points are priced on.
+                double scale = Math.pow(10, Math.round(-Math.log10(p.pip)) + 2);
+                double spotRef = Math.round((om + f * (cm - om)) * scale) / scale;
+                double[] mid = fwdModel.midPoints(e, spotRef, p.pip);
+                for (int t = 0; t < ForwardsModel.TENORS.length; t++) {
+                    double half = ForwardsModel.halfSpread(e.symbol, t);
+                    sender.table(table)
+                            .symbol("symbol", e.symbol)
+                            .symbol("tenor", ForwardsModel.TENORS[t])
+                            .symbol("source", ForwardsModel.SOURCE)
+                            .intColumn("tenor_days", e.tenorDays[t])
+                            .timestampColumn("value_date", e.valueDateNs[t], ChronoUnit.NANOS)
+                            .doubleColumn("bid_points", Math.round((mid[t] - half) * 100.0) / 100.0)
+                            .doubleColumn("ask_points", Math.round((mid[t] + half) * 100.0) / 100.0)
+                            .doubleColumn("spot_ref", spotRef)
+                            .at(e.ts, ChronoUnit.NANOS);
+                    fwdRows.incrementAndGet();
+                }
+                if (e.bad) {
+                    fwdBadTs.add(e.ts);
+                }
+            }
+        }
+
+        /** Print the planted bad point's window per day, as the Python generator does. */
+        private void reportBadPoints() {
+            if (fwdBadTs.isEmpty()) {
+                System.out.printf("[FORWARDS] No planted bad point in this run (%s %s window not covered).%n",
+                        fwdModel.badSymbol, ForwardsModel.BAD_POINT_TENOR);
+                return;
+            }
+            Map<Long, List<Long>> byDay = new java.util.TreeMap<>();
+            for (long ts : fwdBadTs) {
+                byDay.computeIfAbsent(Math.floorDiv(ts, ForwardsModel.DAY_NS), d -> new ArrayList<>()).add(ts);
+            }
+            for (Map.Entry<Long, List<Long>> d : byDay.entrySet()) {
+                List<Long> tss = d.getValue();
+                System.out.printf("[FORWARDS] Planted bad point %s %s (+%s pips) on %s: %d ladders, "
+                                + "@bad_point_from := '%s', @bad_point_to := '%s'%n",
+                        fwdModel.badSymbol, ForwardsModel.BAD_POINT_TENOR, "6",
+                        java.time.LocalDate.ofEpochDay(d.getKey()), tss.size(),
+                        nanosToIso(tss.get(0)), nanosToIso(tss.get(tss.size() - 1)));
             }
         }
 
@@ -517,7 +636,7 @@ public final class QwpTradesGenerator {
                 double lo = p.lowAt(k);
                 double hi = p.highAt(k);
                 cMid[j] = FxUniverse.evolveMid(oMid[j], p, driftPips, lo, hi, walkRng[j]);
-                cSp[j] = FxUniverse.evolveSpreadPips(oSp[j], walkRng[j]);
+                cSp[j] = FxUniverse.evolveSpreadPips(oSp[j], p, walkRng[j]);
                 // Exact open/close best bid/ask; intra-second events interpolate between
                 // these by ordinal, with the first/last event pinned exactly to them so
                 // close(t) == open(t+1) holds in the emitted rows (clean OHLC candles).
@@ -536,6 +655,12 @@ public final class QwpTradesGenerator {
                     cInd1[j] = FxUniverse.evolveIndicator(oInd1[j], indRng[j]);
                     cInd2[j] = FxUniverse.evolveIndicator(oInd2[j], indRng[j]);
                 }
+            }
+            if (kind == Kind.FORWARDS) {
+                // Ladders come from ForwardsModel on their own cadence; no per-second event plan.
+                offsetCount = 0;
+                offsetCursor = 0;
+                return;
             }
             int nEvents = ThreadLocalRandom.current().nextInt(wMin, wMax + 1);
             for (int e = 0; e < nEvents; e++) {
@@ -632,10 +757,12 @@ public final class QwpTradesGenerator {
             ThreadLocalRandom rnd = ThreadLocalRandom.current();
             boolean buy = rnd.nextBoolean();
             boolean passive = rnd.nextDouble() < 0.4;
-            double remaining = FxUniverse.tradeSizeLognormal();
+            // Metals trade in ounces on their own level spacing (tick == pip for FX).
+            double remaining = p.metal ? FxUniverse.tradeSizeLognormal(p.sizeScale) : FxUniverse.tradeSizeLognormal();
+            double tick = p.tick();
             double limit = passive
-                    ? (buy ? ask + rnd.nextInt(0, 3) * p.pip : bid - rnd.nextInt(0, 3) * p.pip)
-                    : (buy ? ask + rnd.nextInt(3, 11) * p.pip : bid - rnd.nextInt(3, 11) * p.pip);
+                    ? (buy ? ask + rnd.nextInt(0, 3) * tick : bid - rnd.nextInt(0, 3) * tick)
+                    : (buy ? ask + rnd.nextInt(3, 11) * tick : bid - rnd.nextInt(3, 11) * tick);
             String ecn = FxUniverse.ECNS[rnd.nextInt(FxUniverse.ECNS.length)];
             long orderLo = rnd.nextLong();
             long orderHi = rnd.nextLong();
@@ -643,15 +770,15 @@ public final class QwpTradesGenerator {
             int fill = 0;
             for (int lvl = 0; lvl < cfg.maxLevels && remaining > 0; lvl++) {
                 double price = buy
-                        ? FxUniverse.quantizeToPip(ask + lvl * p.pip, p.pip, p.precision)
-                        : FxUniverse.quantizeToPip(bid - lvl * p.pip, p.pip, p.precision);
+                        ? FxUniverse.quantizeToPip(ask + lvl * tick, p.pip, p.precision)
+                        : FxUniverse.quantizeToPip(bid - lvl * tick, p.pip, p.precision);
                 if (buy ? price > limit : price < limit) {
                     break;
                 }
                 if (capReached()) {
                     return false;
                 }
-                double lvlVol = FxUniverse.volumeForLevel(lvl, ladder);
+                double lvlVol = FxUniverse.scaleVolume(FxUniverse.volumeForLevel(lvl, ladder), p);
                 double qty = Math.min(remaining, lvlVol);
                 remaining -= qty;
                 String counterparty = leiPool[rnd.nextInt(leiPool.length)];
@@ -679,19 +806,20 @@ public final class QwpTradesGenerator {
             DoubleArray asks = askArrays.computeIfAbsent(levels, L -> new DoubleArray(2, L));
             bids.clear();
             asks.clear();
-            // row 0 = prices
+            // row 0 = prices (levels one tick apart: a pip for FX, wider for a metal)
+            double tick = p.tick();
             for (int i = 0; i < levels; i++) {
-                bids.append(FxUniverse.quantizeToPip(bid - i * p.pip, p.pip, p.precision));
+                bids.append(FxUniverse.quantizeToPip(bid - i * tick, p.pip, p.precision));
             }
             for (int i = 0; i < levels; i++) {
-                asks.append(FxUniverse.quantizeToPip(ask + i * p.pip, p.pip, p.precision));
+                asks.append(FxUniverse.quantizeToPip(ask + i * tick, p.pip, p.precision));
             }
-            // row 1 = volumes
+            // row 1 = volumes (metals rescaled to ounces)
             for (int i = 0; i < levels; i++) {
-                bids.append((double) FxUniverse.volumeForLevel(i, ladder));
+                bids.append(FxUniverse.scaleVolume(FxUniverse.volumeForLevel(i, ladder), p));
             }
             for (int i = 0; i < levels; i++) {
-                asks.append((double) FxUniverse.volumeForLevel(i, ladder));
+                asks.append(FxUniverse.scaleVolume(FxUniverse.volumeForLevel(i, ladder), p));
             }
             sender.table(table)
                     .symbol("symbol", p.symbol)
@@ -717,9 +845,9 @@ public final class QwpTradesGenerator {
                     .symbol("ecn", ecn)
                     .symbol("reason", reason)
                     .doubleColumn("bid_price", bid)
-                    .longColumn("bid_volume", FxUniverse.volumeForLevel(0, ladder))
+                    .longColumn("bid_volume", (long) FxUniverse.scaleVolume(FxUniverse.volumeForLevel(0, ladder), p))
                     .doubleColumn("ask_price", ask)
-                    .longColumn("ask_volume", FxUniverse.volumeForLevel(0, ladder))
+                    .longColumn("ask_volume", (long) FxUniverse.scaleVolume(FxUniverse.volumeForLevel(0, ladder), p))
                     .doubleColumn("indicator1", Math.round(ind1 * 1000.0) / 1000.0)
                     .doubleColumn("indicator2", Math.round(ind2 * 1000.0) / 1000.0)
                     .at(ts, ChronoUnit.NANOS);
@@ -813,6 +941,9 @@ public final class QwpTradesGenerator {
                     }
                     if (cfg.coreProcesses > 0) {
                         sb.append(String.format("  core %,d/s (%,d)", Math.round((nowCp - lastCp) / dt), nowCp));
+                    }
+                    if (cfg.forwards) {
+                        sb.append(String.format("  fwd (%,d)", fwdRows.get()));
                     }
                     long totDelta = (nowT - lastT) + (nowMd - lastMd) + (nowCp - lastCp);
                     long totRows = nowT + nowMd + nowCp;
@@ -1016,6 +1147,22 @@ public final class QwpTradesGenerator {
                     + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS");
             execDdl(cfg.corePriceTable(), ddl);
         }
+        if (cfg.forwards) {
+            // Same schema, retention and encodings as the Python fx_forward_points.
+            String ddl = "CREATE TABLE IF NOT EXISTS " + cfg.forwardPointsTable() + " ("
+                    + "timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)), "
+                    + "symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter), "
+                    + "tenor SYMBOL PARQUET(rle_dictionary, zstd(4)), "
+                    + "tenor_days INT PARQUET(default, zstd(4)), "
+                    + "value_date TIMESTAMP PARQUET(delta_binary_packed, zstd(4)), "
+                    + "bid_points DOUBLE PARQUET(default, zstd(4)), "
+                    + "ask_points DOUBLE PARQUET(default, zstd(4)), "
+                    + "spot_ref DOUBLE PARQUET(default, zstd(4)), "
+                    + "source SYMBOL PARQUET(rle_dictionary, zstd(4))"
+                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS")
+                    + " DEDUP UPSERT KEYS(timestamp, symbol, tenor)";
+            execDdl(cfg.forwardPointsTable(), ddl);
+        }
     }
 
     // Deferred-start anchor shared by every REFRESH EVERY view, matching the Python DDL.
@@ -1080,6 +1227,17 @@ public final class QwpTradesGenerator {
                     "REFRESH EVERY 1h " + MV_DEFERRED + " ", "1 MONTH"));
         } else {
             System.out.println("[INFO] --create_views: trades pool off; skipping fx_trades_ohlc_* views.");
+        }
+        // Forward points (Python fx_forward_points_1m). 2 DAYS rather than core_price_1s's
+        // 4 HOURS so the planted 09:20 UTC bad point is still there for an afternoon demo.
+        if (cfg.forwards) {
+            String fw1m = cfg.viewName("fx_forward_points_1m");
+            execDdl(fw1m, "CREATE MATERIALIZED VIEW IF NOT EXISTS " + fw1m + " AS ("
+                    + "SELECT timestamp, symbol, tenor, last(bid_points) AS bid_points, "
+                    + "last(ask_points) AS ask_points, last(spot_ref) AS spot_ref, "
+                    + "last(value_date) AS value_date, last(tenor_days) AS tenor_days "
+                    + "FROM " + cfg.forwardPointsTable() + " SAMPLE BY 1m) PARTITION BY HOUR"
+                    + mvRetentionClause("2 DAYS"));
         }
     }
 
@@ -1160,6 +1318,7 @@ public final class QwpTradesGenerator {
         switch (kind) {
             case TRADES: return pausedTrades;
             case MARKET_DATA: return pausedMd;
+            case FORWARDS: return pausedFwd;
             default: return pausedCore;
         }
     }
@@ -1168,6 +1327,7 @@ public final class QwpTradesGenerator {
         switch (kind) {
             case TRADES: return tradesFinishMs;
             case MARKET_DATA: return mdFinishMs;
+            case FORWARDS: return fwdFinishMs;
             default: return coreFinishMs;
         }
     }
@@ -1398,6 +1558,7 @@ public final class QwpTradesGenerator {
         switch (kind) {
             case TRADES: return "trades";
             case MARKET_DATA: return "market_data";
+            case FORWARDS: return "fx_forward_points";
             default: return "core_price";
         }
     }
@@ -1409,6 +1570,8 @@ public final class QwpTradesGenerator {
                 return readMaxTimestampNanos(cfg.tradesTable(), false);   // TIMESTAMP_NS
             case MARKET_DATA:
                 return readMaxTimestampNanos(cfg.marketDataTable(), true);
+            case FORWARDS:
+                return readMaxTimestampNanos(cfg.forwardPointsTable(), true);
             default:
                 return readMaxTimestampNanos(cfg.corePriceTable(), true);
         }
@@ -1430,6 +1593,9 @@ public final class QwpTradesGenerator {
         }
         if (cfg.coreProcesses > 0) {
             latest = maxOf(latest, readMaxTimestampNanos(cfg.corePriceTable(), true));
+        }
+        if (cfg.forwards) {
+            latest = maxOf(latest, readMaxTimestampNanos(cfg.forwardPointsTable(), true));
         }
         return latest;
     }
@@ -1521,9 +1687,10 @@ public final class QwpTradesGenerator {
                                     FxPair p = pairs.get(i);
                                     double mid = (bid + ask) / 2.0;
                                     initialMid[i] = FxUniverse.quantizeToPip(mid, p.pip, p.precision);
-                                    // Spread in whole pips, clamped to the same 1..8 band the walk uses.
+                                    // Spread in whole pips, clamped to the same band the walk uses
+                                    // (1..8 for FX, the metal's own band otherwise).
                                     int sp = (int) Math.round((ask - bid) / p.pip);
-                                    initialSpreadPips[i] = Math.max(1, Math.min(8, sp));
+                                    initialSpreadPips[i] = Math.max(p.spreadMinPips, Math.min(p.spreadMaxPips, sp));
                                     initialInd1[i] = Math.max(0.0, Math.min(1.0, ind1));
                                     initialInd2[i] = Math.max(0.0, Math.min(1.0, ind2));
                                     p.resetBracket(mid * 0.99, mid * 1.01);

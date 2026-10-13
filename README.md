@@ -6,6 +6,13 @@ This script generates highly realistic, multi-level FX market data and ingests i
 2. **`core_price`** - Best bid/offer (BBO) with indicators and metadata
 3. **`fx_trades`** - Executed trades with realistic order matching against orderbooks
 
+Two optional layers, both off by default: `--metals true` adds the precious metals pairs
+(XAUUSD, XAGUSD, XPTUSD, XPDUSD, XAUEUR) to the universe, and `--forwards true` adds a fourth
+table, **`fx_forward_points`**, with forward point ladders for forwards and swaps. See
+[Precious metals](#precious-metals) and [Forwards and swaps](#forwards-and-swaps). The
+Java sibling supports both with the same flags, so a Java backfill can be continued by
+Python real-time with either layer on (run both engines with the same flags).
+
 Designed for **stress testing**, **benchmarking**, and **live demo scenarios**, it supports both wall-clock-paced ("real-time") and maximum-throughput ("faster-than-life") simulation with multi-process orchestration, pip-accurate pricing, WAL backpressure detection, and robust state management.
 
 > **Java sibling (QWP):** [`java-qwp/`](java-qwp/README.md) is a Java generator that ingests the **same three tables and the same materialized views** over QuestDB's QWP (WebSocket) protocol. This Python generator is authoritative; the two are **dataset-compatible** — run the Java one with `--prefix none` and matching EPS flags and you can backfill with one and continue (or go live) with the other on the same tables. See its README for the interchangeability runbook.
@@ -119,6 +126,23 @@ order_id UUID  -- Multiple trades can share same order_id (partial fills)
 ```
 **Volume:** 5-30 orders/second → typically 5-50 trades/second (depending on partial fills)
 
+### `fx_forward_points` (with `--forwards true`)
+Forward point ladders, one row per pair and tenor:
+```sql
+timestamp TIMESTAMP
+symbol SYMBOL
+tenor SYMBOL       -- ON, TN, 1W, 2W, 1M, 2M, 3M, 6M, 9M, 1Y
+tenor_days INT     -- calendar days from spot to the value date (negative for ON and TN)
+value_date TIMESTAMP  -- midnight UTC of the settlement date
+bid_points DOUBLE  -- in pips, can be negative
+ask_points DOUBLE
+spot_ref DOUBLE    -- the spot mid the ladder was priced on
+source SYMBOL      -- FWD_FEED
+```
+`DEDUP UPSERT KEYS(timestamp, symbol, tenor)`, partitioned and retained like `core_price`.
+**Volume:** 26 rows/second with `--metals` (13 pairs x 10 tenors every 5 seconds, about
+2.2M rows a day), 16 rows/second without.
+
 ---
 
 ## Arguments
@@ -161,6 +185,10 @@ order_id UUID  -- Multiple trades can share same order_id (partial fills)
 | `--short_ttl`                | bool      | `false`       | Enforce TTLs on all tables (3 days for tables, 4 hours-1 month for views)                      |
 | `--suffix`                   | str       | `""`          | Suffix to append to all table/view names                                                       |
 | `--yahoo_refresh_secs`       | int       | `300`         | Yahoo Finance bracket refresh interval (real-time mode only)                                   |
+| `--metals`                   | bool      | `false`       | Add XAUUSD, XAGUSD, XPTUSD, XPDUSD and XAUEUR to the pair universe. Total EPS is unchanged, so each FX pair gets 30/35 of its usual rows. See [Precious metals](#precious-metals) |
+| `--forwards`                 | bool      | `false`       | Create and fill `fx_forward_points` (and `fx_forward_points_1m` with `--create_views`). See [Forwards and swaps](#forwards-and-swaps) |
+| `--bad_point_utc`            | str       | `09:20`       | `--forwards` only: UTC start (`HH:MM`) of the daily 20-minute planted bad forward point        |
+| `--seed`                     | int       | None          | Seed every random stream so faster-than-life runs are reproducible byte for byte (Yahoo brackets aside). Unset = unseeded, as before |
 
 ### Event Rate Validation
 
@@ -308,6 +336,114 @@ python fx_data_generator.py \
   --mode real-time --processes 1 --total_market_data_events 100_000_000
 ```
 
+### Runner scripts
+
+| Script | What it runs |
+|---|---|
+| `fx_real_time_ingest.sh` | Real-time over TCP/ILP, local |
+| `fx_backfill_ingest.sh` | Faster-than-life backfill over TCP/ILP |
+| `fx_qwp_real_time.sh` | Real-time over QWP, multi-host HA, token file, durable acks |
+| `fx_qwp_backfill.sh` | Faster-than-life backfill over QWP with the same connection settings; run `fx_qwp_real_time.sh` afterwards to continue live on the same tables |
+
+Each script has an `EXTRA_ARGS` block with `--metals true` and `--forwards true` commented out.
+Uncomment to enable. The first run with `--forwards true` needs `--create_views true` so
+`fx_forward_points_1m` exists (the scripts default to `--create_views false`).
+
+---
+
+## Precious metals
+
+`--metals true` adds five pairs to the universe: **XAUUSD**, **XAGUSD**, **XPTUSD**,
+**XPDUSD** and **XAUEUR**. Precious metals trade as FX pairs: the metal is the base currency
+(always `XAUUSD`, never `USDXAU`), quoted in USD or EUR per troy ounce, two-way, T+2 spot. They
+flow through `market_data`, `core_price`, `fx_trades` and every view like any other pair, so
+the spot presentation (candles, views, `ASOF JOIN`, `HORIZON JOIN` markouts) runs unchanged
+with a metal selected.
+
+| Pair | Pip | Decimals | Yahoo | Spread (pips) | Book level step | Notes |
+|---|---|---|---|---|---|---|
+| XAUUSD | 0.01 | 2 | `GC=F` | 20 to 40 ($0.20 to $0.40) | 10 pips, 40 levels span $4 | the metals benchmark |
+| XAGUSD | 0.001 | 3 | `SI=F` | 20 to 40 ($0.02 to $0.04) | 5 pips | |
+| XPTUSD | 0.01 | 2 | `PL=F` | 100 to 300 | 20 pips | |
+| XPDUSD | 0.01 | 2 | `PA=F` | 300 to 800 | 50 pips | widest and jumpiest |
+| XAUEUR | 0.01 | 2 | derived: XAUUSD / EURUSD | 25 to 50 | 10 pips | |
+
+- **Sizes are troy ounces.** The generator's size fields are notional in base units, so the
+  same log-normal shapes are rescaled per metal: gold orders have a median around 3,000 oz,
+  silver around 50,000 oz, and order book levels scale the same way.
+- **Prices** walk at roughly twice the real per-second volatility, quantised to the pip like
+  every FX pair. The `XAUUSD=X` style spot tickers do not resolve on Yahoo, so brackets come
+  from the front-month futures (a small premium to spot) with dated static fallbacks in
+  `METALS_PAIRS`.
+- **Dilution.** Total EPS is unchanged, so with `--metals` each of the 30 FX pairs gets 30/35
+  of its usual rows. The FX pairs' price paths do not change (metals draw from their own
+  random stream), only the row counts fall in proportion.
+
+## Forwards and swaps
+
+`--forwards true` (both modes) creates `fx_forward_points` and, with `--create_views true`,
+the 1-minute view `fx_forward_points_1m`, both through the same retention, suffix and
+Parquet-encoding helpers as `core_price` (`TTL 3 DAYS` or the Enterprise storage policy on
+the table, `TTL 2 DAYS` on the view with `--short_ttl`). The view keeps 2 days rather than
+`core_price_1s`'s 4 hours so the daily planted event is still there for an afternoon demo.
+
+**Covered pairs:** the majors EURUSD, USDJPY, GBPUSD, USDCHF, AUDUSD, USDCAD, NZDUSD, plus
+EURJPY; with `--metals` also XAUUSD, XAGUSD, XPTUSD, XPDUSD and XAUEUR. **Tenors:** ON, TN, 1W,
+2W, 1M, 2M, 3M, 6M, 9M, 1Y.
+
+**Model.** Points come from covered interest parity,
+`points = spot x ((1 + r_quote x d / basis) / (1 + r_base x d / basis) - 1) / pip`, on
+per-currency short-rate curves (lease-rate curves for the metals, so XAUUSD shows contango
+and the platinum and short-dated silver curves show backwardation). The curves are static
+tables in the file (`RATE_CURVES`, dated, with sources) plus a slow random walk: a parallel
+shift of a few basis points a day and small per-tenor noise. Day count: Act/365 for GBP,
+Act/360 for every other currency and for lease rates. Spot is the generator's own mid at the
+emission instant, so outrights are consistent with `core_price`; each row records it as
+`spot_ref`. Crosses (EURJPY, XAUEUR) are derived from their legs, so the triangular check holds
+by construction. Bid and ask are the mid plus or minus a half spread that widens with tenor.
+
+**Value dates.** Spot is T+2 business days for every pair (weekday calendar, no holidays;
+USDCAD is T+1 in the real market). Tenors roll from spot, whole months with the end-of-month
+rule and modified following. ON and TN follow market convention: they carry the points of the
+short swaps today to tomorrow and tomorrow to spot, their value dates are today and tomorrow
+and `tenor_days` is negative, so their outrights are spot **minus** the cumulative points.
+`value_date` is recomputed at each emission and rolls at midnight UTC; on a weekend the trade
+date rolls to Monday.
+
+**Cadence.** One full ladder per pair every 5 seconds, each pair at its own phase plus jitter,
+the same simulated cadence in both modes. In faster-than-life one worker emits all ladders.
+Forward randomness has its own stream, so spot data is identical with the flag on or off.
+
+**Planted event.** Once per simulated day, from `--bad_point_utc` (default **09:20 UTC**) for
+20 minutes, the EURJPY 3M mid (XAUEUR 3M with `--metals`) is published 6 pips away from what
+its legs imply. `source` stays `FWD_FEED`: it is a feed error, not a manual mark. Nothing else
+in the data competes with it. The run prints its timestamps at the end, as `@bad_point_from`
+and `@bad_point_to` values. In real-time mode, a generator started after 09:40 UTC on a day
+with no backfill has no event that day, so backfill the day first (`fx_qwp_backfill.sh` or
+`fx_backfill_ingest.sh` with `--forwards true`).
+
+**Queries.** The forwards section of `demo_queries.sql` has six cells: the forward curve now
+with outrights, the same curve as of any instant, implied carry and lease rates, swap points
+between two tenors, the triangular consistency check (which returns the planted window), and
+the points history against spot.
+
+**Volume.** 26 rows/second with `--metals` (about 2.2M rows a day), against 700 to 1,000 for
+`core_price` and 1,200 to 15,000 for `market_data`: about 3% of `core_price`, and narrow
+rows. The 1-minute view holds 13 x 10 x 1,440 = about 190k rows a day. The WAL monitor keeps
+watching `market_data` (or `core_price`) as before.
+
+## Demo dashboards
+
+- **Spot only:** `grafana_dashboard.json` ("FX Orderbook - Realtime Demo"), with both flags off.
+- **Spot plus forwards:** `fx_forwards_grafana_dashboard.json` ("FX and Metals: Spot and
+  Forwards"), with `--metals true --forwards true` and XAUUSD selected. Market Depth runs full
+  width, then a Spot row (top of book against core price, 15-minute candles), a Forwards row
+  (the curve with outrights and implied rates, 3M points against spot, the triangular
+  consistency gap per tenor) and a Swaps row (the swap ladder from spot). It needs
+  `market_data` and its views, so it is not for two-table mode (`--market_data_processes 0`).
+  The consistency panel reads the latest complete minute of the selected time range: set the
+  range to end inside 09:20 to 09:40 UTC to see the planted bad point turn a bar red.
+
 ---
 
 ## Docker Support
@@ -348,6 +484,10 @@ The script automatically creates OHLC aggregation views:
 - `market_data_ohlc_1m`: 1-minute OHLC from orderbook best bid
 - `market_data_ohlc_15m`: 15-minute OHLC
 - `market_data_ohlc_1d`: 1-day OHLC
+
+### Forward Points View (with `--forwards true`)
+- `fx_forward_points_1m`: last bid/ask points, `spot_ref`, value date and `tenor_days` per
+  symbol, tenor and minute
 
 ### Trade Views (User-Created)
 Example views for `fx_trades` aggregations:

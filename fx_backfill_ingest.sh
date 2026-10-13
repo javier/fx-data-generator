@@ -2,6 +2,12 @@
 # fx_backfill_ingest.sh
 # Batch (faster-than-life) backfill for the fx generator.
 
+# Optional layers, off by default. Uncomment a line to enable it.
+EXTRA_ARGS=(
+  # --metals true     # adds XAUUSD, XAGUSD, XPTUSD, XPDUSD, XAUEUR; FX pairs get 30/35 of their rows
+  # --forwards true   # adds fx_forward_points; the first run needs --create_views true for its _1m view
+)
+
 python fx_data_generator.py \
   --host 172.31.42.41 \
   --market_data_min_eps 8200 \
@@ -26,4 +32,5 @@ python fx_data_generator.py \
   --incremental false \
   --orders_min_per_sec 5 \
   --orders_max_per_sec 30 \
-  --lei_pool_size 2000
+  --lei_pool_size 2000 \
+  ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

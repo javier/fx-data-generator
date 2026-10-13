@@ -198,6 +198,47 @@ explicitly so it's a conscious choice, not an accident.
 
 ---
 
+## Change 8: Precious metals (`--metals`) and forwards (`--forwards`)
+
+**Why.** The Python generator gained two optional layers for a precious metals and FX
+desk demo. Java must offer the same flags, pairs, schema and data character so a Java
+backfill can be continued by Python real-time (or vice versa) with either layer on.
+
+**Metals (both engines, default off).** XAUUSD, XAGUSD, XAUEUR, XPTUSD, XPDUSD appended
+after the 30 FX pairs, with per-pair overrides of the FX model: walk move and shock
+scale, shock probability, spread band and step (step = half-even rounding of
+band/8, so gold steps 2 pips on both engines), book level spacing, volume and trade
+size scale (troy ounces), Yahoo futures tickers, XAUEUR bracket derived from
+XAUUSD / EURUSD. FX pairs keep their indices, hence their walk seeds and paths.
+- Java: `FxPair.metal(...)` + `FxUniverse.metalPairs()/universe(metals)`;
+  `evolveMid`/`evolveSpreadPips` read the pair's parameters (FX defaults reproduce the
+  old draws exactly); books, core volumes and orders use `pair.tick()` and
+  `FxUniverse.scaleVolume`.
+
+**Forwards (both engines, default off).** New table `<prefix>fx_forward_points<suffix>`
+(`timestamp, symbol, tenor, tenor_days INT, value_date TIMESTAMP, bid_points,
+ask_points, spot_ref, source`, `PARTITION BY HOUR`, `DEDUP UPSERT KEYS(timestamp,
+symbol, tenor)`, retention through the same helpers as `core_price`, `3 DAYS` TTL) and
+view `<prefix>fx_forward_points_1m<suffix>` (`SAMPLE BY 1m`, `PARTITION BY HOUR`,
+`TTL 2 DAYS`). Same covered pairs, tenors, value-date rules (T+2, weekday calendar,
+end-of-month, modified following, ON/TN before spot), rate and lease curves, 5-second
+cadence with phases kept inside the cycle, and the daily planted bad point.
+- Java: `ForwardsModel` (port of the Python class) and a `FORWARDS` pool of one worker
+  that replays the covered pairs' deterministic walks for `spot_ref`; it resumes from
+  its own table in faster-than-life. Flags `--metals`, `--forwards`, `--bad_point_utc`.
+
+**Validated (local QuestDB, small test tables dropped afterwards):** Java FTL run with
+both layers: metal spreads, book spacing and sizes match Python; every covered pair
+has a full ladder every 5 s; all six forwards cells in `demo_queries.sql` run on the
+Java data and the consistency check returns only the planted XAUEUR 3M window.
+`SHOW CREATE TABLE` is byte-identical for all four tables whichever engine created
+them; `SHOW CREATE MATERIALIZED VIEW` matches once whitespace is normalised (the
+stored SQL keeps each engine's line breaks, as it already did for the other views).
+Java real-time: ladders at about 26 rows/s, `spot_ref` equal to the `core_price`
+mid at the same instant within an intra-second move.
+
+---
+
 ## Operational guardrails (demo runbook, not code)
 
 1. **Match the EPS / orders rates across engines (most important).** Per-second row

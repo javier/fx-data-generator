@@ -80,6 +80,11 @@ public final class Cli {
     public String suffix = "";                 // table-name suffix (parity with Python)
     public int leiPoolSize = 2000;
 
+    // --- optional layers (parity with the Python --metals / --forwards) ---------
+    public boolean metals = false;             // add XAUUSD, XAGUSD, XPTUSD, XPDUSD, XAUEUR to the universe
+    public boolean forwards = false;           // create + fill fx_forward_points (+ its _1m view)
+    public String badPointUtc = "09:20";       // --forwards: UTC start of the daily 20-minute planted bad point
+
     public static Cli parse(String[] args) {
         Cli c = new Cli();
         List<String> notes = new ArrayList<>();
@@ -232,6 +237,15 @@ public final class Cli {
                 case "lei_pool_size":
                     c.leiPoolSize = Integer.parseInt(req(args, ++i, raw));
                     break;
+                case "metals":
+                    i = boolFlag(args, i, v -> c.metals = v);
+                    break;
+                case "forwards":
+                    i = boolFlag(args, i, v -> c.forwards = v);
+                    break;
+                case "bad_point_utc":
+                    c.badPointUtc = req(args, ++i, raw);
+                    break;
 
                 // ---- accepted but currently unused (kept for now) ----
                 case "chunk_seconds":
@@ -284,8 +298,15 @@ public final class Cli {
         if (coreProcesses < 0 || coreProcesses > 30) {
             fail("--core_processes must be between 0 and 30");
         }
-        if (tradesProcesses == 0 && marketDataProcesses == 0 && coreProcesses == 0) {
+        if (tradesProcesses == 0 && marketDataProcesses == 0 && coreProcesses == 0 && !forwards) {
             fail("enable at least one pool (--trades_processes, --market_data_processes and/or --core_processes > 0)");
+        }
+        if (forwards) {
+            try {
+                ForwardsModel.parseBadPointUtc(badPointUtc);
+            } catch (RuntimeException e) {
+                fail(e.getMessage());
+            }
         }
         if (marketDataProcesses > 0) {
             if (marketDataMinEps <= 0 || marketDataMaxEps < marketDataMinEps) {
@@ -335,6 +356,10 @@ public final class Cli {
 
     public String corePriceTable() {
         return prefix + "core_price" + suffix;
+    }
+
+    public String forwardPointsTable() {
+        return prefix + "fx_forward_points" + suffix;
     }
 
     /** View/base name with the same prefix+suffix scheme as the tables (stem has no leading prefix). */
@@ -516,6 +541,11 @@ public final class Cli {
                 "  --prefix <s>                      table-name prefix (default 'qwp_'); use 'none' (or '') to match the Python names exactly",
                 "  --suffix <s>                      append suffix to the table name (-> <prefix>fx_trades<s>)",
                 "  --lei_pool_size <n>               distinct counterparties (default 2000)",
+                "",
+                "Optional layers (parity with the Python generator):",
+                "  --metals [true|false]             add XAUUSD, XAGUSD, XPTUSD, XPDUSD, XAUEUR (FX pairs get 30/35 of the rows)",
+                "  --forwards [true|false]           create + fill fx_forward_points (one extra worker thread; _1m view with --create_views)",
+                "  --bad_point_utc <HH:MM>           --forwards: UTC start of the daily 20-minute planted bad point (default 09:20)",
                 "  --chunk_seconds <n>               accepted but unused (state is streamed per-second)")));
     }
 }

@@ -1,0 +1,1087 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_QUESTDB",
+      "label": "QuestDB",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "questdb-questdb-datasource",
+      "pluginName": "QuestDB"
+    }
+  ],
+  "__elements": {},
+  "__requires": [
+    {
+      "type": "panel",
+      "id": "ae3e-plotly-panel",
+      "name": "Plotly panel",
+      "version": "0.5.0"
+    },
+    {
+      "type": "panel",
+      "id": "candlestick",
+      "name": "Candlestick",
+      "version": ""
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.4.1"
+    },
+    {
+      "type": "datasource",
+      "id": "questdb-questdb-datasource",
+      "name": "QuestDB",
+      "version": "0.1.5"
+    },
+    {
+      "type": "panel",
+      "id": "table",
+      "name": "Table",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "barchart",
+      "name": "Bar chart",
+      "version": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Spot plus forwards and swaps for a precious metals and FX desk",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "refresh": "500ms",
+  "schemaVersion": 39,
+  "tags": [],
+  "templating": {
+    "list": [
+      {
+        "allowCustomValue": false,
+        "current": {
+          "selected": true,
+          "text": "XAUUSD",
+          "value": "XAUUSD"
+        },
+        "datasource": {
+          "type": "questdb-questdb-datasource",
+          "uid": "${DS_QUESTDB}"
+        },
+        "definition": "SELECT distinct SYMBOL FROM (\nSELECT  SYMBOL FROM core_price\nwhere timestamp > dateadd('d',-4,now())\nlatest on timestamp partition by symbol\n) order by symbol;\n",
+        "description": "symbol to filter by",
+        "hide": 1,
+        "includeAll": false,
+        "label": "symbol",
+        "multi": false,
+        "name": "SYMBOL",
+        "options": [],
+        "query": "SELECT distinct SYMBOL FROM (\nSELECT  SYMBOL FROM core_price\nwhere timestamp > dateadd('d',-4,now())\nlatest on timestamp partition by symbol\n) order by symbol;\n",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "hidden": false,
+    "refresh_intervals": [
+      "250ms",
+      "500ms",
+      "750ms",
+      "1s",
+      "2s",
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "1d"
+    ]
+  },
+  "timezone": "browser",
+  "title": "FX and Metals: Spot and Forwards",
+  "uid": "fxmetalsfwd01",
+  "version": 1,
+  "weekStart": "",
+  "panels": [
+    {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "description": "Visualizes the order book snapshot for the selected currency pair, showing the price and cumulative volume at each bid and ask level. The area under the green (bids) and red (asks) lines represents market liquidity on both sides, with the mid-price and top volume \u201cwalls\u201d highlighted for quick identification of major support and resistance.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "hideTimeOverride": true,
+      "id": 1,
+      "maxPerRow": 2,
+      "options": {
+        "onclick": "console.log(data)\nwindow.updateVariables({query:{'var-project':'test'}, partial: true})",
+        "script": "const table = data.series[0];\nconst fields = table.fields;\n\nconst side = fields.find(f => f.name === \"side\");\nconst price = fields.find(f => f.name === \"price\");\nconst cum_volume = fields.find(f => f.name === \"cum_volume\");\nconst volume = fields.find(f => f.name === \"volume\");\n\nif (!side || !price || !cum_volume || !volume) {\n  throw new Error(\"Missing required fields\");\n}\n\nconst sideVals = side.values.toArray();\nconst priceVals = price.values.toArray();\nconst cumVolVals = cum_volume.values.toArray();\nconst volVals = volume.values.toArray();\n\nconst bids = [];\nconst asks = [];\n\nfor (let i = 0; i < priceVals.length; i++) {\n  const s = sideVals[i];\n  const p = priceVals[i];\n  const v = cumVolVals[i];\n  const raw = volVals[i];\n\n  if (s === \"bid\") bids.push({ x: p, y: v, raw });\n  else if (s === \"ask\") asks.push({ x: p, y: v, raw });\n}\n\nbids.sort((a, b) => b.x - a.x);\nasks.sort((a, b) => a.x - b.x);\n\nconst bestBid = bids[0]?.x ?? 0;\nconst bestAsk = asks[0]?.x ?? 0;\nconst mid = (bestBid + bestAsk) / 2;\n\nif (bids.length > 0) bids.unshift({ x: mid, y: bids[0].y });\nif (asks.length > 0) asks.unshift({ x: mid, y: 0 });\n\nconst topBids = [...bids]\n  .filter(b => b.raw)\n  .sort((a, b) => b.raw - a.raw)\n  .slice(-2); // largest 2\n\nconst topAsks = [...asks]\n  .filter(a => a.raw)\n  .sort((a, b) => b.raw - a.raw)\n  .slice(-2); // largest 2\n\nconst wallLines = [...topBids, ...topAsks].map(wall => ({\n  type: \"line\",\n  x0: wall.x,\n  x1: wall.x,\n  y0: 0,\n  y1: 1,\n  xref: \"x\",\n  yref: \"paper\",\n  line: {\n    color: \"yellow\",\n    width: 1,\n    dash: \"dot\"\n  }\n}));\n\nconst wallLabels = [...topBids, ...topAsks].map(wall => ({\n  x: wall.x,\n  y: 1.02,\n  xref: \"x\",\n  yref: \"paper\",\n  text: wall.x.toFixed(5),\n  showarrow: false,\n  font: { color: \"yellow\", size: 10 }\n}));\n\nreturn {\n  data: [\n    {\n      name: \"Bids\",\n      x: bids.map(pt => pt.x),\n      y: bids.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(0,255,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(0,255,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    },\n    {\n      name: \"Asks\",\n      x: asks.map(pt => pt.x),\n      y: asks.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(255,0,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(255,0,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    }\n  ],\n  layout: {\n    plot_bgcolor: \"black\",\n    paper_bgcolor: \"black\",\n    font: { color: \"white\" },\n    xaxis: {\n      title: \"Price\",\n      type: \"linear\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false\n    },\n    yaxis: {\n      title: \"Cumulative Volume\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false\n    },\n    margin: { t: 40, l: 60, r: 20, b: 50 },\n    shapes: [\n      {\n        type: \"line\",\n        x0: mid,\n        x1: mid,\n        y0: 0,\n        y1: 1,\n        xref: \"x\",\n        yref: \"paper\",\n        line: {\n          color: \"white\",\n          width: 1,\n          dash: \"dot\"\n        }\n      },\n      ...wallLines\n    ],\n    annotations: wallLabels,\n    legend: {\n      orientation: \"h\",\n      x: 0.5,\n      xanchor: \"center\",\n      y: -0.3\n    }\n  }\n};"
+      },
+      "pluginVersion": "0.5.0",
+      "repeat": "SYMBOL",
+      "repeatDirection": "h",
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "format": 1,
+          "meta": {
+            "builderOptions": {
+              "fields": [],
+              "limit": "",
+              "mode": "list",
+              "timeField": ""
+            }
+          },
+          "queryType": "sql",
+          "rawSql": "WITH snapshot AS (\n  SELECT timestamp, bids, asks\n  FROM market_data\n  WHERE $__timeFilter(timestamp) and  symbol = '${SYMBOL}'\n  ORDER BY timestamp DESC\n  LIMIT 1\n),\nbid_levels AS (\n  SELECT timestamp, 'bid' AS side, bids[1,1] AS price, bids[2,1] AS volume FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,2], bids[2,2] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,3], bids[2,3] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,4], bids[2,4] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,5], bids[2,5] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,6], bids[2,6] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,7], bids[2,7] FROM snapshot\n),\nask_levels AS (\n  SELECT timestamp, 'ask' AS side, asks[1,1] AS price, asks[2,1] AS volume FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,2], asks[2,2] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,3], asks[2,3] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,4], asks[2,4] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,5], asks[2,5] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,6], asks[2,6] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,7], asks[2,7] FROM snapshot\n),\nbid_cum AS (\n  SELECT\n    timestamp,\n    side,\n    price,\n    volume,\n    SUM(volume) OVER (ORDER BY price DESC) AS cum_volume\n  FROM bid_levels\n  WHERE price IS NOT NULL\n),\nask_cum AS (\n  SELECT\n    timestamp,\n    side,\n    price,\n    volume,\n    SUM(volume) OVER (ORDER BY price ASC) AS cum_volume\n  FROM ask_levels\n  WHERE price IS NOT NULL\n)\nSELECT * FROM bid_cum\nUNION ALL\nSELECT * FROM ask_cum\nORDER BY side, price;\n",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ],
+      "timeFrom": "10m",
+      "title": "Market Depth - ${SYMBOL}",
+      "type": "ae3e-plotly-panel"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
+      "id": 2,
+      "panels": [],
+      "repeat": "SYMBOL",
+      "title": "Spot",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "description": "Compares the best bid in the order book (from L2 market data) using an ASOF JOIN against the corresponding \u201ccore\u201d quote price from upstream sources (e.g., ECNs). Then it finds at which level we could trade the core price bid volume. If no matching level is found, Level and Price will be empty. This table helps detect price alignment issues, latency, or anomalies between your live order book and reference prices provided by liquidity venues.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "light-blue",
+            "mode": "shades"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "inspect": false,
+            "minWidth": 50,
+            "width": 99
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "MarketData_Time"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 200
+              },
+              {
+                "id": "custom.width",
+                "value": 180
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f894d",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CorePrice_Time"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 200
+              },
+              {
+                "id": "custom.width"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f894d",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Level"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 20
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f8980",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "noValue",
+                "value": "-"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Price"
+            },
+            "properties": [
+              {
+                "id": "custom.width"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89bf",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "noValue",
+                "value": "-"
+              },
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bid_Price"
+            },
+            "properties": [
+              {
+                "id": "custom.width"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f8980",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Volume"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bid_Volume"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89bf",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ECN"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#692f89",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 11
+      },
+      "hideTimeOverride": true,
+      "id": 3,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "format": 1,
+          "meta": {
+            "builderOptions": {
+              "fields": [],
+              "limit": "",
+              "mode": "list",
+              "timeField": ""
+            }
+          },
+          "queryType": "sql",
+          "rawSql": "WITH p AS (\n  SELECT\n    timestamp,\n    bid_price,\n    bid_volume,\n    symbol,\n    ecn\n  FROM core_price\n  WHERE $__timeFilter(timestamp) AND symbol = '${SYMBOL}'\n  LIMIT -6\n), levels AS (\n  SELECT\n    market_data.timestamp AS md_timestamp,\n    insertion_point(bids [ 2 ], bid_volume) AS level,\n    bids [ 1 ] [ insertion_point(bids [ 2 ], bid_volume) ] AS price,\n    bids [ 2 ] [ insertion_point(bids [ 2 ], bid_volume) ] AS volume,\n    p.timestamp,\n    p.bid_price,\n    p.bid_volume AS bid_volume,\n    p.ecn\n  FROM p ASOF JOIN market_data ON symbol\n)\nSELECT\n  md_timestamp AS MarketData_Time,\n  CASE WHEN price IS null THEN null ELSE level end AS Level,\n  Price,\n  Volume,\n  timestamp AS CorePrice_Time,\n  bid_price AS Bid_Price,\n  bid_volume1 AS Bid_Volume,\n  ecn AS ECN\nFROM levels;",
+          "refId": "A",
+          "selectedFormat": 1
+        }
+      ],
+      "timeFrom": "1m",
+      "title": "Top-of-book Levels vs Core Price - ${SYMBOL}",
+      "transparent": true,
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "description": "15-minute candlesticks of the best bid from the market_data_ohlc_15m materialized view, with volume. Requires market_data (not for two-table mode).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineStyle": {
+              "fill": "solid"
+            },
+            "lineWidth": 1,
+            "pointSize": 3,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 11
+      },
+      "id": 4,
+      "options": {
+        "candleStyle": "candles",
+        "colorStrategy": "open-close",
+        "colors": {
+          "down": "light-blue",
+          "up": "semi-dark-purple"
+        },
+        "fields": {
+          "close": "close",
+          "high": "high",
+          "low": "low",
+          "open": "open",
+          "volume": "total_volume"
+        },
+        "includeAllFields": false,
+        "legend": {
+          "calcs": [
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "mode": "candles+volume",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawQuery": true,
+          "rawSql": "SELECT timestamp, open, high, low, close, total_volume\nFROM market_data_ohlc_15m\nWHERE $__timeFilter(timestamp) AND symbol = '${SYMBOL}'",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ],
+      "title": "OHLC - Bids - 15min - (${SYMBOL})",
+      "transparent": true,
+      "type": "candlestick"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 19
+      },
+      "id": 5,
+      "panels": [],
+      "repeat": "SYMBOL",
+      "title": "Forwards",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "description": "Latest forward ladder for the pair: value date, bid and ask points (pips), outrights against the latest core_price spot, and the base-currency rate implied by the points and the quote-currency curve (for a metal, the implied lease rate). ON and TN settle before spot: their outrights are spot minus the cumulative points.",
+      "id": 6,
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "title": "Forward Curve (points in pips) - ${SYMBOL}",
+      "type": "table",
+      "transparent": true,
+      "pluginVersion": "10.4.1",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "semi-dark-blue",
+            "mode": "shades"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "inspect": false,
+            "minWidth": 50
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#692f8980",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Value date"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "time:YYYY-MM-DD"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bid"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ask"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Out bid"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Out ask"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Impl %"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawQuery": true,
+          "rawSql": "DECLARE\n  @pip := CASE WHEN '${SYMBOL}' LIKE '%JPY' THEN 0.01 WHEN '${SYMBOL}' = 'XAGUSD' THEN 0.001 WHEN '${SYMBOL}' LIKE 'X%' THEN 0.01 ELSE 0.0001 END,\n  @dp := CASE WHEN '${SYMBOL}' LIKE '%JPY' OR '${SYMBOL}' LIKE 'X%' THEN 4 WHEN '${SYMBOL}' = 'XAGUSD' THEN 5 ELSE 6 END,\n  @quote := right('${SYMBOL}', 3),\n  @base_basis := CASE WHEN left('${SYMBOL}', 3) = 'GBP' THEN 365.0 ELSE 360.0 END\nWITH\n  quote_curve AS (\n    SELECT tenor, CASE @quote WHEN 'USD' THEN usd WHEN 'EUR' THEN eur WHEN 'JPY' THEN jpy\n                              WHEN 'CHF' THEN chf WHEN 'CAD' THEN cad END AS quote_rate\n    FROM (\n                SELECT 'ON' tenor, 3.88 usd, 2.42 eur, 1.23 jpy, -0.05 chf, 2.24 cad FROM long_sequence(1)\n      UNION ALL SELECT 'TN', 3.88, 2.42, 1.23, -0.05, 2.24 FROM long_sequence(1)\n      UNION ALL SELECT '1W', 3.88, 2.43, 1.23, -0.04, 2.24 FROM long_sequence(1)\n      UNION ALL SELECT '2W', 3.89, 2.44, 1.24, -0.04, 2.23 FROM long_sequence(1)\n      UNION ALL SELECT '1M', 3.90, 2.46, 1.25, -0.03, 2.22 FROM long_sequence(1)\n      UNION ALL SELECT '2M', 3.92, 2.49, 1.26, -0.02, 2.21 FROM long_sequence(1)\n      UNION ALL SELECT '3M', 3.93, 2.52, 1.27, -0.01, 2.20 FROM long_sequence(1)\n      UNION ALL SELECT '6M', 3.95, 2.58, 1.30, 0.01, 2.18 FROM long_sequence(1)\n      UNION ALL SELECT '9M', 3.95, 2.62, 1.33, 0.03, 2.16 FROM long_sequence(1)\n      UNION ALL SELECT '1Y', 3.94, 2.65, 1.35, 0.05, 2.15 FROM long_sequence(1)\n    )\n  ),\n  spot AS (\n    SELECT bid_price, ask_price FROM core_price\n    WHERE symbol = '${SYMBOL}' AND timestamp <= $__toTime\n    LATEST ON timestamp PARTITION BY symbol\n  ),\n  curve AS (\n    SELECT tenor, tenor_days, value_date, bid_points, ask_points, spot_ref FROM fx_forward_points\n    WHERE symbol = '${SYMBOL}' AND timestamp <= $__toTime\n    LATEST ON timestamp PARTITION BY tenor\n  ),\n  ladder AS (\n    SELECT tenor, tenor_days, value_date, bid_points, ask_points, spot_ref,\n      sum(CASE WHEN tenor_days < 0 THEN bid_points END)\n        OVER (ORDER BY tenor_days DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_bid,\n      sum(CASE WHEN tenor_days < 0 THEN ask_points END)\n        OVER (ORDER BY tenor_days DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_ask,\n      CASE WHEN tenor_days < 0\n           THEN least(lead(tenor_days) OVER (ORDER BY tenor_days), 0) - tenor_days\n           ELSE tenor_days END AS days\n    FROM curve\n  )\nSELECT l.tenor AS Tenor, l.value_date AS \"Value date\", l.bid_points AS \"Bid\", l.ask_points AS \"Ask\",\n  round(CASE WHEN l.tenor_days < 0 THEN s.bid_price - l.cum_ask * @pip ELSE s.bid_price + l.bid_points * @pip END, @dp) AS \"Out bid\",\n  round(CASE WHEN l.tenor_days < 0 THEN s.ask_price - l.cum_bid * @pip ELSE s.ask_price + l.ask_points * @pip END, @dp) AS \"Out ask\",\n  round(((1 + q.quote_rate / 100 * l.days / 360)\n          / (1 + (l.bid_points + l.ask_points) / 2 * @pip / l.spot_ref) - 1) * @base_basis / l.days * 100, 3) AS \"Impl %\"\nFROM ladder l\nJOIN quote_curve q ON q.tenor = l.tenor\nCROSS JOIN spot s\nORDER BY l.tenor_days",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "description": "Minute series of the 3M mid forward points (right axis) and the spot mid, from the fx_forward_points_1m and core_price_1s views with an ASOF JOIN.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "fieldMinMax": false,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "3M points"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "semi-dark-purple",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spot"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "light-blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 6,
+        "x": 12,
+        "y": 20
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawQuery": true,
+          "rawSql": "WITH\n  points AS (\n    SELECT timestamp, (bid_points + ask_points) / 2 AS \"3M points\" FROM fx_forward_points_1m\n    WHERE symbol = '${SYMBOL}' AND tenor = '3M' AND $__timeFilter(timestamp)\n  ),\n  spot AS (\n    SELECT timestamp, last(close_mid) AS spot FROM core_price_1s\n    WHERE symbol = '${SYMBOL}' AND $__timeFilter(timestamp)\n    SAMPLE BY 1m\n  )\nSELECT p.timestamp, s.spot, p.\"3M points\"\nFROM points p\nASOF JOIN spot s",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ],
+      "title": "3M Points vs Spot - ${SYMBOL}",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "id": 8,
+      "gridPos": {
+        "h": 10,
+        "w": 6,
+        "x": 18,
+        "y": 20
+      },
+      "type": "barchart",
+      "title": "Triangular Consistency Gap (pips)",
+      "description": "Absolute gap, per tenor, between the published EURJPY and XAUEUR points and the points implied by their legs (EURUSD x USDJPY, XAUUSD / EURUSD), at the latest complete minute of the selected time range. A bar over the 1-pip line is a bad point in one feed. The generator plants one daily from 09:20 to 09:40 UTC: set the time range to end inside it to see it.",
+      "transparent": true,
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "lineWidth": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "decimals": 2,
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "light-blue",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.9,
+        "groupWidth": 0.8,
+        "orientation": "auto",
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "showValue": "never",
+        "stacking": "none",
+        "xField": "Tenor",
+        "xTickLabelRotation": 0,
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawQuery": true,
+          "rawSql": "WITH\n  prem AS (\n    SELECT timestamp, tenor,\n      max(CASE WHEN symbol = 'EURUSD' THEN (bid_points + ask_points) / 2 * 0.0001 / spot_ref END) AS eurusd,\n      max(CASE WHEN symbol = 'USDJPY' THEN (bid_points + ask_points) / 2 * 0.01 / spot_ref END) AS usdjpy,\n      max(CASE WHEN symbol = 'XAUUSD' THEN (bid_points + ask_points) / 2 * 0.01 / spot_ref END) AS xauusd,\n      max(CASE WHEN symbol = 'EURJPY' THEN (bid_points + ask_points) / 2 END) AS eurjpy_points,\n      max(CASE WHEN symbol = 'EURJPY' THEN spot_ref END) AS eurjpy_spot,\n      max(CASE WHEN symbol = 'XAUEUR' THEN (bid_points + ask_points) / 2 END) AS xaueur_points,\n      max(CASE WHEN symbol = 'XAUEUR' THEN spot_ref END) AS xaueur_spot,\n      max(tenor_days) AS tenor_days\n    FROM fx_forward_points_1m\n    WHERE $__timeFilter(timestamp) AND symbol IN ('EURUSD', 'USDJPY', 'EURJPY', 'XAUUSD', 'XAUEUR')\n    GROUP BY timestamp, tenor\n  ),\n  -- Only finished minutes: within a 5-second cycle EURUSD publishes before the gold pairs, so\n  -- in the minute still being written a cross and its legs can be a rate step apart.\n  complete AS (\n    SELECT * FROM prem\n    WHERE eurusd IS NOT NULL AND usdjpy IS NOT NULL AND eurjpy_points IS NOT NULL\n      AND timestamp < timestamp_floor('m', now())\n  ),\n  latest AS (SELECT max(timestamp) AS ts FROM complete)\nSELECT c.tenor AS Tenor,\n  round(abs(c.eurjpy_points - c.eurjpy_spot * ((1 + c.eurusd) * (1 + c.usdjpy) - 1) / 0.01), 2) AS EURJPY,\n  round(abs(c.xaueur_points - c.xaueur_spot * ((1 + c.xauusd) / (1 + c.eurusd) - 1) / 0.01), 2) AS XAUEUR\nFROM complete c CROSS JOIN latest l\nWHERE c.timestamp = l.ts\nORDER BY c.tenor_days",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "id": 9,
+      "panels": [],
+      "repeat": "SYMBOL",
+      "title": "Swaps",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "description": "Spot against each forward tenor: bid swap = far bid - near ask, ask swap = far ask - near bid (the near leg is spot, so they are the tenor's points), and the implied swap rate, the annualised forward premium of the period.",
+      "id": 10,
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "title": "Swap Ladder from Spot - ${SYMBOL}",
+      "type": "table",
+      "transparent": true,
+      "pluginVersion": "10.4.1",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "semi-dark-blue",
+            "mode": "shades"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "inspect": false,
+            "minWidth": 50
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#692f8980",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bid swap"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ask swap"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Implied swap rate %"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawQuery": true,
+          "rawSql": "DECLARE\n  @pip := CASE WHEN '${SYMBOL}' LIKE '%JPY' THEN 0.01 WHEN '${SYMBOL}' = 'XAGUSD' THEN 0.001 WHEN '${SYMBOL}' LIKE 'X%' THEN 0.01 ELSE 0.0001 END\nWITH\n  curve AS (\n    SELECT tenor, tenor_days, bid_points, ask_points, spot_ref FROM fx_forward_points\n    WHERE symbol = '${SYMBOL}' AND timestamp <= $__toTime\n    LATEST ON timestamp PARTITION BY tenor\n  )\nSELECT 'SPOT' AS Near, tenor AS Far, tenor_days AS Days,\n  bid_points AS \"Bid swap\", ask_points AS \"Ask swap\",\n  round((bid_points + ask_points) / 2 * @pip / spot_ref * 360 / tenor_days * 100, 3) AS \"Implied swap rate %\"\nFROM curve\nWHERE tenor_days > 0\nORDER BY tenor_days",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ]
+    }
+  ]
+}
