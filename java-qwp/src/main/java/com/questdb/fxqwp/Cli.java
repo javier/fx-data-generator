@@ -36,6 +36,7 @@ public final class Cli {
     public String sfDir = "/tmp/qwp_trades_sf";
     public String senderId = "qwp-fx-trades";
     public int autoFlushBytes = 524288;   // QWP sender auto-flush size (bytes); 512 KiB, safely under the ~1MB WS frame cap
+    public boolean durableAck = false;    // QWP: hold store-and-forward frames until a durable (replicated) ack. Enterprise-only (OSS rejects it during the WS upgrade). Independent of --enterprise.
 
     // --- mode / volume / time ------------------------------------------------
     public String mode = null;                 // real-time | faster-than-life (required)
@@ -45,8 +46,8 @@ public final class Cli {
     public String startTs = null;              // ISO-8601 start (faster-than-life)
     public String endTs = null;                // ISO-8601 max timestamp (upper bound)
     public int tradesProcesses = 1;            // worker threads for qwp_trades (0 = off)
-    public int marketDataProcesses = 0;        // worker threads for qwp_market_data (0 = off)
-    public int coreProcesses = 0;              // worker threads for qwp_core_price (0 = off)
+    public int marketDataProcesses = 1;        // worker threads for qwp_market_data (0 = off)
+    public int coreProcesses = 1;              // worker threads for qwp_core_price (0 = off)
     public int runSecs = 0;                    // wall-clock run cap in seconds; 0 = no cap
     public int commitIntervalMs = 1000;        // transaction rate: commit (flush) cadence in ms (global default)
     // Per-pool commit-cadence overrides; 0 = inherit commitIntervalMs.
@@ -74,7 +75,8 @@ public final class Cli {
     public boolean incremental = false;        // seed state from last stored prices, skip Yahoo
     public boolean shortTtl = false;
     public boolean enterprise = false;
-    public boolean createViews = false;        // create market_data OHLC/BBO matviews
+    public boolean createViews = true;         // create the Python-parity matviews (default on, like Python)
+    public String prefix = "qwp_";             // table-name prefix; set "" to match the Python table names exactly
     public String suffix = "";                 // table-name suffix (parity with Python)
     public int leiPoolSize = 2000;
 
@@ -127,6 +129,9 @@ public final class Cli {
                 case "auto_flush_bytes":
                 case "autoflush_bytes":
                     c.autoFlushBytes = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "durable_ack":
+                    i = boolFlag(args, i, v -> c.durableAck = v);
                     break;
 
                 // ---- mode / volume / time ----
@@ -217,6 +222,9 @@ public final class Cli {
                     break;
                 case "create_views":
                     i = boolFlag(args, i, v -> c.createViews = v);
+                    break;
+                case "prefix":
+                    c.prefix = normalizePrefix(req(args, ++i, raw));
                     break;
                 case "suffix":
                     c.suffix = req(args, ++i, raw);
@@ -312,18 +320,26 @@ public final class Cli {
         if ("faster-than-life".equals(mode) && totalTrades <= 0 && endTs == null && runSecs <= 0) {
             fail("faster-than-life requires a bound: set --total_market_data_events > 0, --end_ts, or --run_secs");
         }
+        if ("real-time".equals(mode) && incremental) {
+            fail("--incremental is not allowed in real-time mode (real-time syncs live quotes from Yahoo)");
+        }
     }
 
     public String tradesTable() {
-        return "qwp_trades" + suffix;
+        return prefix + "fx_trades" + suffix;
     }
 
     public String marketDataTable() {
-        return "qwp_market_data" + suffix;
+        return prefix + "market_data" + suffix;
     }
 
     public String corePriceTable() {
-        return "qwp_core_price" + suffix;
+        return prefix + "core_price" + suffix;
+    }
+
+    /** View/base name with the same prefix+suffix scheme as the tables (stem has no leading prefix). */
+    public String viewName(String stem) {
+        return prefix + stem + suffix;
     }
 
     public int tradesCommitIntervalMs() {
@@ -410,6 +426,15 @@ public final class Cli {
         return out;
     }
 
+    /**
+     * Normalize the --prefix value. "none" (or "-") maps to an empty prefix so the tables use the
+     * exact Python names. This sentinel exists because mvn exec:java whitespace-tokenizes
+     * -Dexec.args and drops empty quoted tokens, so `--prefix ''` cannot reach the program that way.
+     */
+    private static String normalizePrefix(String v) {
+        return ("none".equalsIgnoreCase(v) || "-".equals(v)) ? "" : v;
+    }
+
     private static String req(String[] args, int i, String flag) {
         if (i >= args.length) {
             fail("missing value for " + flag);
@@ -456,11 +481,12 @@ public final class Cli {
                 "  --sf_dir <dir>                    store-and-forward dir (default /tmp/qwp_trades_sf)",
                 "  --sender_id <id>                  store-and-forward sender id (default qwp-fx-trades)",
                 "  --auto_flush_bytes <n>            QWP sender auto-flush size in bytes (default 524288 = 512 KiB)",
+                "  --durable_ack [true|false]        hold store-and-forward frames until a durable (replicated) ack; Enterprise-only, default false (OSS rejects it)",
                 "",
                 "Pools (one thread set per table; symbols snake-drafted across each pool):",
                 "  --trades_processes <n>            worker threads for qwp_trades, 0-30 (default 1; 0 = off)",
-                "  --market_data_processes <n>       worker threads for qwp_market_data, 0-30 (default 0 = off)",
-                "  --core_processes <n>              worker threads for qwp_core_price, 0-30 (default 0 = off)",
+                "  --market_data_processes <n>       worker threads for qwp_market_data, 0-30 (default 1; 0 = off)",
+                "  --core_processes <n>              worker threads for qwp_core_price, 0-30 (default 1; 0 = off)",
                 "",
                 "Volume / time (each *_per_sec / *_eps is the table-wide total across its pool):",
                 "  --orders_min_per_sec <n>          qwp_trades orders/sec total (default 50); each order -> 1+ fills",
@@ -483,11 +509,12 @@ public final class Cli {
                 "  --yahoo_refresh_secs <n>          real-time Yahoo refresh interval (default 300)",
                 "  --realtime_lookahead_secs <n>     real-time: stamp events n s ahead of wall-clock (default 2)",
                 "  --no_yahoo                        skip Yahoo, use template brackets (offline)",
-                "  --incremental [true|false]        seed prices from last stored row, skip Yahoo",
-                "  --short_ttl [true|false]          attach retention to the table",
-                "  --enterprise [true|false]         with --short_ttl, use STORAGE POLICY instead of TTL",
-                "  --create_views [true|false]       create market_data OHLC (1m/15m) + hourly BBO matviews",
-                "  --suffix <s>                      append suffix to the table name (-> qwp_trades<s>)",
+                "  --incremental [true|false]        seed state from last stored core_price row, skip Yahoo (faster-than-life only)",
+                "  --short_ttl [true|false]          attach retention to the tables/views",
+                "  --enterprise [true|false]         with --short_ttl, use STORAGE POLICY instead of TTL on base tables",
+                "  --create_views [true|false]       create the full Python-parity matview set (default true)",
+                "  --prefix <s>                      table-name prefix (default 'qwp_'); use 'none' (or '') to match the Python names exactly",
+                "  --suffix <s>                      append suffix to the table name (-> <prefix>fx_trades<s>)",
                 "  --lei_pool_size <n>               distinct counterparties (default 2000)",
                 "  --chunk_seconds <n>               accepted but unused (state is streamed per-second)")));
     }

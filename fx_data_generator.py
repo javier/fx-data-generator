@@ -1,6 +1,9 @@
 import argparse
 import time
 import sys
+import os
+import signal
+import tempfile
 import math
 import random
 import multiprocessing as mp
@@ -8,11 +11,21 @@ from multiprocessing import Event
 import numpy as np
 import pandas as pd
 import datetime
-from questdb.ingress import Sender, TimestampNanos
+from questdb import Sender, TimestampNanos
 import psycopg as pg
 import yfinance as yf
 import hashlib
 import uuid
+
+# QWP/WebSocket caps each encoded message (one flush frame) at ~2 MiB. A flush over
+# that raises "encoded message size ... exceeds maximum configured allowed size" AND
+# the client discards the buffer, so the overflow must be prevented up front, not
+# retried. SortedEmitter._send_df flushes by the live buffer size (len(sender)), so
+# SAFE_FRAME_BYTES is a target with generous headroom rather than a per-row guess.
+QWP_MAX_FRAME_BYTES = 2_097_138
+SAFE_FRAME_BYTES = 1_400_000
+# Emitter buffer cap (rows) for memory / commit sizing; _send_df still frames each flush.
+MAX_BATCH_ROWS = 50_000
 
 FX_PAIRS = [
     # (symbol, low, high, precision, pip, rank)
@@ -233,15 +246,22 @@ class SortedEmitter:
       straight to pandas without per-row dict churn.
     """
 
-    def __init__(self, sender, buffer_limit, suffix):
+    def __init__(self, sender, buffer_limit, suffix, no_market_data=False):
         self.sender = sender
         self.buffer_limit = buffer_limit
         self.suffix = suffix
+        # When market_data is disabled it no longer drives _flush_md (which used to flush
+        # all three tables together), so flush trades alongside core_price to keep low-volume
+        # trades visible promptly instead of waiting for the (now large) trades buffer to fill.
+        self.no_market_data = no_market_data
         self._md = {"ts": [], "symbol": [], "bids": [], "asks": [],
                     "best_bid": [], "best_ask": []}
-        self._cp = {"ts": [], "symbol": [], "ecn": [], "reason": [],
-                    "bid_price": [], "bid_volume": [], "ask_price": [], "ask_volume": [],
-                    "indicator1": [], "indicator2": []}
+        # core_price is accumulated as a list of column-array chunks (one chunk per
+        # emit_core_bulk call, i.e. per symbol per second) and concatenated at flush.
+        # This replaces a per-event dict-append path: at high core EPS the per-row
+        # Python overhead dominated generation (see emit_core_bulk / generate).
+        self._cp_chunks = []
+        self._cp_n = 0
         self._tr = {"ts": [], "symbol": [], "ecn": [], "side": [], "counterparty": [],
                     "trade_id": [], "passive": [], "price": [], "quantity": [], "order_id": []}
 
@@ -257,20 +277,16 @@ class SortedEmitter:
         if len(b["ts"]) >= self.buffer_limit:
             self._flush_md()
 
-    # --- Core price rows --- #
-    def emit_core(self, ts_ns, symbol, ecn, reason, columns):
-        b = self._cp
-        b["ts"].append(ts_ns)
-        b["symbol"].append(symbol)
-        b["ecn"].append(ecn)
-        b["reason"].append(reason)
-        b["bid_price"].append(columns["bid_price"])
-        b["bid_volume"].append(columns["bid_volume"])
-        b["ask_price"].append(columns["ask_price"])
-        b["ask_volume"].append(columns["ask_volume"])
-        b["indicator1"].append(columns["indicator1"])
-        b["indicator2"].append(columns["indicator2"])
-        if len(b["ts"]) >= self.buffer_limit:
+    # --- Core price rows (bulk) --- #
+    def emit_core_bulk(self, ts, symbol, ecn, reason, bid_price, bid_volume,
+                       ask_price, ask_volume, indicator1, indicator2):
+        # Each argument is a numpy column covering all of one symbol's core_price
+        # events for the second (or sub-slice). Columns are stashed as-is and
+        # concatenated once at flush, so there is no per-row Python work here.
+        self._cp_chunks.append((ts, symbol, ecn, reason, bid_price, bid_volume,
+                                ask_price, ask_volume, indicator1, indicator2))
+        self._cp_n += len(ts)
+        if self._cp_n >= self.buffer_limit:
             self._flush_cp()
 
     # --- Trade rows --- #
@@ -289,11 +305,40 @@ class SortedEmitter:
         if len(b["ts"]) >= self.buffer_limit:
             self._flush_tr()
 
+    # --- Framed send: never let one flush exceed the QWP frame limit --- #
+    def _send_df(self, df, table, symbols, bytes_per_row):
+        """Send df to QuestDB in frames that never exceed the QWP ~2 MiB message limit.
+
+        Rows are appended to the sender buffer in modest increments and flushed by the
+        ACTUAL staged buffer size (len(self.sender)) rather than a per-row byte guess,
+        so it is robust to however the columns actually encode over QWP. bytes_per_row
+        is only a rough per-table estimate used to size each append and a fallback row
+        cap (in case the buffer size is ever reported as 0). A flush that overran the
+        limit would be discarded by the client, so we must stay under it up front."""
+        n = len(df)
+        if n == 0:
+            return
+        add_rows = max(1, 200_000 // bytes_per_row)                 # one append stays well under the budget
+        row_cap = max(add_rows, SAFE_FRAME_BYTES // bytes_per_row)  # fallback if len(sender) is unavailable
+        start = 0
+        staged = 0
+        while start < n:
+            end = min(start + add_rows, n)
+            self.sender.dataframe(df.iloc[start:end], table_name=table, symbols=symbols, at="ts")
+            staged += end - start
+            start = end
+            if start >= n or len(self.sender) >= SAFE_FRAME_BYTES or staged >= row_cap:
+                self.sender.flush()
+                staged = 0
+
     # --- Flush methods --- #
     def _flush_md(self):
         b = self._md
         if not b["ts"]:
             return
+        # Order-book rows carry two DOUBLE[][] arrays; per-row size grows with depth,
+        # so size the frame budget from the widest book in this batch.
+        maxlv = max(a.shape[1] for a in b["bids"])
         df = pd.DataFrame({
             "symbol": pd.Categorical(b["symbol"]),
             "bids": b["bids"],
@@ -302,9 +347,7 @@ class SortedEmitter:
             "best_ask": np.asarray(b["best_ask"], dtype=np.float64),
             "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
         })
-        self.sender.dataframe(df, table_name=table_name("market_data", self.suffix),
-                              symbols=["symbol"], at="ts")
-        self.sender.flush()
+        self._send_df(df, table_name("market_data", self.suffix), ["symbol"], 48 * maxlv + 192)
         for v in b.values():
             v.clear()
 
@@ -313,26 +356,30 @@ class SortedEmitter:
         self._flush_tr()
 
     def _flush_cp(self):
-        b = self._cp
-        if not b["ts"]:
+        if not self._cp_chunks:
             return
+        cols = list(zip(*self._cp_chunks))
+        cat = lambda i: cols[i][0] if len(cols[i]) == 1 else np.concatenate(cols[i])
         df = pd.DataFrame({
-            "symbol": pd.Categorical(b["symbol"]),
-            "ecn": pd.Categorical(b["ecn"]),
-            "reason": pd.Categorical(b["reason"]),
-            "bid_price": np.asarray(b["bid_price"], dtype=np.float64),
-            "bid_volume": np.asarray(b["bid_volume"], dtype=np.int64),
-            "ask_price": np.asarray(b["ask_price"], dtype=np.float64),
-            "ask_volume": np.asarray(b["ask_volume"], dtype=np.int64),
-            "indicator1": np.asarray(b["indicator1"], dtype=np.float64),
-            "indicator2": np.asarray(b["indicator2"], dtype=np.float64),
-            "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
+            "symbol": pd.Categorical(cat(1)),
+            "ecn": pd.Categorical(cat(2)),
+            "reason": pd.Categorical(cat(3)),
+            "bid_price": cat(4).astype(np.float64, copy=False),
+            "bid_volume": cat(5).astype(np.int64),
+            "ask_price": cat(6).astype(np.float64, copy=False),
+            "ask_volume": cat(7).astype(np.int64),
+            "indicator1": cat(8).astype(np.float64, copy=False),
+            "indicator2": cat(9).astype(np.float64, copy=False),
+            "ts": pd.to_datetime(cat(0).astype(np.int64, copy=False), unit="ns"),
         })
-        self.sender.dataframe(df, table_name=table_name("core_price", self.suffix),
-                              symbols=["symbol", "ecn", "reason"], at="ts")
-        self.sender.flush()
-        for v in b.values():
-            v.clear()
+        self._send_df(df, table_name("core_price", self.suffix),
+                      ["symbol", "ecn", "reason"], 80)
+        self._cp_chunks = []
+        self._cp_n = 0
+
+        # With market_data off, ride core_price's flush cadence so trades stay fresh.
+        if self.no_market_data:
+            self._flush_tr()
 
     def _flush_tr(self):
         b = self._tr
@@ -350,9 +397,8 @@ class SortedEmitter:
             "order_id": b["order_id"],
             "ts": pd.to_datetime(np.asarray(b["ts"], dtype=np.int64), unit="ns"),
         })
-        self.sender.dataframe(df, table_name=table_name("fx_trades", self.suffix),
-                              symbols=["symbol", "ecn", "side", "counterparty"], at="ts")
-        self.sender.flush()
+        self._send_df(df, table_name("fx_trades", self.suffix),
+                      ["symbol", "ecn", "side", "counterparty"], 128)
         for v in b.values():
             v.clear()
 
@@ -362,6 +408,80 @@ class SortedEmitter:
         self._flush_cp()
         self._flush_tr()
 
+
+def qwp_addr_list(host, default_port=9000):
+    """Build a QWP addr= value from --host, supporting multi-host HA failover.
+
+    Accepts a single bare host ("h" -> "h:9000"), a single host:port, or a
+    comma-separated list ("h1:9000,h2:9000,h3") where any entry missing a port
+    gets default_port. The QWP client rotates across the listed nodes and replays
+    store-and-forward frames on the one that is (or becomes) the writable primary.
+    """
+    out = []
+    for h in host.split(","):
+        h = h.strip()
+        if not h:
+            continue
+        out.append(h if ":" in h else f"{h}:{default_port}")
+    return ",".join(out)
+
+def pg_host(host):
+    """First bare hostname from --host (strip :port and any extra hosts).
+
+    PG-wire metadata/DDL/WAL connections target a single node, and DDL must land on the
+    writable primary, so put the primary first in a multi-host --host list. QWP ingest
+    itself still fails over across every host via qwp_addr_list().
+    """
+    first = host.split(",")[0].strip()
+    return first.rsplit(":", 1)[0] if ":" in first else first
+
+def compute_buffer_limit(args):
+    """Rows buffered per table before a flush (= one WAL commit).
+
+    Base is 1000 (real-time) / 10000 (faster-than-life). When market_data is disabled,
+    core_price becomes the lead table and can run at very high EPS; keep the per-flush
+    batch large enough to hold ~10 flushes/sec so we don't spam tiny commits (which is
+    what makes QuestDB's WAL apply fall behind and trips the backpressure monitor).
+    """
+    base = 1000 if args.mode == "real-time" else 10000
+    if getattr(args, "no_market_data", False):
+        base = max(base, args.core_max_eps // 10)
+        # Bound the per-flush batch for memory / commit sizing. Frame safety (staying
+        # under the QWP ~2 MiB message limit) is enforced separately by _send_df.
+        base = min(base, MAX_BATCH_ROWS)
+    return base
+
+def compute_wal_threshold(args, buffer_limit):
+    """WAL apply-lag threshold (in un-applied transactions) before the monitor pauses.
+
+    Market-on keeps the proven 3*processes (market_data commits slowly). When market_data
+    is disabled, core_price leads and commits far more often, so a threshold of 3 is a
+    hair-trigger: default to ~10s of the lead table's commit rate instead. Override with
+    --wal_lag_threshold.
+    """
+    if args.wal_lag_threshold is not None:
+        return args.wal_lag_threshold
+    if getattr(args, "no_market_data", False):
+        commit_rate = max(1, args.core_max_eps // buffer_limit)   # commits/sec
+        return min(1000, max(3 * args.processes, 10 * commit_rate))
+    return 3 * args.processes
+
+def lerp_state(open_state, close_state, f):
+    """Linearly interpolate every per-symbol state field between open and close at fraction f
+    in [0,1]. Used to slice a real-time second into sub-windows: because the second's events
+    already interpolate open->close linearly, slicing on this same line reproduces the exact
+    price/indicator trajectory and keeps slice boundaries continuous (sub_close[k] == sub_open[k+1]).
+    """
+    out = {}
+    for sym, o in open_state.items():
+        c = close_state[sym]
+        out[sym] = {k: o[k] + f * (c[k] - o[k]) for k in o}
+    return out
+
+def slice_count(total, n, s):
+    """Split `total` events across `n` slices, spreading the remainder over the first slices so
+    counts are as even as possible (slice index s in [0, n))."""
+    return total // n + (1 if s < (total % n) else 0)
 
 def get_latest_timestamp_ns(conn, table):
     cur = conn.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp DESC LIMIT 1")
@@ -399,20 +519,21 @@ TABLE_ENTERPRISE_POLICY = 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 3 mon
 
 
 def ensure_tables_exist(args, suffix):
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     short_ttl = args.short_ttl
     enterprise = args.enterprise
     with pg.connect(conn_str, autocommit=True) as conn:
-        conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
-            timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
-            symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
-            bids DOUBLE[][] PARQUET(default, zstd(4)),
-            asks DOUBLE[][] PARQUET(default, zstd(4)),
-            best_bid DOUBLE PARQUET(default, zstd(4)),
-            best_ask DOUBLE PARQUET(default, zstd(4))
-        ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
-        """)
+        if not getattr(args, "no_market_data", False):
+            conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name('market_data', suffix)} (
+                timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+                symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+                bids DOUBLE[][] PARQUET(default, zstd(4)),
+                asks DOUBLE[][] PARQUET(default, zstd(4)),
+                best_bid DOUBLE PARQUET(default, zstd(4)),
+                best_ask DOUBLE PARQUET(default, zstd(4))
+            ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)};
+            """)
         conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name('core_price', suffix)} (
             timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
@@ -443,13 +564,15 @@ def ensure_tables_exist(args, suffix):
         """)
 
 def ensure_materialized_views_exist(args, suffix):
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     short_ttl = args.short_ttl
     enterprise = args.enterprise
     # Storage policies are not yet supported on materialized views in QuestDB.
     # To re-enable storage policies for matviews, swap the lambdas below.
     # rc = lambda oss_ttl, ep: retention_clause(short_ttl, enterprise, oss_ttl, ep)
     rc = lambda oss_ttl, ep: mv_retention_clause(short_ttl, enterprise, oss_ttl, ep)
+    # bbo_* and market_data_ohlc_* views read from market_data; skip them when it is disabled.
+    _md = not getattr(args, "no_market_data", False)
     with pg.connect(conn_str, autocommit=True) as conn:
         conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('core_price_1s', suffix)}  AS (
@@ -487,7 +610,7 @@ def ensure_materialized_views_exist(args, suffix):
             SAMPLE BY 1d
         ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1s', suffix)} AS (
             SELECT timestamp, symbol,
                 last(best_bid) AS bid,
@@ -497,7 +620,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY HOUR {rc('3 DAYS', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1m', suffix)} REFRESH EVERY 1m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -507,7 +630,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY DAY {rc('3 DAYS', 'TO REMOTE 1 day, TO PARQUET 7 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1h', suffix)} REFRESH EVERY 10m DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -517,7 +640,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('bbo_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 max(bid) AS bid,
@@ -527,7 +650,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1m', suffix)}  AS (
             SELECT timestamp, symbol,
                 first(best_bid) AS open,
@@ -540,7 +663,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY HOUR {rc('1 DAY', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_15m', suffix)} AS (
             SELECT timestamp, symbol,
                 first(open) AS open,
@@ -554,7 +677,7 @@ def ensure_materialized_views_exist(args, suffix):
         ) PARTITION BY HOUR {rc('2 DAYS', 'TO REMOTE 1 day, TO PARQUET 7 days, DROP LOCAL 12 months')};
         """)
 
-        conn.execute(f"""
+        if _md: conn.execute(f"""
         CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('market_data_ohlc_1d', suffix)} REFRESH EVERY 1h DEFERRED START '2025-06-01T00:00:00.000000Z' AS (
             SELECT timestamp, symbol,
                 first(best_bid) AS open,
@@ -597,7 +720,7 @@ def ensure_materialized_views_exist(args, suffix):
 # used only with incremental mode
 def load_initial_state(args, suffix):
     state = {}
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str) as conn:
         cur = conn.execute(f"SELECT symbol, bid_price, ask_price, indicator1, indicator2 FROM {table_name('core_price', suffix)} LATEST BY symbol")
         for row in cur.fetchall():
@@ -650,14 +773,16 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
         out.append((symbol, low, high, precision, pip, rank))
     return out
 
-def fx_pairs_refresher(shared_fx_pairs, interval=300, bracket_pct=1.0, first_ready_event=None):
-    while True:
+def fx_pairs_refresher(shared_fx_pairs, interval=300, bracket_pct=1.0, first_ready_event=None,
+                       shutdown_event=None):
+    _ignore_sigint()
+    while not _shutting_down(shutdown_event):
         new_fx_pairs = fetch_fx_pairs_from_yahoo(list(shared_fx_pairs), bracket_pct)
         for i in range(len(shared_fx_pairs)):
             shared_fx_pairs[i] = new_fx_pairs[i]
         if first_ready_event is not None and not first_ready_event.is_set():
             first_ready_event.set()
-        time.sleep(interval)
+        _interruptible_sleep(shutdown_event, interval)
 
 def quantize_to_pip(price, pip):
     decimals = abs(int(round(np.log10(pip))))
@@ -759,10 +884,11 @@ def generate_events_for_second(
     suffix="",
     real_time=True,
     orders_count=0,
-    lei_pool=None
+    lei_pool=None,
+    window_ns=1_000_000_000
 ):
     """
-    Generate events for a single second:
+    Generate events for a single second (or a sub-slice of one when window_ns < 1e9):
     - market_data: Many events (full depth orderbook updates)
     - core_price: Fewer events (BBO snapshots with indicators)
     - fx_trades: Execute against orderbooks, timestamped after corresponding core_price
@@ -830,7 +956,7 @@ def generate_events_for_second(
 
     # --- Generate market_data events (LOTS of them - orderbook updates) ---
     if market_event_count > 0:
-        offsets_market = np.sort(np.random.randint(0, 1_000_000_000, market_event_count, dtype=np.int64))
+        offsets_market = np.sort(np.random.randint(0, window_ns, market_event_count, dtype=np.int64))
         sym_idx_market = np.random.randint(0, n_pairs, market_event_count)
         levels_market = np.random.randint(min_levels, max_levels + 1, market_event_count)
         md_bid_vols = draw_volumes(market_event_count)
@@ -857,10 +983,16 @@ def generate_events_for_second(
                 emitter.emit_market(row_ts, symbol, bids, asks)
 
     # --- Generate core_price events (FEWER - BBO snapshots with metadata) ---
-    # Track generated core_price events for trade generation
-    core_price_events = []
+    # Per symbol, every core_price column is computed vectorized and the whole
+    # block is handed to the emitter in one emit_core_bulk() call. We keep each
+    # symbol's book arrays so trades can sample from them lazily: only the handful
+    # of events that are actually traded need a materialized book, instead of one
+    # dict per core event (which dominated generation at high core EPS).
+    ecn_arr = np.asarray(ecn_pool)
+    reason_arr = np.asarray(reason_pool)
+    symbol_books = []  # (symbol, pb, pa, bid_vols, ask_vols, levels, ts, ecn, pip, rank, n)
     if core_count > 0:
-        offsets_core = np.sort(np.random.randint(0, 1_000_000_000, core_count, dtype=np.int64))
+        offsets_core = np.sort(np.random.randint(0, window_ns, core_count, dtype=np.int64))
         sym_idx_core = np.random.randint(0, n_pairs, core_count)
         levels_core = np.random.randint(min_levels, max_levels + 1, core_count)
         core_bid_vols = draw_volumes(core_count)
@@ -882,55 +1014,75 @@ def generate_events_for_second(
             ind2_close = float(round(c_state["indicator2"], 3))
             bid_vec, ask_vec = interp_open_close(symbol, n_events)
             pb, pa = price_grids(bid_vec, ask_vec, pip)
-            for j, e in enumerate(idx):
-                row_ts = int(row_ts_core[e])
-                if end_ns is not None and row_ts >= end_ns:
-                    continue
-                ecn = ecn_pool[ecn_idx[e]]
-                reason = reason_pool[reason_idx[e]]
-                last = j == n_events - 1
 
-                # Core price always uses level 0 (best bid/offer); indicators come
-                # from the open state for all but the last event (which is close).
-                emitter.emit_core(
-                    row_ts,
-                    symbol,
-                    ecn,
-                    reason,
-                    {
-                        "bid_price": float(pb[j, 0]),  # Level 0 = Best bid
-                        "bid_volume": int(core_bid_vols[e, 0]),
-                        "ask_price": float(pa[j, 0]),  # Level 0 = Best ask
-                        "ask_volume": int(core_ask_vols[e, 0]),
-                        "indicator1": ind1_close if last else ind1_open,
-                        "indicator2": ind2_close if last else ind2_open,
-                    }
-                )
+            # Indicators use the open state for every event except the last, which
+            # uses the close state (first event = open, last event = close), exactly
+            # as the per-event path did.
+            ind1 = np.full(n_events, ind1_open, dtype=np.float64)
+            ind2 = np.full(n_events, ind2_open, dtype=np.float64)
+            ind1[-1] = ind1_close
+            ind2[-1] = ind2_close
 
-                # Store this core_price event for potential trade generation. The
-                # book is stashed as (prices, volumes) row views into the grids, so
-                # a trade executes against exactly the book whose level 0 was
-                # published in the core_price row.
-                core_price_events.append({
-                    "timestamp": row_ts,
-                    "symbol": symbol,
-                    "ecn": ecn,
-                    "bids": (pb[j], core_bid_vols[e]),
-                    "asks": (pa[j], core_ask_vols[e]),
-                    "levels": int(levels_core[e]),
-                    "pip": pip,
-                    "rank": rank
-                })
+            ts_sym = row_ts_core[idx]
+            ecn_sym = ecn_arr[ecn_idx[idx]]
+            reason_sym = reason_arr[reason_idx[idx]]
+            bvols = core_bid_vols[idx]
+            avols = core_ask_vols[idx]
+            lvls = levels_core[idx]
+
+            # In faster-than-life the time window can end mid-second; drop events at
+            # or past end_ns (the per-event path skipped them with `continue`). The
+            # interpolation and indicators were computed over the full event set
+            # first, so surviving events keep identical values.
+            if end_ns is not None:
+                keep = ts_sym < end_ns
+                if not keep.all():
+                    if not keep.any():
+                        continue
+                    pb = pb[keep]; pa = pa[keep]
+                    ts_sym = ts_sym[keep]; ecn_sym = ecn_sym[keep]; reason_sym = reason_sym[keep]
+                    bvols = bvols[keep]; avols = avols[keep]; lvls = lvls[keep]
+                    ind1 = ind1[keep]; ind2 = ind2[keep]
+                    n_events = ts_sym.size
+
+            # Core price always uses level 0 (best bid/offer).
+            emitter.emit_core_bulk(
+                ts_sym, np.full(n_events, symbol), ecn_sym, reason_sym,
+                pb[:, 0], bvols[:, 0], pa[:, 0], avols[:, 0], ind1, ind2,
+            )
+
+            # Book kept as (prices, volumes) row views into the grids, so a sampled
+            # trade executes against exactly the book whose level 0 was published.
+            symbol_books.append((symbol, pb, pa, bvols, avols, lvls, ts_sym,
+                                 ecn_sym, pip, rank, n_events))
 
     # --- Generate trades from core_price events ---
-    if orders_count > 0 and lei_pool and core_price_events:
+    # Weight orders by liquidity rank (lower rank = more liquid = higher weight).
+    # The per-event weight is (11 - rank); since rank is constant within a symbol,
+    # weighting each symbol by (11 - rank) * n_events and then drawing a uniform
+    # event inside the chosen symbol reproduces the identical per-event selection
+    # distribution, while materializing a book only for the events actually traded.
+    total_core = sum(bk[10] for bk in symbol_books)
+    if orders_count > 0 and lei_pool and total_core > 0:
         # Cap orders to available core_price events to avoid excessive duplication
-        actual_orders_count = min(orders_count, len(core_price_events))
+        actual_orders_count = min(orders_count, total_core)
+        sym_weights = [(11 - bk[9]) * bk[10] for bk in symbol_books]
+        chosen_books = random.choices(symbol_books, weights=sym_weights, k=actual_orders_count)
 
-        # Select exactly actual_orders_count events, weighted by liquidity rank
-        # Lower rank = more liquid = higher weight
-        weights = [(11 - cp_event["rank"]) for cp_event in core_price_events]
-        selected_events = random.choices(core_price_events, weights=weights, k=actual_orders_count)
+        selected_events = []
+        for bk in chosen_books:
+            symbol, pb, pa, bvols, avols, lvls, ts_sym, ecn_sym, pip, rank, n_events = bk
+            p = random.randrange(n_events)
+            selected_events.append({
+                "timestamp": int(ts_sym[p]),
+                "symbol": symbol,
+                "ecn": str(ecn_sym[p]),
+                "bids": (pb[p], bvols[p]),
+                "asks": (pa[p], avols[p]),
+                "levels": int(lvls[p]),
+                "pip": pip,
+                "rank": rank,
+            })
 
         for cp_event in selected_events:
             # Check if we have room for trades within this second
@@ -987,6 +1139,41 @@ def wait_if_paused(pause_event, process_idx):
         print(f"[WORKER {process_idx}] Paused due to WAL lag (waiting for sequencerTxn==writerTxn)...")
         time.sleep(5)
 
+def _ignore_sigint():
+    """Child processes ignore Ctrl+C so it does not spray KeyboardInterrupt tracebacks;
+    the parent's handler sets the shared shutdown event and they exit via that instead."""
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass  # not on the main thread of a child; safe to ignore
+
+def _shutting_down(shutdown_event):
+    return shutdown_event is not None and shutdown_event.is_set()
+
+def _interruptible_sleep(shutdown_event, seconds):
+    """Sleep, but wake immediately if a shutdown is requested (so background
+    processes stop promptly on Ctrl+C instead of sitting in a long time.sleep)."""
+    if shutdown_event is not None:
+        shutdown_event.wait(seconds)
+    else:
+        time.sleep(seconds)
+
+def _install_parent_sigint(shutdown_event):
+    """Turn Ctrl+C in the parent into a graceful shutdown: the first signal asks the
+    workers to finish the current batch, flush/drain and exit; a second forces exit.
+    Child processes ignore SIGINT (see _ignore_sigint) and stop via shutdown_event."""
+    state = {"n": 0}
+    def handler(signum, frame):
+        state["n"] += 1
+        if state["n"] == 1:
+            print("\n[SHUTDOWN] Ctrl+C received - draining buffers and stopping cleanly "
+                  "(press Ctrl+C again to force).", flush=True)
+            shutdown_event.set()
+        else:
+            print("\n[SHUTDOWN] Forcing immediate exit.", flush=True)
+            os._exit(130)
+    signal.signal(signal.SIGINT, handler)
+
 def ingest_worker(
     args,
     per_second_plan,
@@ -999,17 +1186,39 @@ def ingest_worker(
     processes,
     pause_event,
     global_sec_idx_offset, # only meaningful in faster-than-life
-    lei_pool
+    lei_pool,
+    shutdown_event=None
 ):
-    if args.mode=="real-time":
-        buffer_limit=1000
-    else:
-        buffer_limit=10000
+    _ignore_sigint()
+    buffer_limit = compute_buffer_limit(args)
 
     auto_flush_interval = buffer_limit * 2  # safety net in the ILP client
 
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;auto_flush_interval={auto_flush_interval};" if not args.token else f"https::addr={args.host}:9000;token={args.token};tls_verify=unsafe_off;auto_flush_interval={auto_flush_interval};"
+    elif args.protocol == "qwp":
+        # QWP/WebSocket. Same Sender.from_conf() + dataframe() API as ILP; only the conf
+        # differs. QWP has its own versioning, so protocol_version is NOT set (it errors on
+        # QWP). Each worker gets a unique sender_id + store-and-forward dir so un-acked frames
+        # survive reconnects/failover without colliding between processes.
+        scheme = "wss" if args.qwp_tls else "ws"
+        sender_id = f"fx-{process_idx}"
+        sf_dir = os.path.join(args.store_forward_dir, sender_id)
+        os.makedirs(sf_dir, exist_ok=True)
+        # --host may be a comma-separated host:port list for multi-host HA failover.
+        parts = [f"{scheme}::addr={qwp_addr_list(args.host)};", "auto_flush=off;"]
+        if args.token:
+            parts.append(f"token={args.token};")
+        if args.qwp_tls:
+            parts.append("tls_verify=unsafe_off;")
+        parts.append(f"sender_id={sender_id};")
+        parts.append(f"sf_dir={sf_dir};")
+        parts.append("reconnect_max_duration_millis=300000;")
+        parts.append("reconnect_initial_backoff_millis=100;")
+        parts.append("reconnect_max_backoff_millis=5000;")
+        if args.durable_ack:
+            parts.append("request_durable_ack=on;")
+        conf = "".join(parts)
     else:
         conf = f"tcp::addr={args.host}:9009;protocol_version=2;auto_flush_interval={auto_flush_interval};" if not args.token else f"tcps::addr={args.host}:9009;username={args.ilp_user};token={args.token};token_x={args.token_x};token_y={args.token_y};tls_verify=unsafe_off;protocol_version=2;auto_flush_interval={auto_flush_interval};"
 
@@ -1023,12 +1232,16 @@ def ingest_worker(
     last_close_per_symbol = {}
 
     with Sender.from_conf(conf) as sender:
-        emitter = SortedEmitter(sender, buffer_limit=buffer_limit, suffix=args.suffix)
+        emitter = SortedEmitter(sender, buffer_limit=buffer_limit, suffix=args.suffix,
+                                no_market_data=args.no_market_data)
         wall_start = None  # for real-time alignment
 
         if args.mode == "faster-than-life":
             open_per_second, close_per_second = global_states
             for sec_idx, (market_total, core_total) in enumerate(per_second_plan):
+                if _shutting_down(shutdown_event):
+                    emitter.flush_all()
+                    break
                 wait_if_paused(pause_event, process_idx)
 
                 open_state = open_per_second[sec_idx]
@@ -1042,7 +1255,8 @@ def ingest_worker(
                     end_ns, args.suffix, False,
                     orders_total, lei_pool
                 )
-                sent += market_total
+                # Stop budget counts core_price events when market_data is disabled.
+                sent += core_total if args.no_market_data else market_total
 
                 if (end_ns and ts >= end_ns) or (sent >= total_events):
                     emitter.flush_all()
@@ -1062,43 +1276,77 @@ def ingest_worker(
             wall_start = time.time()
             last_refresh = time.time()
 
+            # Optional sub-second slicing: split each real-time second into fixed-duration slices
+            # so rows arrive smoothly (~every slice_ms) instead of in one burst per second. Off by
+            # default (n_slices == 1 reproduces the original per-second behaviour exactly).
+            slice_ms = max(0, getattr(args, "realtime_slice_ms", 0) or 0)
+            n_slices = max(1, 1000 // slice_ms) if slice_ms else 1
+            slice_ns = 1_000_000_000 // n_slices
+            slices_done = 0
+
             while not (end_ns and ts >= end_ns) and (total_events == 0 or sent < total_events):
+                if _shutting_down(shutdown_event):
+                    break
                 fx_pairs_snapshot = list(fx_pairs)
                 wait_if_paused(pause_event, process_idx)
-                market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+                market_total = 0 if args.no_market_data else random.randint(args.market_data_min_eps, args.market_data_max_eps)
                 core_total = random.randint(args.core_min_eps, args.core_max_eps)
                 orders_total = random.randint(args.orders_min_per_sec, args.orders_max_per_sec)
-
 
                 # At the beginning of the second: capture OPEN state
                 open_state = {k: v.copy() for k, v in current_state.items()}
                 # Evolve for close (to be used as interpolation target)
                 close_state = evolve_state_one_tick(current_state, fx_pairs_snapshot, 7.0)
 
-                generate_events_for_second(
-                    ts, market_total, core_total, fx_pairs_snapshot,
-                    open_state, close_state, emitter, ladder,
-                    args.min_levels, args.max_levels,
-                    prebuilt_bids, prebuilt_asks,
-                    end_ns, args.suffix, True,
-                    orders_total, lei_pool
-                )
+                for s in range(n_slices):
+                    # Sub-window open/close land on the same open->close line, so the price
+                    # trajectory and second-boundary continuity are identical to the unsliced case.
+                    if n_slices == 1:
+                        s_open, s_close, s_window = open_state, close_state, 1_000_000_000
+                    else:
+                        s_open = lerp_state(open_state, close_state, s / n_slices)
+                        s_close = lerp_state(open_state, close_state, (s + 1) / n_slices)
+                        s_window = slice_ns
+                    generate_events_for_second(
+                        ts + s * slice_ns, slice_count(market_total, n_slices, s),
+                        slice_count(core_total, n_slices, s), fx_pairs_snapshot,
+                        s_open, s_close, emitter, ladder,
+                        args.min_levels, args.max_levels,
+                        prebuilt_bids, prebuilt_asks,
+                        end_ns, args.suffix, True,
+                        slice_count(orders_total, n_slices, s), lei_pool,
+                        window_ns=s_window
+                    )
+                    # Push this slice out now so delivery is smooth, then align to its wall-clock boundary.
+                    if n_slices > 1:
+                        emitter.flush_all()
+                    slices_done += 1
+                    next_tick = wall_start + slices_done * slice_ns / 1_000_000_000
+                    sleep_for = next_tick - time.time()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    if _shutting_down(shutdown_event):
+                        break
+
                 current_state = close_state
-                sent += market_total
+                # Stop budget counts core_price events when market_data is disabled.
+                sent += core_total if args.no_market_data else market_total
                 ts += int(1e9)
                 sec_idx += 1
-
-                # Wall clock alignment
-                next_tick = wall_start + sec_idx
-                now = time.time()
-                sleep_for = next_tick - now
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
             emitter.flush_all()
+
+        # QWP/WebSocket: drain outstanding store-and-forward frames (wait for acks)
+        # before the sender closes, so a clean exit does not lose buffered rows.
+        if args.protocol == "qwp":
+            emitter.flush_all()
+            sender.close_drain()
 
     # ... main event loop ends here ...
 
     # Print reason for exit
+    if _shutting_down(shutdown_event):
+        print(f"[WORKER {process_idx}] Shutdown requested; flushed and drained cleanly (last ts: {ns_to_iso(ts)}).")
+        sys.exit(0)
     if end_ns is not None and ts >= end_ns:
         print(f"[WORKER {process_idx}] Finished. Exiting because end_ts ({ns_to_iso(end_ns)}) was reached (last ts: {ns_to_iso(ts)}). Events sent from worker {sent} ")
     elif sent >= total_events:
@@ -1108,16 +1356,19 @@ def ingest_worker(
 
     sys.exit(0)
 
-def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
+def wal_monitor(args, pause_event, threshold, suffix='', interval=5, shutdown_event=None):
+    _ignore_sigint()
     import time
     import psycopg as pg
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
-    threshold = 3 * processes
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     last_logged_paused = False
 
+    # Watch the busiest table for WAL lag: market_data normally, core_price when it is disabled.
+    mon_table = table_name('core_price' if getattr(args, "no_market_data", False) else 'market_data', suffix)
+    print(f"[WAL MONITOR] Watching {mon_table} with lag threshold {threshold}")
     with pg.connect(conn_str, autocommit=True) as conn:
-        while True:
-            cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{table_name('market_data', suffix)}'")
+        while not _shutting_down(shutdown_event):
+            cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'")
             row = cur.fetchone()
             if row:
                 seq, wrt = row
@@ -1134,7 +1385,7 @@ def wal_monitor(args, pause_event, processes, interval=5,suffix=''):
                         print(f"[WAL MONITOR] Resuming ingestion: sequencerTxn={seq}, writerTxn={wrt}, lag={lag}")
                         pause_event.clear()
                         last_logged_paused = False
-            time.sleep(interval)
+            _interruptible_sleep(shutdown_event, interval)
 
 def parse_ts_arg(ts):
     # Accepts 2025-07-11T14:00:00, 2025-07-11T14:00:00Z, or 2025-07-11T14:00:00+00:00 as UTC
@@ -1165,10 +1416,21 @@ def main():
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default="quest")
     parser.add_argument("--token", default=None)
+    parser.add_argument("--token_file", default=None,
+                        help="read the (bearer) token from this file, trimmed; overrides --token. "
+                             "Keeps the token off the command line. Used by http/qwp auth.")
     parser.add_argument("--token_x", default=None)
     parser.add_argument("--token_y", default=None)
     parser.add_argument("--ilp_user", default="admin")
-    parser.add_argument("--protocol", choices=["http", "tcp"], default="http")
+    parser.add_argument("--protocol", choices=["http", "tcp", "qwp"], default="http")
+    parser.add_argument("--qwp_tls", type=lambda x: str(x).lower() == 'true', default=False,
+                        help="QWP only: use wss (TLS) instead of ws, with tls_verify=unsafe_off")
+    parser.add_argument("--durable_ack", type=lambda x: str(x).lower() == 'true', default=False,
+                        help="QWP only: request_durable_ack=on so a failover cannot lose acked-but-"
+                             "unreplicated rows (Enterprise). Independent of --enterprise.")
+    parser.add_argument("--store_forward_dir", default=os.path.join(tempfile.gettempdir(), "fx_qwp_sf"),
+                        help="QWP only: base dir for per-worker store-and-forward spill; each worker "
+                             "gets a <dir>/fx-<idx> subdir (default: <tmp>/fx_qwp_sf)")
     parser.add_argument("--mode", choices=["real-time", "faster-than-life"], required=True)
     parser.add_argument("--market_data_min_eps", type=int, default=1200)
     parser.add_argument("--market_data_max_eps", type=int, default=15000)
@@ -1178,6 +1440,22 @@ def main():
     parser.add_argument("--start_ts", type=str)
     parser.add_argument("--end_ts", type=str)
     parser.add_argument("--processes", type=int, default=1)
+    parser.add_argument("--market_data_processes", type=int, default=None,
+                        help="Toggle for the market_data table (parity shim for the Java per-pool "
+                             "flag). 0 = disable market_data (send only core_price + fx_trades, for "
+                             "fast two-table demos); 1 = enable (default). Other values are rejected: "
+                             "Python has a single shared pool, so use --processes for parallelism. "
+                             "When 0, the stop budget (--total_market_data_events) counts core_price "
+                             "events instead.")
+    parser.add_argument("--wal_lag_threshold", type=int, default=None,
+                        help="Pause ingestion when the monitored table's WAL apply lag exceeds this "
+                             "many transactions (default: 3*processes with market_data on; ~10s of "
+                             "core_price's commit rate when market_data is disabled).")
+    parser.add_argument("--realtime_slice_ms", type=int, default=0,
+                        help="Real-time only: split each second into slices of this many ms and "
+                             "flush after each, so rows arrive smoothly instead of one burst/sec "
+                             "(e.g. 100 = 10 evenly-spaced flushes/sec). 0 (default) = off. Ignored "
+                             "in faster-than-life.")
     parser.add_argument("--min_levels", type=int, default=40)
     parser.add_argument("--max_levels", type=int, default=40)
     parser.add_argument("--incremental", type=lambda x: str(x).lower() != 'false', default=False)
@@ -1194,6 +1472,21 @@ def main():
 
     args = parser.parse_args()
     suffix = args.suffix
+
+    # Token file wins over inline --token (keeps the token off the command line).
+    if args.token_file:
+        with open(args.token_file) as tf:
+            args.token = tf.read().strip()
+
+    # --market_data_processes is a toggle for the market_data table (parity shim for the Java
+    # per-pool count). Python has one shared pool, so only 0 (disable) and 1 (enable) are
+    # meaningful; reject anything else. When 0, market_data is dropped and core_price + fx_trades
+    # still flow.
+    if args.market_data_processes is not None and args.market_data_processes not in (0, 1):
+        print("ERROR: --market_data_processes accepts only 0 (disable market_data) or 1 (enable) in "
+              "the Python generator. Per-pool worker counts are Java-only; use --processes for parallelism.")
+        sys.exit(1)
+    args.no_market_data = (args.market_data_processes == 0)
 
     # Parse ts ONCE
     if args.start_ts:
@@ -1216,8 +1509,10 @@ def main():
             print("ERROR: --total_market_data_events must be set to a positive integer in faster-than-life mode.")
             exit(1)
 
-    # Validate event rate hierarchy: market_data > core_price > orders
-    if args.market_data_min_eps <= args.core_max_eps:
+    # Validate event rate hierarchy: market_data > core_price > orders.
+    # When market_data is disabled, its EPS is unused, so skip that half of the check
+    # (demos deliberately push core_price EPS high).
+    if not args.no_market_data and args.market_data_min_eps <= args.core_max_eps:
         print(f"ERROR: market_data_min_eps ({args.market_data_min_eps}) must be greater than core_max_eps ({args.core_max_eps}).")
         print("Market data events should always be more frequent than core price events.")
         exit(1)
@@ -1231,9 +1526,10 @@ def main():
         ensure_materialized_views_exist(args, suffix)
 
     # Connect and get latest timestamps
-    conn_str = f"user={args.user} password={args.password} host={args.host} port={args.pg_port} dbname=qdb"
+    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     with pg.connect(conn_str) as conn:
-        latest_market_ns = get_latest_timestamp_ns(conn, table_name('market_data', suffix))
+        # market_data may not exist when disabled (--market_data_processes 0); skip its lookup.
+        latest_market_ns = None if args.no_market_data else get_latest_timestamp_ns(conn, table_name('market_data', suffix))
         latest_core_ns = get_latest_timestamp_ns(conn, table_name('core_price', suffix))
 
     max_latest_ns = max(x for x in [latest_market_ns, latest_core_ns] if x is not None) if (latest_market_ns is not None or latest_core_ns is not None) else None
@@ -1286,6 +1582,9 @@ def main():
 
     # Build state
     manager = mp.Manager()
+    # Shared shutdown flag; Ctrl+C in the parent sets it and every child stops cleanly.
+    shutdown_event = mp.Event()
+    _install_parent_sigint(shutdown_event)
     refresher_proc = None
     if args.mode == "real-time":
         # Real-time uses a shared Manager list updated by Yahoo refresher
@@ -1310,7 +1609,8 @@ def main():
             first_ready_event = mp.Event()
             # Start the refresher
             refresher_proc = mp.Process(target=fx_pairs_refresher, args=(fx_pairs, args.yahoo_refresh_secs),
-                                        kwargs={'first_ready_event': first_ready_event})
+                                        kwargs={'first_ready_event': first_ready_event,
+                                                'shutdown_event': shutdown_event})
             refresher_proc.daemon = True
             refresher_proc.start()
             print("[INFO] Waiting for Yahoo FX brackets initial load...", flush=True)
@@ -1323,10 +1623,14 @@ def main():
             state = load_initial_state_from_brackets(fx_pairs)
 
     pause_event = Event()
+    _buffer_limit = compute_buffer_limit(args)
+    _wal_threshold = compute_wal_threshold(args, _buffer_limit)
+    print(f"[INFO] Flush buffer_limit={_buffer_limit} rows; WAL lag threshold={_wal_threshold} "
+          f"(watching {'core_price' if args.no_market_data else 'market_data'})")
     wal_proc = mp.Process(
         target=wal_monitor,
-        args=(args, pause_event, args.processes),
-        kwargs={'suffix': suffix}
+        args=(args, pause_event, _wal_threshold),
+        kwargs={'suffix': suffix, 'shutdown_event': shutdown_event}
     )
     wal_proc.start()
 
@@ -1348,14 +1652,19 @@ def main():
                 print(f"[INFO] Reached end_ts limit at {len(full_per_second_plan)} seconds ({events_so_far} events). "
                       f"Requested {args.total_market_data_events} events but time window only allows {events_so_far}.")
                 break
-            market_total = random.randint(args.market_data_min_eps, args.market_data_max_eps)
+            # When market_data is disabled, plan tuples carry 0 market events and the stop
+            # budget (--total_market_data_events) is measured in core_price events instead.
+            market_total = 0 if args.no_market_data else random.randint(args.market_data_min_eps, args.market_data_max_eps)
             core_total = random.randint(args.core_min_eps, args.core_max_eps)
             full_per_second_plan.append((market_total, core_total))
-            events_so_far += market_total
+            events_so_far += core_total if args.no_market_data else market_total
         overage = events_so_far - args.total_market_data_events
         if overage > 0 and (max_seconds_from_window is None or len(full_per_second_plan) < max_seconds_from_window):
             market_total, core_total = full_per_second_plan[-1]
-            full_per_second_plan[-1] = (market_total - overage, core_total)
+            if args.no_market_data:
+                full_per_second_plan[-1] = (market_total, core_total - overage)
+            else:
+                full_per_second_plan[-1] = (market_total - overage, core_total)
 
         total_seconds = len(full_per_second_plan)
         if total_seconds == 0:
@@ -1377,10 +1686,11 @@ def main():
 
             # Slice the plan for this chunk
             chunk_plan = full_per_second_plan[chunk_start_sec:chunk_end_sec]
-            chunk_events = sum(market for market, _ in chunk_plan)
+            chunk_events = sum((c if args.no_market_data else m) for m, c in chunk_plan)
+            chunk_label = "core_price" if args.no_market_data else "market_data"
 
             print(f"[CHUNK {chunk_idx + 1}/{num_chunks}] Seconds {chunk_start_sec}-{chunk_end_sec - 1}, "
-                  f"{chunk_events} market_data events, starting at {ns_to_iso(chunk_start_ns)}")
+                  f"{chunk_events} {chunk_label} events, starting at {ns_to_iso(chunk_start_ns)}")
 
             # Precompute state for this chunk only (using carry_forward_state for continuity)
             open_per_second, close_per_second = precompute_open_close_state(
@@ -1414,7 +1724,7 @@ def main():
                     args=(
                         args,
                         worker_plans[process_idx],
-                        sum(market for market, _ in worker_plans[process_idx]),
+                        sum((c if args.no_market_data else m) for m, c in worker_plans[process_idx]),
                         chunk_start_ns,
                         effective_end_ns,
                         global_states,
@@ -1423,7 +1733,8 @@ def main():
                         args.processes,
                         pause_event,
                         global_sec_offsets[process_idx],
-                        lei_pool
+                        lei_pool,
+                        shutdown_event
                     )
                 )
                 p.start()
@@ -1432,6 +1743,11 @@ def main():
             # Wait for all workers to finish this chunk
             for p in pool:
                 p.join()
+
+            # Stop launching further chunks if Ctrl+C was pressed mid-chunk.
+            if _shutting_down(shutdown_event):
+                print("[SHUTDOWN] Stopping after current chunk.", flush=True)
+                break
 
             # Carry forward the final close state for continuity with next chunk
             carry_forward_state = close_per_second[-1]
@@ -1455,18 +1771,24 @@ def main():
                 1,  # processes
                 pause_event,
                 0,  # not needed for real-time
-                lei_pool
+                lei_pool,
+                shutdown_event
             )
         )
         p.start()
         p.join()
 
-    wal_proc.terminate()
-    wal_proc.join()
-
-    if refresher_proc is not None:
-        refresher_proc.terminate()
-        refresher_proc.join()
+    # Stop background processes. Set the flag (already set on a Ctrl+C shutdown, but
+    # also needed after a normal finish) so each exits its loop, then join with a short
+    # grace period and only hard-terminate if it is still blocked.
+    shutdown_event.set()
+    for proc in (wal_proc, refresher_proc):
+        if proc is None:
+            continue
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
 
 if __name__ == "__main__":
     main()

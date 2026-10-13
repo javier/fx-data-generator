@@ -11,11 +11,12 @@ import java.util.concurrent.ThreadLocalRandom;
  * The simulated FX market: the pair universe, the ECN/counterparty pools, and
  * the price-continuity model.
  *
- * <p>This is the simplified sibling of the Python generator. There is no order
- * book and no {@code market_data}/{@code core_price} table: trades are sampled
- * directly off an evolving mid/spread. The continuity guarantees that matter for
- * downstream OHLC still hold, because the mid follows the same controlled random
- * walk and {@code close(second t) == open(second t+1)}.
+ * <p>This mirrors the Python generator's market model and feeds all three tables
+ * ({@code fx_trades}, {@code market_data}, {@code core_price}): trades, the order
+ * book, and top-of-book are all derived from the same per-symbol mid/spread walk,
+ * seeded identically across the worker pools. The continuity guarantees that matter
+ * for downstream OHLC hold because the mid follows the same controlled random walk
+ * and {@code close(second t) == open(second t+1)}.
  */
 public final class FxUniverse {
 
