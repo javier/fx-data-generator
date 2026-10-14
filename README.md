@@ -436,10 +436,12 @@ watching `market_data` (or `core_price`) as before.
 
 - **Spot only:** `grafana_dashboard.json` ("FX Orderbook - Realtime Demo"), with both flags off.
 - **Spot plus forwards:** `fx_forwards_grafana_dashboard.json` ("FX and Metals: Spot and
-  Forwards"), with `--metals true --forwards true` and XAUUSD selected. Market Depth runs full
-  width, then a Spot row (top of book against core price, 15-minute candles), a Forwards row
-  (the curve with outrights and implied rates, 3M points against spot, the triangular
-  consistency gap per tenor) and a Swaps row (the swap ladder from spot). It needs
+  Forwards"), with `--metals true --forwards true` and XAUUSD selected. It reuses the first
+  dashboard's Market Depth, top-of-book and 1-minute OHLC panels unchanged (and its 250 ms
+  refresh), so spot looks and ticks the same; then a Forwards row (the curve with outrights
+  and implied rates; every 3M ladder of the last 15 minutes against the spot it was priced on;
+  the triangular consistency gap per tenor) and a Swaps row (the swap ladder from spot with
+  implied swap rates and far-leg outrights). It needs
   `market_data` and its views, so it is not for two-table mode (`--market_data_processes 0`).
   The consistency panel reads the latest complete minute of the selected time range: set the
   range to end inside 09:20 to 09:40 UTC to see the planted bad point turn a bar red.

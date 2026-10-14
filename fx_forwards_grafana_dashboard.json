@@ -221,8 +221,7 @@
               "type": "color-background"
             },
             "inspect": false,
-            "minWidth": 50,
-            "width": 99
+            "minWidth": 50
           },
           "mappings": [],
           "thresholds": {
@@ -247,11 +246,7 @@
             "properties": [
               {
                 "id": "custom.minWidth",
-                "value": 200
-              },
-              {
-                "id": "custom.width",
-                "value": 180
+                "value": 190
               }
             ]
           },
@@ -263,23 +258,7 @@
             "properties": [
               {
                 "id": "custom.minWidth",
-                "value": 200
-              },
-              {
-                "id": "custom.width",
-                "value": 180
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Level"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 55
+                "value": 190
               }
             ]
           },
@@ -290,12 +269,8 @@
             },
             "properties": [
               {
-                "id": "custom.width",
-                "value": 60
-              },
-              {
                 "id": "decimals",
-                "value": 5
+                "value": 4
               }
             ]
           },
@@ -306,12 +281,8 @@
             },
             "properties": [
               {
-                "id": "custom.width",
-                "value": 80
-              },
-              {
                 "id": "decimals",
-                "value": 5
+                "value": 4
               }
             ]
           }
@@ -369,7 +340,7 @@
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
       },
-      "description": "15-minute candlesticks of the best bid from the market_data_ohlc_15m materialized view, with volume. Requires market_data (not for two-table mode).",
+      "description": "Candlestick chart summarizing price action using the best bid from the order book, aggregated into 1-minute intervals. Each candlestick shows the open, high, low, and close bid price, along with traded volume. Ideal for visualizing price trends, volatility, and market regime changes over time. Data is queried from a materialized view.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -470,15 +441,33 @@
             "uid": "${DS_QUESTDB}"
           },
           "editorMode": "code",
+          "expand": false,
           "format": 1,
-          "queryType": "sql",
           "rawQuery": true,
-          "rawSql": "SELECT timestamp, open, high, low, close, total_volume\nFROM market_data_ohlc_15m\nWHERE $__timeFilter(timestamp) AND symbol = '${SYMBOL}'",
+          "rawSql": "select timestamp, first(bids[1,1]) open, max(bids[1,1]) high, \nmin(bids[1,1]) low,  last(bids[1,1]) close, sum(bids[2,1]) total_volume \n        from market_data\n        where  $__timeFilter(timestamp) and symbol = '${SYMBOL}'\n        sample by 1s\n        \n        \n",
           "refId": "A",
-          "selectedFormat": 2
+          "selectedFormat": 2,
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
         }
       ],
-      "title": "OHLC - Bids - 15min - (${SYMBOL})",
+      "timeFrom": "1m",
+      "title": "OHLC - Bids - 1m - (${SYMBOL})",
       "transparent": true,
       "type": "candlestick"
     },
@@ -646,7 +635,7 @@
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
       },
-      "description": "Minute series of the 3M mid forward points (right axis) and the spot mid, from the fx_forward_points_1m and core_price_1s views with an ASOF JOIN.",
+      "description": "Every 3M ladder over the last 15 minutes (one every 5 s): the mid forward points (right axis) and the spot mid each ladder was priced on (spot_ref).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -770,13 +759,15 @@
           "format": 1,
           "queryType": "sql",
           "rawQuery": true,
-          "rawSql": "WITH\n  points AS (\n    SELECT timestamp, (bid_points + ask_points) / 2 AS \"3M points\" FROM fx_forward_points_1m\n    WHERE symbol = '${SYMBOL}' AND tenor = '3M' AND $__timeFilter(timestamp)\n  ),\n  spot AS (\n    SELECT timestamp, last(close_mid) AS spot FROM core_price_1s\n    WHERE symbol = '${SYMBOL}' AND $__timeFilter(timestamp)\n    SAMPLE BY 1m\n  )\nSELECT p.timestamp, s.spot, p.\"3M points\"\nFROM points p\nASOF JOIN spot s",
+          "rawSql": "SELECT timestamp, spot_ref AS spot, (bid_points + ask_points) / 2 AS \"3M points\"\nFROM fx_forward_points\nWHERE symbol = '${SYMBOL}' AND tenor = '3M' AND $__timeFilter(timestamp)",
           "refId": "A",
           "selectedFormat": 2
         }
       ],
+      "timeFrom": "15m",
       "title": "3M Points vs Spot - ${SYMBOL}",
-      "type": "timeseries"
+      "type": "timeseries",
+      "hideTimeOverride": false
     },
     {
       "datasource": {
@@ -886,7 +877,7 @@
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
       },
-      "description": "Spot against each forward tenor: bid swap = far bid - near ask, ask swap = far ask - near bid (the near leg is spot, so they are the tenor's points), and the implied swap rate, the annualised forward premium of the period.",
+      "description": "Spot against each forward tenor: bid swap = far bid - near ask, ask swap = far ask - near bid (the near leg is spot, so they are the tenor's points), the implied swap rate (the annualised forward premium of the period), and the far-leg outrights against the latest core_price spot.",
       "id": 10,
       "gridPos": {
         "h": 9,
@@ -959,6 +950,30 @@
                 "value": 3
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Far outright bid"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Far outright ask"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
           }
         ]
       },
@@ -984,7 +999,7 @@
           "format": 1,
           "queryType": "sql",
           "rawQuery": true,
-          "rawSql": "DECLARE\n  @pip := CASE WHEN '${SYMBOL}' LIKE '%JPY' THEN 0.01 WHEN '${SYMBOL}' = 'XAGUSD' THEN 0.001 WHEN '${SYMBOL}' LIKE 'X%' THEN 0.01 ELSE 0.0001 END\nWITH\n  curve AS (\n    SELECT tenor, tenor_days, bid_points, ask_points, spot_ref FROM fx_forward_points\n    WHERE symbol = '${SYMBOL}' AND timestamp <= $__toTime\n    LATEST ON timestamp PARTITION BY tenor\n  )\nSELECT 'SPOT' AS Near, tenor AS Far, tenor_days AS Days,\n  bid_points AS \"Bid swap\", ask_points AS \"Ask swap\",\n  round((bid_points + ask_points) / 2 * @pip / spot_ref * 360 / tenor_days * 100, 3) AS \"Implied swap rate %\"\nFROM curve\nWHERE tenor_days > 0\nORDER BY tenor_days",
+          "rawSql": "DECLARE\n  @pip := CASE WHEN '${SYMBOL}' LIKE '%JPY' THEN 0.01 WHEN '${SYMBOL}' = 'XAGUSD' THEN 0.001 WHEN '${SYMBOL}' LIKE 'X%' THEN 0.01 ELSE 0.0001 END,\n  @dp := CASE WHEN '${SYMBOL}' LIKE '%JPY' OR '${SYMBOL}' LIKE 'X%' THEN 4 WHEN '${SYMBOL}' = 'XAGUSD' THEN 5 ELSE 6 END\nWITH\n  spot AS (\n    SELECT bid_price, ask_price FROM core_price\n    WHERE symbol = '${SYMBOL}' AND timestamp <= $__toTime\n    LATEST ON timestamp PARTITION BY symbol\n  ),\n  curve AS (\n    SELECT tenor, tenor_days, bid_points, ask_points, spot_ref FROM fx_forward_points\n    WHERE symbol = '${SYMBOL}' AND timestamp <= $__toTime\n    LATEST ON timestamp PARTITION BY tenor\n  )\nSELECT 'SPOT' AS Near, c.tenor AS Far, c.tenor_days AS Days,\n  c.bid_points AS \"Bid swap\", c.ask_points AS \"Ask swap\",\n  round((c.bid_points + c.ask_points) / 2 * @pip / c.spot_ref * 360 / c.tenor_days * 100, 3) AS \"Implied swap rate %\",\n  round(s.bid_price + c.bid_points * @pip, @dp) AS \"Far outright bid\",\n  round(s.ask_price + c.ask_points * @pip, @dp) AS \"Far outright ask\"\nFROM curve c CROSS JOIN spot s\nWHERE c.tenor_days > 0\nORDER BY c.tenor_days",
           "refId": "A",
           "selectedFormat": 2
         }
