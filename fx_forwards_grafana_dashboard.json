@@ -76,8 +76,9 @@
   "graphTooltip": 0,
   "id": null,
   "links": [],
-  "refresh": "500ms",
-  "schemaVersion": 39,
+  "preload": false,
+  "refresh": "250ms",
+  "schemaVersion": 41,
   "tags": [],
   "templating": {
     "list": [
@@ -103,8 +104,6 @@
         "query": "SELECT distinct SYMBOL FROM (\nSELECT  SYMBOL FROM core_price\nwhere timestamp > dateadd('d',-4,now())\nlatest on timestamp partition by symbol\n) order by symbol;\n",
         "refresh": 1,
         "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
         "type": "query"
       }
     ]
@@ -114,8 +113,8 @@
     "to": "now"
   },
   "timepicker": {
-    "hidden": false,
     "refresh_intervals": [
+      "100ms",
       "250ms",
       "500ms",
       "750ms",
@@ -131,13 +130,13 @@
       "1h",
       "2h",
       "1d"
-    ]
+    ],
+    "hidden": false
   },
   "timezone": "browser",
   "title": "FX and Metals: Spot and Forwards",
   "uid": "fxmetalsfwd01",
   "version": 1,
-  "weekStart": "",
   "panels": [
     {
       "datasource": {
@@ -145,6 +144,10 @@
         "uid": "${DS_QUESTDB}"
       },
       "description": "Visualizes the order book snapshot for the selected currency pair, showing the price and cumulative volume at each bid and ask level. The area under the green (bids) and red (asks) lines represents market liquidity on both sides, with the mid-price and top volume \u201cwalls\u201d highlighted for quick identification of major support and resistance.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
       "gridPos": {
         "h": 10,
         "w": 24,
@@ -156,7 +159,7 @@
       "maxPerRow": 2,
       "options": {
         "onclick": "console.log(data)\nwindow.updateVariables({query:{'var-project':'test'}, partial: true})",
-        "script": "const table = data.series[0];\nconst fields = table.fields;\n\nconst side = fields.find(f => f.name === \"side\");\nconst price = fields.find(f => f.name === \"price\");\nconst cum_volume = fields.find(f => f.name === \"cum_volume\");\nconst volume = fields.find(f => f.name === \"volume\");\n\nif (!side || !price || !cum_volume || !volume) {\n  throw new Error(\"Missing required fields\");\n}\n\nconst sideVals = side.values.toArray();\nconst priceVals = price.values.toArray();\nconst cumVolVals = cum_volume.values.toArray();\nconst volVals = volume.values.toArray();\n\nconst bids = [];\nconst asks = [];\n\nfor (let i = 0; i < priceVals.length; i++) {\n  const s = sideVals[i];\n  const p = priceVals[i];\n  const v = cumVolVals[i];\n  const raw = volVals[i];\n\n  if (s === \"bid\") bids.push({ x: p, y: v, raw });\n  else if (s === \"ask\") asks.push({ x: p, y: v, raw });\n}\n\nbids.sort((a, b) => b.x - a.x);\nasks.sort((a, b) => a.x - b.x);\n\nconst bestBid = bids[0]?.x ?? 0;\nconst bestAsk = asks[0]?.x ?? 0;\nconst mid = (bestBid + bestAsk) / 2;\n\nif (bids.length > 0) bids.unshift({ x: mid, y: bids[0].y });\nif (asks.length > 0) asks.unshift({ x: mid, y: 0 });\n\nconst topBids = [...bids]\n  .filter(b => b.raw)\n  .sort((a, b) => b.raw - a.raw)\n  .slice(-2); // largest 2\n\nconst topAsks = [...asks]\n  .filter(a => a.raw)\n  .sort((a, b) => b.raw - a.raw)\n  .slice(-2); // largest 2\n\nconst wallLines = [...topBids, ...topAsks].map(wall => ({\n  type: \"line\",\n  x0: wall.x,\n  x1: wall.x,\n  y0: 0,\n  y1: 1,\n  xref: \"x\",\n  yref: \"paper\",\n  line: {\n    color: \"yellow\",\n    width: 1,\n    dash: \"dot\"\n  }\n}));\n\nconst wallLabels = [...topBids, ...topAsks].map(wall => ({\n  x: wall.x,\n  y: 1.02,\n  xref: \"x\",\n  yref: \"paper\",\n  text: wall.x.toFixed(5),\n  showarrow: false,\n  font: { color: \"yellow\", size: 10 }\n}));\n\nreturn {\n  data: [\n    {\n      name: \"Bids\",\n      x: bids.map(pt => pt.x),\n      y: bids.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(0,255,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(0,255,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    },\n    {\n      name: \"Asks\",\n      x: asks.map(pt => pt.x),\n      y: asks.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(255,0,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(255,0,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    }\n  ],\n  layout: {\n    plot_bgcolor: \"black\",\n    paper_bgcolor: \"black\",\n    font: { color: \"white\" },\n    xaxis: {\n      title: \"Price\",\n      type: \"linear\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false\n    },\n    yaxis: {\n      title: \"Cumulative Volume\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false\n    },\n    margin: { t: 40, l: 60, r: 20, b: 50 },\n    shapes: [\n      {\n        type: \"line\",\n        x0: mid,\n        x1: mid,\n        y0: 0,\n        y1: 1,\n        xref: \"x\",\n        yref: \"paper\",\n        line: {\n          color: \"white\",\n          width: 1,\n          dash: \"dot\"\n        }\n      },\n      ...wallLines\n    ],\n    annotations: wallLabels,\n    legend: {\n      orientation: \"h\",\n      x: 0.5,\n      xanchor: \"center\",\n      y: -0.3\n    }\n  }\n};"
+        "script": "function parseArray(val) {\n  if (Array.isArray(val)) return val;\n  if (typeof val === \"string\") {\n    return val.replace(/[{}]/g, \"\")\n      .split(\",\")\n      .filter(x => x.length > 0)\n      .map(Number);\n  }\n  return [];\n}\n\nconst NUM_SEGMENTS = 4; // Number of wall segments per side (tweak as you like)\nconst table = data.series[0];\nconst fields = table.fields;\n\nconst bprices = fields.find(f => f.name === \"bprices\");\nconst bcumvolumes = fields.find(f => f.name === \"bcumvolumes\");\nconst bvolumes = fields.find(f => f.name === \"bvolumes\");\nconst aprices = fields.find(f => f.name === \"aprices\");\nconst acumvolumes = fields.find(f => f.name === \"acumvolumes\");\nconst avolumes = fields.find(f => f.name === \"avolumes\");\n\nif (!bprices || !bcumvolumes || !aprices || !acumvolumes) {\n  throw new Error(\"Missing required array fields\");\n}\n\nconst bps = parseArray(bprices.values.get(0));\nconst bvs = parseArray(bcumvolumes.values.get(0));\nconst brs = bvolumes ? parseArray(bvolumes.values.get(0)) : [];\nconst aps = parseArray(aprices.values.get(0));\nconst avs = parseArray(acumvolumes.values.get(0));\nconst ars = avolumes ? parseArray(avolumes.values.get(0)) : [];\n\nconst bids = [];\nfor (let i = 0; i < Math.min(bps.length, bvs.length); i++) {\n  bids.push({ x: bps[i], y: bvs[i], raw: brs[i] ?? null });\n}\n\nconst asks = [];\nfor (let i = 0; i < Math.min(aps.length, avs.length); i++) {\n  asks.push({ x: aps[i], y: avs[i], raw: ars[i] ?? null });\n}\n\nbids.sort((a, b) => b.x - a.x);\nasks.sort((a, b) => a.x - b.x);\n\nconst bestBid = bids[0]?.x ?? 0;\nconst bestAsk = asks[0]?.x ?? 0;\nconst mid = (bestBid + bestAsk) / 2;\nif (bids.length > 0 && asks.length > 0) {\n  const bidY = bids[0].y;\n  const askY = asks[0].y;\n  const midY = Math.min(bidY, askY);\n  bids.unshift({ x: mid, y: midY });\n  asks.unshift({ x: mid, y: midY });\n  bids.push({ x: bids[bids.length - 1].x - 0.0001, y: 0 });\n  asks.push({ x: asks[asks.length - 1].x + 0.0001, y: 0 });\n}\n\n// --- SEGMENTED WALL LOGIC ---\nfunction segmentedWalls(levels, nSegments) {\n  const N = levels.length;\n  if (N === 0) return [];\n  const result = [];\n  const segSize = Math.floor(N / nSegments);\n\n  for (let seg = 0; seg < nSegments; seg++) {\n    const start = seg * segSize;\n    const end = seg === nSegments - 1 ? N : (seg + 1) * segSize;\n    let maxIdx = -1, maxRaw = -Infinity;\n    for (let i = start; i < end; i++) {\n      if (levels[i]?.raw !== undefined && levels[i].raw > maxRaw) {\n        maxRaw = levels[i].raw;\n        maxIdx = i;\n      }\n    }\n    if (maxIdx >= 0) result.push(levels[maxIdx]);\n  }\n  return result;\n}\n\nconst topBids = segmentedWalls(bids, NUM_SEGMENTS);\nconst topAsks = segmentedWalls(asks, NUM_SEGMENTS);\n\nconst wallLines = [...topBids, ...topAsks].map(wall => ({\n  type: \"line\",\n  x0: wall.x,\n  x1: wall.x,\n  y0: 0,\n  y1: 1,\n  xref: \"x\",\n  yref: \"paper\",\n  line: {\n    color: \"yellow\",\n    width: 1,\n    dash: \"dot\"\n  }\n}));\n\nconst wallLabels = [...topBids, ...topAsks].map(wall => ({\n  x: wall.x,\n  y: 1.02,\n  xref: \"x\",\n  yref: \"paper\",\n  text: wall.x.toFixed(5),\n  showarrow: false,\n  font: { color: \"yellow\", size: 10 }\n}));\n\nconst minX = Math.min(...bids.map(b => b.x), ...asks.map(a => a.x), mid);\nconst maxX = Math.max(...bids.map(b => b.x), ...asks.map(a => a.x), mid);\nconst pad = (maxX - minX) * 0.01; // 1% padding\n\nreturn {\n  data: [\n    {\n      name: \"Bids\",\n      x: bids.map(pt => pt.x),\n      y: bids.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(0,255,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(0,255,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    },\n    {\n      name: \"Asks\",\n      x: asks.map(pt => pt.x),\n      y: asks.map(pt => pt.y),\n      mode: \"lines\",\n      fill: \"tozeroy\",\n      fillcolor: \"rgba(255,0,0,0.2)\",\n      line: { shape: \"hv\", color: \"rgba(255,0,0,0.7)\", width: 2 },\n      type: \"scatter\",\n      hovertemplate: \"Price: %{x}<br>CumVol: %{y}<extra></extra>\"\n    }\n  ],\n  layout: {\n    plot_bgcolor: \"black\",\n    paper_bgcolor: \"black\",\n    font: { color: \"white\" },\n    xaxis: {\n      title: \"Price\",\n      type: \"linear\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false,\n      range: [minX - pad, maxX + pad] // this forces the mid to be visible\n    },\n    yaxis: {\n      title: \"Cumulative Volume\",\n      type: \"log\",\n      showgrid: true,\n      gridcolor: \"rgba(255,255,255,0.1)\",\n      zeroline: false\n    },\n    margin: { t: 20, l: 40, r: 10, b: 30 },\n    shapes: [\n      {\n        type: \"line\",\n        x0: mid,\n        x1: mid,\n        y0: 0,\n        y1: 1,\n        xref: \"x\",\n        yref: \"paper\",\n        line: {\n          color: \"white\",\n          width: 1,\n          dash: \"dot\"\n        }\n      },\n      ...wallLines\n    ],\n    annotations: wallLabels,\n    legend: {\n      orientation: \"h\",\n      x: 0.5,\n      xanchor: \"center\",\n      y: -0.3\n    }\n  }\n};"
       },
       "pluginVersion": "0.5.0",
       "repeat": "SYMBOL",
@@ -177,7 +180,7 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "WITH snapshot AS (\n  SELECT timestamp, bids, asks\n  FROM market_data\n  WHERE $__timeFilter(timestamp) and  symbol = '${SYMBOL}'\n  ORDER BY timestamp DESC\n  LIMIT 1\n),\nbid_levels AS (\n  SELECT timestamp, 'bid' AS side, bids[1,1] AS price, bids[2,1] AS volume FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,2], bids[2,2] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,3], bids[2,3] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,4], bids[2,4] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,5], bids[2,5] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,6], bids[2,6] FROM snapshot\n  UNION ALL SELECT timestamp, 'bid', bids[1,7], bids[2,7] FROM snapshot\n),\nask_levels AS (\n  SELECT timestamp, 'ask' AS side, asks[1,1] AS price, asks[2,1] AS volume FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,2], asks[2,2] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,3], asks[2,3] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,4], asks[2,4] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,5], asks[2,5] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,6], asks[2,6] FROM snapshot\n  UNION ALL SELECT timestamp, 'ask', asks[1,7], asks[2,7] FROM snapshot\n),\nbid_cum AS (\n  SELECT\n    timestamp,\n    side,\n    price,\n    volume,\n    SUM(volume) OVER (ORDER BY price DESC) AS cum_volume\n  FROM bid_levels\n  WHERE price IS NOT NULL\n),\nask_cum AS (\n  SELECT\n    timestamp,\n    side,\n    price,\n    volume,\n    SUM(volume) OVER (ORDER BY price ASC) AS cum_volume\n  FROM ask_levels\n  WHERE price IS NOT NULL\n)\nSELECT * FROM bid_cum\nUNION ALL\nSELECT * FROM ask_cum\nORDER BY side, price;\n",
+          "rawSql": "WITH snapshot AS (\n  SELECT timestamp, bids, asks\n  FROM market_data\n  WHERE $__timeFilter(timestamp) and  symbol = '${SYMBOL}'\n  ORDER BY timestamp DESC\n  LIMIT 1\n)\nSELECT timestamp, bids[1] as bprices, bids[2] as bvolumes, array_cum_sum(bids[2]) as bcumvolumes,asks[1] as aprices, asks[2] as avolumes, array_cum_sum(asks[2]) as acumvolumes from snapshot;\n",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -205,7 +208,7 @@
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
       },
-      "description": "Compares the best bid in the order book (from L2 market data) using an ASOF JOIN against the corresponding \u201ccore\u201d quote price from upstream sources (e.g., ECNs). Then it finds at which level we could trade the core price bid volume. If no matching level is found, Level and Price will be empty. This table helps detect price alignment issues, latency, or anomalies between your live order book and reference prices provided by liquidity venues.",
+      "description": "Compares the best bid in the order book (from L2 market data) using an ASOF JOIN against the corresponding \u201ccore\u201d quote price from upstream sources (e.g., ECNs). This table helps detect price alignment issues, latency, or anomalies between your live order book and reference prices provided by liquidity venues.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -226,8 +229,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -250,13 +252,6 @@
               {
                 "id": "custom.width",
                 "value": 180
-              },
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f894d",
-                  "mode": "fixed"
-                }
               }
             ]
           },
@@ -271,14 +266,8 @@
                 "value": 200
               },
               {
-                "id": "custom.width"
-              },
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f894d",
-                  "mode": "fixed"
-                }
+                "id": "custom.width",
+                "value": 180
               }
             ]
           },
@@ -290,18 +279,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 20
-              },
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f8980",
-                  "mode": "fixed"
-                }
-              },
-              {
-                "id": "noValue",
-                "value": "-"
+                "value": 55
               }
             ]
           },
@@ -312,18 +290,8 @@
             },
             "properties": [
               {
-                "id": "custom.width"
-              },
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f89bf",
-                  "mode": "fixed"
-                }
-              },
-              {
-                "id": "noValue",
-                "value": "-"
+                "id": "custom.width",
+                "value": 60
               },
               {
                 "id": "decimals",
@@ -338,71 +306,12 @@
             },
             "properties": [
               {
-                "id": "custom.width"
-              },
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f8980",
-                  "mode": "fixed"
-                }
+                "id": "custom.width",
+                "value": 80
               },
               {
                 "id": "decimals",
                 "value": 5
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Volume"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f89",
-                  "mode": "fixed"
-                }
-              },
-              {
-                "id": "unit",
-                "value": "short"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Bid_Volume"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f89bf",
-                  "mode": "fixed"
-                }
-              },
-              {
-                "id": "unit",
-                "value": "short"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "ECN"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#692f89",
-                  "mode": "fixed"
-                }
               }
             ]
           }
@@ -428,7 +337,7 @@
         },
         "showHeader": true
       },
-      "pluginVersion": "10.4.1",
+      "pluginVersion": "11.6.0",
       "targets": [
         {
           "datasource": {
@@ -445,13 +354,13 @@
             }
           },
           "queryType": "sql",
-          "rawSql": "WITH p AS (\n  SELECT\n    timestamp,\n    bid_price,\n    bid_volume,\n    symbol,\n    ecn\n  FROM core_price\n  WHERE $__timeFilter(timestamp) AND symbol = '${SYMBOL}'\n  LIMIT -6\n), levels AS (\n  SELECT\n    market_data.timestamp AS md_timestamp,\n    insertion_point(bids [ 2 ], bid_volume) AS level,\n    bids [ 1 ] [ insertion_point(bids [ 2 ], bid_volume) ] AS price,\n    bids [ 2 ] [ insertion_point(bids [ 2 ], bid_volume) ] AS volume,\n    p.timestamp,\n    p.bid_price,\n    p.bid_volume AS bid_volume,\n    p.ecn\n  FROM p ASOF JOIN market_data ON symbol\n)\nSELECT\n  md_timestamp AS MarketData_Time,\n  CASE WHEN price IS null THEN null ELSE level end AS Level,\n  Price,\n  Volume,\n  timestamp AS CorePrice_Time,\n  bid_price AS Bid_Price,\n  bid_volume1 AS Bid_Volume,\n  ecn AS ECN\nFROM levels;",
+          "rawSql": "with p as (select timestamp, bid_price, bid_volume, symbol, ecn  from core_price where $__timeFilter(timestamp) and symbol = '${SYMBOL}' limit -6), levels as (\n        select market_data.timestamp as md_timestamp, insertion_point(bids[2], bid_volume) as level, bids[1][insertion_point(bids[2], bid_volume)] as price, bids[2][insertion_point(bids[2], bid_volume)] as volume, \n         p.timestamp, p.bid_price, p.bid_volume as bid_volume,p.ecn from p asof join market_data on symbol\n\n         )\n         select md_timestamp as MarketData_Time, case when price is null then null else level end as Level, Price, Volume, timestamp as CorePrice_Time, bid_price as Bid_Price, bid_volume1 as Bid_Volume, ecn as ECN from levels;",
           "refId": "A",
           "selectedFormat": 1
         }
       ],
       "timeFrom": "1m",
-      "title": "Top-of-book Levels vs Core Price - ${SYMBOL}",
+      "title": "Top-of-book Price vs Core Price - ${SYMBOL}",
       "transparent": true,
       "type": "table"
     },
@@ -473,6 +382,7 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
@@ -506,8 +416,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -527,7 +436,7 @@
       "id": 4,
       "options": {
         "candleStyle": "candles",
-        "colorStrategy": "open-close",
+        "colorStrategy": "close-close",
         "colors": {
           "down": "light-blue",
           "up": "semi-dark-purple"
@@ -541,10 +450,8 @@
         },
         "includeAllFields": false,
         "legend": {
-          "calcs": [
-            "last"
-          ],
-          "displayMode": "table",
+          "calcs": [],
+          "displayMode": "list",
           "placement": "bottom",
           "showLegend": false
         },
@@ -752,6 +659,7 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
             "fillOpacity": 0,
             "gradientMode": "none",
@@ -784,8 +692,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
