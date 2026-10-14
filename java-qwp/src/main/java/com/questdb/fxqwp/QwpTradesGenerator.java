@@ -877,23 +877,27 @@ public final class QwpTradesGenerator {
 
     private Thread startThroughputSampler(List<Long> perSecond) {
         Thread t = new Thread(() -> {
-            long lastT = 0, lastMd = 0, lastCp = 0, sec = 0;
+            long lastT = 0, lastMd = 0, lastCp = 0, lastFw = 0, sec = 0;
             try {
                 while (running.get()) {
                     Thread.sleep(1000);
                     long nowT = tradesRows.get();
                     long nowMd = mdRows.get();
                     long nowCp = coreRows.get();
+                    long nowFw = fwdRows.get();
                     long dT = nowT - lastT;
                     long dMd = nowMd - lastMd;
                     long dCp = nowCp - lastCp;
+                    long dFw = nowFw - lastFw;
                     lastT = nowT;
                     lastMd = nowMd;
                     lastCp = nowCp;
+                    lastFw = nowFw;
                     sec++;
-                    perSecond.add(dT + dMd + dCp);
-                    System.out.printf("[rate] t=%ds  trades %,d/s  md %,d/s  core %,d/s  (total %,d/s)%n",
-                            sec, dT, dMd, dCp, dT + dMd + dCp);
+                    perSecond.add(dT + dMd + dCp + dFw);
+                    String fw = cfg.forwards ? String.format("  fwd %,d/s", dFw) : "";
+                    System.out.printf("[rate] t=%ds  trades %,d/s  md %,d/s  core %,d/s%s  (total %,d/s)%n",
+                            sec, dT, dMd, dCp, fw, dT + dMd + dCp + dFw);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -912,7 +916,7 @@ public final class QwpTradesGenerator {
     private Thread startHeartbeat() {
         Thread t = new Thread(() -> {
             long lastMs = System.currentTimeMillis();
-            long lastT = 0, lastMd = 0, lastCp = 0, elapsed = 0;
+            long lastT = 0, lastMd = 0, lastCp = 0, lastFw = 0, elapsed = 0;
             try {
                 while (running.get()) {
                     long target = 10_000, slept = 0;
@@ -929,7 +933,7 @@ public final class QwpTradesGenerator {
                     if (dt <= 0) {
                         dt = 1;
                     }
-                    long nowT = tradesRows.get(), nowMd = mdRows.get(), nowCp = coreRows.get();
+                    long nowT = tradesRows.get(), nowMd = mdRows.get(), nowCp = coreRows.get(), nowFw = fwdRows.get();
                     elapsed += Math.round(dt);
                     StringBuilder sb = new StringBuilder();
                     sb.append("[hb] t=").append(elapsed).append("s ");
@@ -943,16 +947,17 @@ public final class QwpTradesGenerator {
                         sb.append(String.format("  core %,d/s (%,d)", Math.round((nowCp - lastCp) / dt), nowCp));
                     }
                     if (cfg.forwards) {
-                        sb.append(String.format("  fwd (%,d)", fwdRows.get()));
+                        sb.append(String.format("  fwd %,d/s (%,d)", Math.round((nowFw - lastFw) / dt), nowFw));
                     }
-                    long totDelta = (nowT - lastT) + (nowMd - lastMd) + (nowCp - lastCp);
-                    long totRows = nowT + nowMd + nowCp;
+                    long totDelta = (nowT - lastT) + (nowMd - lastMd) + (nowCp - lastCp) + (nowFw - lastFw);
+                    long totRows = nowT + nowMd + nowCp + nowFw;
                     sb.append(String.format("  total %,d/s (%,d)", Math.round(totDelta / dt), totRows));
                     System.out.println(sb);
                     lastMs = now;
                     lastT = nowT;
                     lastMd = nowMd;
                     lastCp = nowCp;
+                    lastFw = nowFw;
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
