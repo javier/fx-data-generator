@@ -11,11 +11,13 @@ from multiprocessing import Event
 import numpy as np
 import pandas as pd
 import datetime
+import questdb
 from questdb import Sender, TimestampNanos
 import psycopg as pg
 import yfinance as yf
 import hashlib
 import uuid
+import contextlib
 
 # QWP/WebSocket caps each encoded message (one flush frame) at ~2 MiB. A flush over
 # that raises "encoded message size ... exceeds maximum configured allowed size" AND
@@ -323,10 +325,16 @@ class SortedEmitter:
       per-event arrays), so the per-row numpy copies are gone.
     - Rows are accumulated column-wise so the flush can hand contiguous columns
       straight to pandas without per-row dict churn.
+
+    QWP is different: the sender is a PooledSender from questdb.connect(), which gives
+    multi-host failover and store-and-forward. Pooled dataframe() bypasses
+    store-and-forward, so QWP flushes write rows with row() instead (_send_rows); the
+    pool's auto-flush keeps every frame under the server's frame cap.
     """
 
     def __init__(self, sender, buffer_limit, suffix, no_market_data=False):
         self.sender = sender
+        self.pooled = isinstance(sender, questdb.PooledSender)
         self.buffer_limit = buffer_limit
         self.suffix = suffix
         # When market_data is disabled it no longer drives _flush_md (which used to flush
@@ -420,6 +428,22 @@ class SortedEmitter:
                 self.sender.flush()
                 staged = 0
 
+    # --- QWP pooled send: one row() per row, through store-and-forward --- #
+    def _send_rows(self, table, ts, symbols, columns):
+        """ts: int64 ns timestamps. symbols / columns: name -> per-row Python values
+        (lists, so numpy scalars are already plain int / float). The pool auto-flushes
+        by rows, time and the server frame cap; the final flush publishes the rest
+        without waiting for the ack."""
+        row = self.sender.row
+        sym_items = list(symbols.items())
+        col_items = list(columns.items())
+        for i, t in enumerate(ts.tolist()):
+            row(table,
+                symbols={k: v[i] for k, v in sym_items},
+                columns={k: v[i] for k, v in col_items},
+                at=TimestampNanos(t))
+        self.sender.flush()
+
     # --- Flush methods --- #
     def _flush_md(self):
         b = self._md
@@ -428,6 +452,17 @@ class SortedEmitter:
         # Order-book rows carry two DOUBLE[][] arrays; per-row size grows with depth,
         # so size the frame budget from the widest book in this batch.
         maxlv = max(a.shape[1] for a in b["bids"])
+        if self.pooled:
+            self._send_rows(table_name("market_data", self.suffix),
+                            np.asarray(b["ts"], dtype=np.int64),
+                            {"symbol": b["symbol"]},
+                            {"bids": b["bids"], "asks": b["asks"],
+                             "best_bid": b["best_bid"], "best_ask": b["best_ask"]})
+            for v in b.values():
+                v.clear()
+            self._flush_cp()
+            self._flush_tr()
+            return
         df = pd.DataFrame({
             "symbol": pd.Categorical(b["symbol"]),
             "bids": b["bids"],
@@ -451,6 +486,22 @@ class SortedEmitter:
             return
         cols = list(zip(*self._cp_chunks))
         cat = lambda i: cols[i][0] if len(cols[i]) == 1 else np.concatenate(cols[i])
+        if self.pooled:
+            self._send_rows(table_name("core_price", self.suffix),
+                            cat(0).astype(np.int64, copy=False),
+                            {"symbol": cat(1).tolist(), "ecn": cat(2).tolist(),
+                             "reason": cat(3).tolist()},
+                            {"bid_price": cat(4).astype(np.float64, copy=False).tolist(),
+                             "bid_volume": cat(5).astype(np.int64).tolist(),
+                             "ask_price": cat(6).astype(np.float64, copy=False).tolist(),
+                             "ask_volume": cat(7).astype(np.int64).tolist(),
+                             "indicator1": cat(8).astype(np.float64, copy=False).tolist(),
+                             "indicator2": cat(9).astype(np.float64, copy=False).tolist()})
+            self._cp_chunks = []
+            self._cp_n = 0
+            if self.no_market_data:
+                self._flush_tr()
+            return
         df = pd.DataFrame({
             "symbol": pd.Categorical(cat(1)),
             "ecn": pd.Categorical(cat(2)),
@@ -475,6 +526,19 @@ class SortedEmitter:
     def _flush_tr(self):
         b = self._tr
         if not b["ts"]:
+            return
+        if self.pooled:
+            self._send_rows(table_name("fx_trades", self.suffix),
+                            np.asarray(b["ts"], dtype=np.int64),
+                            {"symbol": b["symbol"], "ecn": b["ecn"], "side": b["side"],
+                             "counterparty": b["counterparty"]},
+                            {"trade_id": b["trade_id"],
+                             "passive": [bool(x) for x in b["passive"]],
+                             "price": [float(x) for x in b["price"]],
+                             "quantity": [float(x) for x in b["quantity"]],
+                             "order_id": b["order_id"]})
+            for v in b.values():
+                v.clear()
             return
         df = pd.DataFrame({
             "symbol": pd.Categorical(b["symbol"]),
@@ -517,6 +581,16 @@ class SortedEmitter:
             ask[i:i + k] = ap
             spot[i:i + k] = sr
             i += k
+        if self.pooled:
+            self._send_rows(table_name("fx_forward_points", self.suffix), ts,
+                            {"symbol": symbol, "tenor": tenor, "source": ["FWD_FEED"] * n},
+                            {"tenor_days": tenor_days.tolist(),
+                             "value_date": [TimestampNanos(v) for v in value_date.tolist()],
+                             "bid_points": bid.tolist(), "ask_points": ask.tolist(),
+                             "spot_ref": spot.tolist()})
+            self._fw_chunks = []
+            self._fw_n = 0
+            return
         df = pd.DataFrame({
             "symbol": pd.Categorical(symbol),
             "tenor": pd.Categorical(tenor),
@@ -556,6 +630,16 @@ def qwp_addr_list(host, default_port=9000):
             continue
         out.append(h if ":" in h else f"{h}:{default_port}")
     return ",".join(out)
+
+def qwp_base_conf(args):
+    """Scheme, addr list, token and TLS shared by every QWP connection (ingest and reads)."""
+    scheme = "wss" if args.qwp_tls else "ws"
+    conf = f"{scheme}::addr={qwp_addr_list(args.host)};"
+    if args.token:
+        conf += f"token={args.token};"
+    if args.qwp_tls:
+        conf += "tls_verify=unsafe_off;"
+    return conf
 
 def pg_host(host):
     """First bare hostname from --host (strip :port and any extra hosts).
@@ -1707,20 +1791,17 @@ def ingest_worker(
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;auto_flush_interval={auto_flush_interval};" if not args.token else f"https::addr={args.host}:9000;token={args.token};tls_verify=unsafe_off;auto_flush_interval={auto_flush_interval};"
     elif args.protocol == "qwp":
-        # QWP/WebSocket. Same Sender.from_conf() + dataframe() API as ILP; only the conf
-        # differs. QWP has its own versioning, so protocol_version is NOT set (it errors on
-        # QWP). Each worker gets a unique sender_id + store-and-forward dir so un-acked frames
-        # survive reconnects/failover without colliding between processes.
-        scheme = "wss" if args.qwp_tls else "ws"
+        # QWP/WebSocket through questdb.connect(): the pool fails over across the addr list
+        # to the new primary and replays store-and-forward frames on its own. A standalone
+        # Sender drives one connection and stops on a replica ("role mismatch"). QWP has its
+        # own versioning, so protocol_version is NOT set (it errors on QWP). Each worker gets
+        # a unique sender_id + store-and-forward dir so un-acked frames survive reconnects
+        # and failover without colliding between processes. Pool auto-flush stays on (its
+        # defaults), so frames never exceed the server's frame cap.
         sender_id = f"fx-{process_idx}"
         sf_dir = os.path.join(args.store_forward_dir, sender_id)
         os.makedirs(sf_dir, exist_ok=True)
-        # --host may be a comma-separated host:port list for multi-host HA failover.
-        parts = [f"{scheme}::addr={qwp_addr_list(args.host)};", "auto_flush=off;"]
-        if args.token:
-            parts.append(f"token={args.token};")
-        if args.qwp_tls:
-            parts.append("tls_verify=unsafe_off;")
+        parts = [qwp_base_conf(args)]
         parts.append(f"sender_id={sender_id};")
         parts.append(f"sf_dir={sf_dir};")
         parts.append("reconnect_max_duration_millis=300000;")
@@ -1760,7 +1841,12 @@ def ingest_worker(
         fwd_model = ForwardsModel(args.metals, fwd_rng, time.time_ns(), parse_bad_point_utc(args.bad_point_utc))
         fwd_cursor = None
 
-    with Sender.from_conf(conf) as sender:
+    with contextlib.ExitStack() as stack:
+        if args.protocol == "qwp":
+            db = stack.enter_context(questdb.connect(conf))
+            sender = stack.enter_context(db.sender())
+        else:
+            sender = stack.enter_context(Sender.from_conf(conf))
         emitter = SortedEmitter(sender, buffer_limit=buffer_limit, suffix=args.suffix,
                                 no_market_data=args.no_market_data)
         wall_start = None  # for real-time alignment
@@ -1888,11 +1974,11 @@ def ingest_worker(
                 sec_idx += 1
             emitter.flush_all()
 
-        # QWP/WebSocket: drain outstanding store-and-forward frames (wait for acks)
-        # before the sender closes, so a clean exit does not lose buffered rows.
+        # QWP/WebSocket: publish the rest and wait for the server acks before the lease
+        # and pool close, so a clean exit does not lose buffered rows.
         if args.protocol == "qwp":
             emitter.flush_all()
-            sender.close_drain()
+            sender.flush(wait=True)
 
     # ... main event loop ends here ...
 
@@ -1916,16 +2002,34 @@ def wal_monitor(args, pause_event, threshold, suffix='', interval=5, shutdown_ev
     _ignore_sigint()
     import time
     import psycopg as pg
-    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     last_logged_paused = False
 
     # Watch the busiest table for WAL lag: market_data normally, core_price when it is disabled.
     mon_table = table_name('core_price' if getattr(args, "no_market_data", False) else 'market_data', suffix)
+    sql = f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'"
     print(f"[WAL MONITOR] Watching {mon_table} with lag threshold {threshold}")
-    with pg.connect(conn_str, autocommit=True) as conn:
+    with contextlib.ExitStack() as stack:
+        if args.protocol == "qwp":
+            # QWP reads go through the pool across the whole --host list. target=primary
+            # keeps them on the node that is ingesting; through a failover each query
+            # retries until a new primary answers, within the same 5-minute budget as
+            # ingest reconnects (attempts set high so the time budget is the real limit).
+            db = stack.enter_context(questdb.connect(
+                qwp_base_conf(args) + "target=primary;"
+                "failover_max_duration_ms=300000;failover_max_attempts=1000;"))
+
+            def fetch_row():
+                df = db.query(sql).to_pandas()
+                return (int(df.iat[0, 0]), int(df.iat[0, 1])) if len(df) else None
+        else:
+            conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
+            conn = stack.enter_context(pg.connect(conn_str, autocommit=True))
+
+            def fetch_row():
+                return conn.execute(sql).fetchone()
+
         while not _shutting_down(shutdown_event):
-            cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'")
-            row = cur.fetchone()
+            row = fetch_row()
             if row:
                 seq, wrt = row
                 lag = seq - wrt
