@@ -1807,6 +1807,11 @@ def ingest_worker(
         parts.append("reconnect_max_duration_millis=300000;")
         parts.append("reconnect_initial_backoff_millis=100;")
         parts.append("reconnect_max_backoff_millis=5000;")
+        # Published-but-unacked frame window (default 128). The real-time loop publishes
+        # several small frames per slice, so during a primary outage 128 fills in seconds
+        # and flush fails with "timed out waiting for local queue capacity" after 30 s.
+        # 4096 rode out a 4-minute outage at the live demo rates with no lost seconds.
+        parts.append("max_in_flight=4096;")
         if args.durable_ack:
             parts.append("request_durable_ack=on;")
         conf = "".join(parts)
