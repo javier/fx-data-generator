@@ -434,17 +434,46 @@ watching `market_data` (or `core_price`) as before.
 
 ## Demo dashboards
 
-- **Spot only:** `grafana_dashboard.json` ("FX Orderbook - Realtime Demo"), with both flags off.
-- **Spot plus forwards:** `fx_forwards_grafana_dashboard.json` ("FX and Metals: Spot and
-  Forwards"), with `--metals true --forwards true` and XAUUSD selected. It reuses the first
+Two dashboards, each available as a native QuestDB Web Console notebook and as a Grafana
+dashboard:
+
+- **FX Orderbook - Realtime Demo**: spot only, with both flags off.
+- **FX and Metals: Spot and Forwards**: spot plus forwards and swaps, with
+  `--metals true --forwards true` and XAUUSD selected. It needs `market_data` and its views, so
+  it is not for two-table mode (`--market_data_processes 0`).
+
+### QuestDB Web Console (no Grafana needed)
+
+Native QuestDB dashboards, built as Web Console notebooks. They need **QuestDB 10.0 or later,
+or QuestDB Enterprise 4.0 or later**. Import the file in the Web Console:
+
+- `questdb-fx-orderbook-realtime-demo-dashboard.json`: FX Orderbook - Realtime Demo
+- `questdb-fx-and-metals-spots-and-forwards-dashboard.json`: FX and Metals: Spot and Forwards
+
+They use notebook variables instead of a pair selector and time picker: `@symbol` (EURUSD and
+XAUUSD by default) and `@asof` (`now()`). Change `@symbol` to switch pairs, or set `@asof` to a
+past instant (for example inside 09:20 to 09:40 UTC) to replay it and see the planted bad point
+in the consistency cell. They refresh every 250 ms by default; some cells use a slower refresh of
+their own. Each cell's window, logic, formatting and the differences from Grafana are documented
+in [docs/questdb-console-dashboards.md](docs/questdb-console-dashboards.md).
+
+![FX Orderbook - Realtime Demo in the QuestDB Web Console](docs/images/fx-orderbook-dashboard.png)
+
+![FX and Metals: Spot and Forwards in the QuestDB Web Console](docs/images/fx-metals-dashboard.png)
+
+### Grafana
+
+- `grafana_dashboard.json`: FX Orderbook - Realtime Demo.
+- `fx_forwards_grafana_dashboard.json`: FX and Metals: Spot and Forwards. It reuses the first
   dashboard's Market Depth, top-of-book and 1-minute OHLC panels unchanged (and its 250 ms
-  refresh), so spot looks and ticks the same; then a Forwards row (the curve with outrights
-  and implied rates; every 3M ladder of the last 15 minutes against the spot it was priced on;
-  the triangular consistency gap per tenor) and a Swaps row (the swap ladder from spot with
-  implied swap rates and far-leg outrights). It needs
-  `market_data` and its views, so it is not for two-table mode (`--market_data_processes 0`).
-  The consistency panel reads the latest complete minute of the selected time range: set the
-  range to end inside 09:20 to 09:40 UTC to see the planted bad point turn a bar red.
+  refresh), so spot looks and ticks the same; then a Forwards row (the curve with outrights and
+  implied rates; every 3M ladder of the last 15 minutes against the spot it was priced on; the
+  triangular consistency gap per tenor) and a Swaps row (the swap ladder from spot with implied
+  swap rates and far-leg outrights). The consistency panel reads the latest complete minute of
+  the selected time range: set the range to end inside 09:20 to 09:40 UTC to see the planted
+  bad point turn a bar red.
+
+Both are exported with the datasource as an input: pick your QuestDB datasource on import.
 
 ---
 
