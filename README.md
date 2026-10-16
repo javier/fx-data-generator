@@ -499,6 +499,10 @@ indicators). The forward curve, swap ladder and consistency panel follow the pic
 Refresh is 250 ms. Each panel's window, query and display are documented in
 [docs/grafana-dashboards.md](docs/grafana-dashboards.md).
 
+![FX Orderbook - Realtime Demo in Grafana](docs/images/grafana-fx-orderbook-dashboard.png)
+
+![FX and Metals: Spot and Forwards in Grafana](docs/images/grafana-fx-metals-dashboard.png)
+
 ---
 
 ## Docker Support
