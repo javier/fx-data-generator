@@ -15,7 +15,7 @@ Python real-time with either layer on (run both engines with the same flags).
 
 Designed for **stress testing**, **benchmarking**, and **live demo scenarios**, it supports both wall-clock-paced ("real-time") and maximum-throughput ("faster-than-life") simulation with multi-process orchestration, pip-accurate pricing, WAL backpressure detection, and robust state management.
 
-> **Java sibling (QWP):** [`java-qwp/`](java-qwp/README.md) is a Java generator that ingests the **same three tables and the same materialized views** over QuestDB's QWP (WebSocket) protocol. This Python generator is authoritative; the two are **dataset-compatible** — run the Java one with `--prefix none` and matching EPS flags and you can backfill with one and continue (or go live) with the other on the same tables. See its README for the interchangeability runbook.
+> **Java sibling (QWP):** [`java-qwp/`](java-qwp/README.md) is a Java generator that ingests the **same tables (including `fx_forward_points` with `--forwards true`) and the same materialized views** over QuestDB's QWP (WebSocket) protocol. This Python generator is authoritative; the two are **dataset-compatible**: run the Java one with `--prefix none` and matching EPS flags and you can backfill with one and continue (or go live) with the other on the same tables. See its README for the interchangeability runbook.
 
 ---
 
@@ -23,10 +23,11 @@ Designed for **stress testing**, **benchmarking**, and **live demo scenarios**, 
 
 ### Data Generation
 
-- **Three-Table Architecture:**
+- **Three-Table Architecture, plus optional forwards:**
   - **`market_data`**: Multi-level orderbook snapshots (bids/asks at 3-50 levels) at 1,200-15,000 events/sec
-  - **`core_price`**: Best bid/offer snapshots with ECN, reason codes, and technical indicators at 700-1,100 events/sec
+  - **`core_price`**: Best bid/offer snapshots with ECN, reason codes, and technical indicators at 700-1,000 events/sec
   - **`fx_trades`**: Realistic trade executions (5-30 orders/sec) with partial fills, level walking, and counterparty LEIs
+  - **`fx_forward_points`** (with `--forwards true`): forward point ladders, 10 tenors per pair every 5 seconds (16 rows/sec for the 8 FX pairs, 26 with `--metals true`)
 
 - **Realistic Order Execution:**
   - Orders execute against actual orderbook liquidity
@@ -54,7 +55,7 @@ Designed for **stress testing**, **benchmarking**, and **live demo scenarios**, 
   - Intra-second price interpolation for smooth OHLC bars
   - `close(second N)` always equals `open(second N+1)`
   - Trades timestamped after their source orderbook snapshot (ASOF join compatible)
-  - All three tables flush synchronously for dashboard consistency
+  - All tables flush together for dashboard consistency (`fx_forward_points` flushes with `core_price`)
 
 ### Performance & Reliability
 
@@ -74,8 +75,8 @@ Designed for **stress testing**, **benchmarking**, and **live demo scenarios**, 
   - Supports continuous/incremental data generation
 
 - **Materialized Views Auto-Setup:**
-  - Creates OHLC views at multiple time granularities (1s, 1m, 15m, 1d)
-  - Separate views for `core_price` and `market_data` aggregations
+  - Creates 11 views: OHLC and BBO at 1s to 1d granularities for `core_price`, `market_data` and `fx_trades`
+  - Plus `fx_forward_points_1m` with `--forwards true` (12 views); see [Materialized Views](#materialized-views)
   - Optional TTLs for demo environments
 
 ---
@@ -108,7 +109,7 @@ reason SYMBOL  -- normal, news_event, liquidity_event
 indicator1 DOUBLE
 indicator2 DOUBLE
 ```
-**Volume:** 700-1,100 events/second
+**Volume:** 700-1,000 events/second
 
 ### `fx_trades`
 Executed trades with nanosecond precision:
@@ -149,16 +150,16 @@ source SYMBOL      -- FWD_FEED
 
 | Argument                     | Type      | Default       | Description                                                                                    |
 |------------------------------|-----------|---------------|------------------------------------------------------------------------------------------------|
-| `--host`                     | str       | `127.0.0.1`   | Host/IP of QuestDB. For QWP, a comma-separated `host:port` list enables multi-host HA failover (a bare host gets `:9000`). DDL/metadata use the **first** entry, so list the writable primary first |
+| `--host`                     | str       | `127.0.0.1`   | Host/IP of QuestDB. For QWP, a comma-separated `host:port` list enables multi-host HA failover (a bare host gets `:9000`). DDL/metadata use the **first** entry, so list the writable primary first; the QWP WAL monitor reads from whichever node is primary |
 | `--pg_port`                  | str/int   | `8812`        | PostgreSQL port for QuestDB metadata queries                                                   |
 | `--user`                     | str       | `admin`       | Database user for metadata                                                                     |
 | `--password`                 | str       | `quest`       | Password for metadata                                                                          |
-| `--token`                    | str       | None          | ILP/QWP authentication token (JWK) for HTTP/HTTPS/QWP                                          |
+| `--token`                    | str       | None          | Authentication token: bearer token for HTTP/HTTPS and QWP, JWK private key `d` for TCPS        |
 | `--token_file`               | str       | None          | Read the token from this file (trimmed); overrides `--token`, keeps it off the command line    |
 | `--token_x`                  | str       | None          | JWK token X coordinate (for tcps)                                                              |
 | `--token_y`                  | str       | None          | JWK token Y coordinate (for tcps)                                                              |
 | `--ilp_user`                 | str       | `admin`       | ILP/HTTP ingestion user                                                                        |
-| `--protocol`                 | str       | `http`        | `http`, `tcp`, or `qwp` (QWP/WebSocket). `tcps`/`https` used automatically if a token is present |
+| `--protocol`                 | str       | `qwp`         | `qwp` (QWP/WebSocket on port 9000), `http` or `tcp`. `tcps`/`https` used automatically if a token is present; QWP uses `--qwp_tls` for TLS |
 | `--qwp_tls`                  | bool      | `false`       | QWP only: use `wss` (TLS) instead of `ws`, with `tls_verify=unsafe_off`                        |
 | `--durable_ack`              | bool      | `false`       | QWP only: `request_durable_ack=on` so a failover cannot lose acked-but-unreplicated rows (Enterprise) |
 | `--store_forward_dir`        | str       | `<tmp>/fx_qwp_sf` | QWP only: base dir for per-worker store-and-forward spill (each worker gets an `fx-<idx>` subdir) |
@@ -182,7 +183,8 @@ source SYMBOL      -- FWD_FEED
 | `--max_levels`               | int       | `40`          | Max orderbook levels                                                                           |
 | `--incremental`              | bool      | `false`       | Load last state from DB to continue appending (faster-than-life only)                          |
 | `--create_views`             | bool      | `true`        | Create materialized views if not present                                                       |
-| `--short_ttl`                | bool      | `false`       | Enforce TTLs on all tables (3 days for tables, 4 hours-1 month for views)                      |
+| `--short_ttl`                | bool      | `false`       | Enforce retention on all tables and views: `TTL 3 DAYS` on `market_data`, `core_price` and `fx_forward_points`, `TTL 1 MONTH` on `fx_trades`, 4 hours to 1 month on the views |
+| `--enterprise`               | bool      | `false`       | With `--short_ttl`: QuestDB Enterprise storage policy (`TO REMOTE`, `TO PARQUET`, `DROP LOCAL`) on the tables instead of a TTL. Views always use a TTL |
 | `--suffix`                   | str       | `""`          | Suffix to append to all table/view names                                                       |
 | `--yahoo_refresh_secs`       | int       | `300`         | Yahoo Finance bracket refresh interval (real-time mode only)                                   |
 | `--metals`                   | bool      | `false`       | Add XAUUSD, XAGUSD, XPTUSD, XPDUSD and XAUEUR to the pair universe. Total EPS is unchanged, so each FX pair gets 30/35 of its usual rows. See [Precious metals](#precious-metals) |
@@ -211,7 +213,7 @@ demos can push `core_price` EPS as high as they like.
 - Yahoo Finance refreshes price brackets every 5 minutes (configurable)
 - Single process only (`--processes 1`)
 - Runs indefinitely until stopped or `--total_market_data_events` reached
-- Ignores `--start_ts` (always starts from now)
+- Always starts from now: `--start_ts` is rejected with an error
 
 **Use cases:** Live demos, continuous data streams, dashboard testing
 
@@ -221,7 +223,7 @@ demos can push `core_price` EPS as high as they like.
 - Processes in chunks (default 15 min) to limit memory usage for long runs
 - Maintains OHLC continuity across chunk boundaries
 - Supports multiprocessing for parallel ingestion
-- Requires `--total_market_data_events` to be set
+- Stops at `--total_market_data_events` (default 1,000,000) or `--end_ts`, whichever comes first
 - Can use `--start_ts` and `--end_ts` for specific time ranges
 - Yahoo Finance queried once at startup (or bypassed if `--incremental`)
 
@@ -301,11 +303,18 @@ python fx_data_generator.py \
 ### QWP/WebSocket ingestion (multi-host HA)
 
 QWP rides the same port `9000`. Pass a comma-separated `host:port` `--host` for automatic
-failover across nodes: the client rotates to the writable primary and replays each
-worker's store-and-forward spool on reconnect (no need to re-point the generator when a
-replica is promoted). `--durable_ack true` guards against losing acked-but-unreplicated
-rows across a failover (Enterprise). DDL/metadata (PG-wire, port `8812`) use the **first**
-host, so list the primary first.
+failover across nodes. Each worker ingests through the client's connection pool
+(`questdb.connect()`), which follows the writable primary and replays the worker's
+store-and-forward spool on disk (`--store_forward_dir`) after reconnecting, so there is no
+need to re-point the generator when a replica is promoted. Rows go through `row()`, not
+dataframes, because QWP dataframe loads bypass store-and-forward. The in-flight frame window
+is raised to 4096 so a primary outage of a few minutes is queued instead of failing.
+The WAL monitor reads `wal_tables()` over QWP with `target=primary`, so it also follows the
+primary, and waits up to 5 minutes for a new one. `--durable_ack true` guards against losing
+acked-but-unreplicated rows across a failover (Enterprise).
+
+DDL, the latest-timestamp check and `--incremental` state loading still use PG-wire (port
+`8812`) on the **first** host, at startup only, so list the primary first.
 
 ```bash
 python fx_data_generator.py \
@@ -474,6 +483,16 @@ in [docs/questdb-console-dashboards.md](docs/questdb-console-dashboards.md).
   bad point turn a bar red.
 
 Both are exported with the datasource as an input: pick your QuestDB datasource on import.
+They need the QuestDB datasource plugin and, for Market Depth, the Plotly panel plugin.
+
+Pick the pair in the symbol dropdown at the top: it lists every pair with `core_price` data in
+the last 4 days (metals included). The first dashboard accepts several pairs and repeats its
+panels per pair; the second takes one, XAUUSD by default. The time picker defaults to the last
+6 hours, but most panels override it with their own short window ending now (10 minutes for
+depth, 1 minute for top of book and candles, 15 minutes for 3M points, today for the
+indicators). The forward curve, swap ladder and consistency panel follow the picker's end time.
+Refresh is 250 ms. Each panel's window, query and display are documented in
+[docs/grafana-dashboards.md](docs/grafana-dashboards.md).
 
 ---
 
@@ -485,10 +504,6 @@ Build and run via Docker:
 docker build -t fx-generator .
 
 docker run -e HOST=172.31.42.41 \
-           -e TOKEN="your_token" \
-           -e TOKEN_X="your_token_x" \
-           -e TOKEN_Y="your_token_y" \
-           -e ILP_USER=ilp_ingest \
            -e MARKET_DATA_MIN_EPS=1200 \
            -e MARKET_DATA_MAX_EPS=2500 \
            -e CORE_MIN_EPS=700 \
@@ -496,56 +511,73 @@ docker run -e HOST=172.31.42.41 \
            -e ORDERS_MIN_PER_SEC=5 \
            -e ORDERS_MAX_PER_SEC=30 \
            -e LEI_POOL_SIZE=2000 \
+           -e METALS=true \
+           -e FORWARDS=true \
            fx-generator
 ```
 
-All parameters can be overridden via environment variables or passed as arguments to the entrypoint script.
+For TCP with JWK authentication instead, add `-e PROTOCOL=tcp -e TOKEN=... -e TOKEN_X=...
+-e TOKEN_Y=... -e ILP_USER=...`.
+
+The entrypoint maps these environment variables to arguments. Image defaults:
+
+| Variable | Argument | Default |
+|---|---|---|
+| `MODE` | `--mode` | `real-time` |
+| `SHORT_TTL` | `--short_ttl` | `True` |
+| `ENTERPRISE` | `--enterprise` | `False` |
+| `MARKET_DATA_MIN_EPS` / `MARKET_DATA_MAX_EPS` | `--market_data_min_eps` / `--market_data_max_eps` | `1200` / `2500` |
+| `CORE_MIN_EPS` / `CORE_MAX_EPS` | `--core_min_eps` / `--core_max_eps` | `700` / `1000` |
+| `TOTAL_MARKET_DATA_EVENTS` | `--total_market_data_events` | `25_000_000` |
+| `PROTOCOL` | `--protocol` | `qwp` |
+| `HOST` | `--host` | `host.docker.internal` |
+| `PG_USER` / `PG_PASSWORD` / `PG_PORT` | `--user` / `--password` / `--pg_port` | `admin` / `quest` / `8812` |
+| `TOKEN` / `TOKEN_X` / `TOKEN_Y` | `--token` / `--token_x` / `--token_y` | empty |
+| `ILP_USER` | `--ilp_user` | `admin` |
+| `YAHOO_REFRESH_SECS` | `--yahoo_refresh_secs` | `30` |
+| `ORDERS_MIN_PER_SEC` / `ORDERS_MAX_PER_SEC` | `--orders_min_per_sec` / `--orders_max_per_sec` | `5` / `30` |
+| `LEI_POOL_SIZE` | `--lei_pool_size` | `2000` |
+| `METALS` | `--metals` | `false` |
+| `FORWARDS` | `--forwards` | `false` |
+
+Any other argument (for example `--suffix` or `--realtime_slice_ms`) can be appended after
+the image name; it is passed through to the script. Views are created by default, so
+`FORWARDS=true` also creates `fx_forward_points_1m`.
+
+The image ingests over QWP (port 9000) by default. Open-source QuestDB needs no credentials
+for QWP; `PG_USER` / `PG_PASSWORD` (admin / quest) are only used for the PG-wire connection
+that creates tables and views at startup. For an authenticated server, pass `TOKEN`. The
+store-and-forward spill directory is inside the container (`/tmp/fx_qwp_sf`), so it covers
+QuestDB restarts and failovers, but not a restart of the container itself. For TCP or HTTP,
+set `PROTOCOL=tcp` or `PROTOCOL=http`.
 
 ---
 
 ## Materialized Views
 
-The script automatically creates OHLC aggregation views:
+With `--create_views true` (the default) the script creates these views if they do not exist
+(`CREATE ... IF NOT EXISTS`; to redefine one, drop it first). Names take `--suffix` like the
+tables. The `bbo_*` and `market_data_ohlc_*` views are skipped in two-table mode
+(`--market_data_processes 0`).
 
-### Core Price Views
-- `core_price_1s`: 1-second OHLC (mid-price, spread, bid/ask stats)
-- `core_price_1d`: 1-day OHLC
+| View | Source | Refresh | Content | TTL with `--short_ttl` |
+|---|---|---|---|---|
+| `core_price_1s` | `core_price` | immediate | 1s OHLC of the mid, last spread, bid/ask min, max and avg | 4 hours |
+| `core_price_1d` | `core_price` | every 1h | the same at 1 day | 1 month |
+| `bbo_1s` | `market_data` | immediate | 1s last best bid and best ask | 3 days |
+| `bbo_1m` | `bbo_1s` | every 1m | 1m max bid and min ask | 3 days |
+| `bbo_1h` | `bbo_1m` | every 10m | 1h max bid and min ask | 1 month |
+| `bbo_1d` | `bbo_1h` | every 1h | 1d max bid and min ask | 1 month |
+| `market_data_ohlc_1m` | `market_data` | immediate | 1m OHLC of `best_bid`, plus summed level-1 bid size as `total_volume` | 1 day |
+| `market_data_ohlc_15m` | `market_data_ohlc_1m` | immediate | 15m OHLC rolled up from the 1m view | 2 days |
+| `market_data_ohlc_1d` | `market_data` | every 1h | 1d OHLC of `best_bid` plus `total_volume` | 1 month |
+| `fx_trades_ohlc_1m` | `fx_trades` | immediate | 1m OHLC of traded `price`, plus summed `quantity` | 2 days |
+| `fx_trades_ohlc_1d` | `fx_trades_ohlc_1m` | every 1h | 1d OHLC rolled up from the 1m view | 1 month |
+| `fx_forward_points_1m` | `fx_forward_points` | immediate | only with `--forwards true`: last bid/ask points, `spot_ref`, value date and `tenor_days` per symbol, tenor and minute | 2 days |
 
-### Market Data Views
-- `market_data_ohlc_1m`: 1-minute OHLC from orderbook best bid
-- `market_data_ohlc_15m`: 15-minute OHLC
-- `market_data_ohlc_1d`: 1-day OHLC
-
-### Forward Points View (with `--forwards true`)
-- `fx_forward_points_1m`: last bid/ask points, `spot_ref`, value date and `tenor_days` per
-  symbol, tenor and minute
-
-### Trade Views (User-Created)
-Example views for `fx_trades` aggregations:
-
-```sql
-CREATE MATERIALIZED VIEW fx_trades_ohlc_1m AS (
-    SELECT timestamp, symbol,
-        first(price) AS open,
-        max(price) AS high,
-        min(price) AS low,
-        last(price) AS close,
-        SUM(quantity) AS total_volume
-    FROM fx_trades
-    SAMPLE BY 1m
-) PARTITION BY HOUR TTL 2 DAYS;
-
-CREATE MATERIALIZED VIEW fx_trades_ohlc_1h AS (
-    SELECT timestamp, symbol,
-        first(price) AS open,
-        max(price) AS high,
-        min(price) AS low,
-        last(price) AS close,
-        SUM(quantity) AS total_volume
-    FROM fx_trades
-    SAMPLE BY 1h
-) PARTITION BY DAY TTL 1 MONTH;
-```
+Views refreshed on a timer are created `DEFERRED`, so they fill on their first scheduled
+refresh. Without `--short_ttl` no view has a TTL. Views always use a TTL, even with
+`--enterprise`, because materialized views do not accept a storage policy.
 
 ---
 
@@ -587,6 +619,7 @@ CREATE MATERIALIZED VIEW fx_trades_ohlc_1h AS (
 - **market_data**: Microsecond (TIMESTAMP)
 - **core_price**: Microsecond (TIMESTAMP)
 - **fx_trades**: Nanosecond (TIMESTAMP_NS)
+- **fx_forward_points**: Microsecond (TIMESTAMP), including `value_date`
 
 Trade timestamps are always ≥1 microsecond after their source `core_price` event, ensuring ASOF joins work correctly despite precision differences.
 
@@ -594,9 +627,14 @@ Trade timestamps are always ≥1 microsecond after their source `core_price` eve
 
 ## WAL Backpressure Control
 
-- **Pause Threshold:** `sequencerTxn - writerTxn > 3 * num_processes`
+- **Monitored table:** `market_data`, or `core_price` when `market_data` is disabled
+- **Pause Threshold:** `sequencerTxn - writerTxn > --wal_lag_threshold` (default
+  `3 * processes`, or about 10 seconds of `core_price` commits when `market_data` is disabled)
 - **Resume:** Only when lag clears completely (`sequencerTxn == writerTxn`)
-- Workers print status messages when paused/resumed
+- The monitor prints a message when it pauses and resumes ingestion
+- **Connection:** PG-wire to the first `--host` for HTTP and TCP; over QWP it reads from the
+  primary through the client pool and follows a failover (see
+  [QWP/WebSocket ingestion](#qwpwebsocket-ingestion-multi-host-ha))
 - Prevents QuestDB OOM during extreme ingestion rates
 
 ---
@@ -605,7 +643,7 @@ Trade timestamps are always ≥1 microsecond after their source `core_price` eve
 
 - **No Overlapping Data:** Script queries latest timestamp before starting and advances past it
 - **No Time Travel:** If requested start is already covered, script exits cleanly
-- **Atomic Flushes:** All three tables flush synchronously for dashboard consistency
+- **Atomic Flushes:** All tables flush together for dashboard consistency (`fx_forward_points` with `core_price`)
 - **Clean Shutdown:** All subprocesses (workers, WAL monitor, Yahoo refresher) terminate cleanly
 
 ---

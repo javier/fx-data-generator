@@ -265,7 +265,8 @@ mid at the same instant within an intra-second move.
 
 A run is "interchangeable" when all hold:
 1. With `--prefix ""`, Java writes to `fx_trades`, `market_data`, `core_price` and the
-   11 views with names identical to Python's.
+   11 views with names identical to Python's (plus `fx_forward_points` and
+   `fx_forward_points_1m` with `--forwards true`).
 2. Backfill (FTL) with engine A, continue (FTL, `--incremental`) with engine B →
    **zero gaps** and `open == previous close` at the seam for bid/ask/spread/indicators
    (verify with `SAMPLE BY 1s FILL(NULL)` + `WHERE col IS NULL`, and a boundary

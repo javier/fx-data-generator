@@ -26,8 +26,9 @@ backfill with one and continue with the other on the same tables (see
 Design points:
 
 - **Three tables, full Python-parity materialized views** — `<prefix>fx_trades`,
-  `<prefix>market_data`, `<prefix>core_price`; with `--create_views` (default
-  **true**) it also builds the same 11 matviews the Python generator creates (BBO
+  `<prefix>market_data`, `<prefix>core_price` (plus `<prefix>fx_forward_points` with
+  `--forwards true`); with `--create_views` (default
+  **true**) it also builds the same 11 matviews the Python generator creates, 12 with `--forwards` (BBO
   ladder, market-data OHLC, core-price OHLC-mid, and trade OHLC — see below).
 - **Independent per-table pools:** `--trades_processes` workers feed `qwp_trades`,
   `--market_data_processes` workers feed `qwp_market_data`, `--core_processes`
@@ -101,7 +102,7 @@ quoted `-Dexec.args` tokens, so prefer `none` there.)
 ### Materialized views (`--create_views`, default on)
 
 With `--create_views true` (the default, matching Python) the generator creates the
-**same 11 matviews as the Python generator** — prefix/suffix threaded through every
+**same 11 matviews as the Python generator** (12 with `--forwards`), with prefix/suffix threaded through every
 name, and each view gated on its base pool being enabled (a disabled pool's views are
 skipped, not errored). The cascades and per-view TTL/partitions are byte-faithful to
 the Python DDL:
@@ -433,7 +434,8 @@ depends on the mode:
   / `core`) plus a min/median/avg/max summary at the end.
 - **Continuous mode (no `--run_secs`):** a lightweight `[hb]` heartbeat every 10s
   showing, per enabled table, the average rows/sec over the interval and the
-  accumulated row count, plus a `total` column aggregating all three, e.g.
+  accumulated row count (forward points as `fwd` with `--forwards true`), plus a
+  `total` column aggregating all of them, e.g.
   `[hb] t=20s  trades 25,030/s (500,600)  md 749,900/s (15M)  core 240,100/s (4.8M)  total 1,015,030/s (20.3M)`.
 
 ### Reference data / schema
@@ -447,7 +449,7 @@ depends on the mode:
 | `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise on the base tables) |
 | `--create_views [true\|false]` | **true** | build the full Python-parity matview set (11 views) |
 | `--prefix <s>` | `qwp_` | table-name prefix (verbatim); use `none` (or `-`, or `""`) to match the Python names exactly |
-| `--suffix <s>` | none | suffix (verbatim); tables become `<prefix>fx_trades<s>` / `<prefix>market_data<s>` / `<prefix>core_price<s>` |
+| `--suffix <s>` | none | suffix (verbatim); tables become `<prefix>fx_trades<s>` / `<prefix>market_data<s>` / `<prefix>core_price<s>` (and `<prefix>fx_forward_points<s>` with `--forwards true`) |
 | `--lei_pool_size <n>` | 2000 | distinct counterparties |
 
 ### Optional layers (parity with the Python generator)

@@ -1,7 +1,8 @@
 # QuestDB Web Console dashboards
 
 The two demo dashboards as native QuestDB Web Console notebooks (grid layout). They are ports of
-the Grafana dashboards `grafana_dashboard.json` and `fx_forwards_grafana_dashboard.json`, and need
+the Grafana dashboards `grafana_dashboard.json` and `fx_forwards_grafana_dashboard.json`
+(documented in [grafana-dashboards.md](grafana-dashboards.md)), and need
 **QuestDB 10.0 or later, or QuestDB Enterprise 4.0 or later**.
 
 - `questdb-fx-orderbook-realtime-demo-dashboard.json`: FX Orderbook - Realtime Demo
