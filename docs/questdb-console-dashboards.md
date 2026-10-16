@@ -10,6 +10,29 @@ the Grafana dashboards `grafana_dashboard.json` and `fx_forwards_grafana_dashboa
 
 For the exact SQL of each cell, open the notebook in the console.
 
+## Setup
+
+1. **Import:** in the Web Console, open the **⋮** menu at the right end of the tab bar, choose
+   **Import tabs**, and pick one of the JSON files. Each file holds one notebook, which opens as
+   a new tab named after the dashboard and shows a summary of what was imported. Import both
+   files to get both dashboards.
+2. **Layout and refresh:** the notebooks are saved in the grid layout with a 250 ms
+   auto-refresh default, so they open as dashboards. Charts only poll while they are visible
+   and the browser tab is in the foreground. The **List | Grid** toggle on the notebook toolbar
+   switches to the cell-by-cell view.
+3. **Starts clean:** query results are not stored in the files, so cells show data once they
+   have run against your server.
+
+**Data needed:**
+
+| Dashboard | Tables and views it reads | Generator flags |
+|---|---|---|
+| FX Orderbook - Realtime Demo | `market_data`, `core_price`, `market_data_ohlc_1m`, `market_data_ohlc_15m`, `bbo_1s`, `bbo_1h` | defaults, with `--create_views true` (the default) |
+| FX and Metals: Spot and Forwards | `market_data`, `core_price`, `fx_forward_points`, `fx_forward_points_1m` | `--metals true --forwards true`, with `--create_views true` |
+
+Neither works in two-table mode (`--market_data_processes 0`), because both read
+`market_data`. Table and view names are fixed: with a generator `--suffix`, edit the cells.
+
 ## Shared conventions
 
 ### Notebook variables

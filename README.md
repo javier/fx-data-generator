@@ -454,10 +454,15 @@ dashboard:
 ### QuestDB Web Console (no Grafana needed)
 
 Native QuestDB dashboards, built as Web Console notebooks. They need **QuestDB 10.0 or later,
-or QuestDB Enterprise 4.0 or later**. Import the file in the Web Console:
+or QuestDB Enterprise 4.0 or later**. To install, open the **⋮** menu at the right end of the
+Web Console tab bar, choose **Import tabs**, and import each file:
 
 - `questdb-fx-orderbook-realtime-demo-dashboard.json`: FX Orderbook - Realtime Demo
 - `questdb-fx-and-metals-spots-and-forwards-dashboard.json`: FX and Metals: Spot and Forwards
+
+Each one opens as a new notebook tab, already in the grid layout. The tables and views each one
+needs are listed in the setup section of
+[docs/questdb-console-dashboards.md](docs/questdb-console-dashboards.md).
 
 They use notebook variables instead of a pair selector and time picker: `@symbol` (EURUSD and
 XAUUSD by default) and `@asof` (`now()`). Change `@symbol` to switch pairs, or set `@asof` to a
