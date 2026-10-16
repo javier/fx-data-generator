@@ -62,6 +62,8 @@ so the depth chart and candles move smoothly at that rate.
 
 ## Dashboard 1: FX Orderbook - Realtime Demo
 
+![FX Orderbook - Realtime Demo in Grafana, EURUSD](images/grafana-fx-orderbook-dashboard.png)
+
 | Panel | Position | Window | Logic | Display |
 |---|---|---|---|---|
 | Market Depth | top, full width, repeated per symbol | last 10 minutes, latest snapshot | latest `market_data` row: bid and ask prices, sizes and cumulative sizes with `array_cum_sum` | Plotly step chart, absolute price on x, cumulative size on a log y axis; bids green, asks red, a white dotted line at the mid; each side is split into 4 segments and the largest level of each is marked with a yellow dotted line and its price |
@@ -72,6 +74,8 @@ so the depth chart and candles move smoothly at that rate.
 | Bid vs Ask Volume (30s) - BBO (1s) | row Indicators, right | last 30 minutes | 30 s summed level-1 bid volume, ask volume negative; bid, ask and mid from `bbo_1s` | lines; volumes and prices on separate units |
 
 ## Dashboard 2: FX and Metals: Spot and Forwards
+
+![FX and Metals: Spot and Forwards in Grafana, XAUUSD](images/grafana-fx-metals-dashboard.png)
 
 The spot panels are copied unchanged from dashboard 1 (same queries, windows and refresh), so
 spot looks and ticks the same. In the top-of-book table the fixed column widths are removed and
