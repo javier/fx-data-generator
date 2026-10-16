@@ -12,6 +12,12 @@ of hosts. It can populate three tables, each with its own pool of worker threads
   Python `core_price`: best `bid_price`/`ask_price` + volumes, `ecn`, `reason`,
   `indicator1`/`indicator2`).
 
+Two optional layers, both off by default and identical to the Python generator's:
+`--metals true` adds the precious metals pairs (XAUUSD, XAGUSD, XPTUSD, XPDUSD,
+XAUEUR) to the universe, and `--forwards true` adds a fourth table,
+**`qwp_fx_forward_points`**, with forward point ladders, filled by one extra worker
+thread. See [Precious metals and forwards](#precious-metals-and-forwards).
+
 It is a sibling of the Python FX data generator (`../fx_data_generator.py`) and is
 **dataset-compatible** with it: set `--prefix none` and the table/view names, schemas,
 and the full materialized-view set match the Python generator exactly, so you can
@@ -20,8 +26,9 @@ backfill with one and continue with the other on the same tables (see
 Design points:
 
 - **Three tables, full Python-parity materialized views** — `<prefix>fx_trades`,
-  `<prefix>market_data`, `<prefix>core_price`; with `--create_views` (default
-  **true**) it also builds the same 11 matviews the Python generator creates (BBO
+  `<prefix>market_data`, `<prefix>core_price` (plus `<prefix>fx_forward_points` with
+  `--forwards true`); with `--create_views` (default
+  **true**) it also builds the same 11 matviews the Python generator creates, 12 with `--forwards` (BBO
   ladder, market-data OHLC, core-price OHLC-mid, and trade OHLC — see below).
 - **Independent per-table pools:** `--trades_processes` workers feed `qwp_trades`,
   `--market_data_processes` workers feed `qwp_market_data`, `--core_processes`
@@ -68,6 +75,17 @@ CREATE TABLE IF NOT EXISTS qwp_core_price (
     reason SYMBOL,                      -- normal | news_event | liquidity_event
     indicator1 DOUBLE, indicator2 DOUBLE
 ) TIMESTAMP(timestamp) PARTITION BY HOUR;
+
+-- only with --forwards true
+CREATE TABLE IF NOT EXISTS qwp_fx_forward_points (
+    timestamp TIMESTAMP, symbol SYMBOL,
+    tenor SYMBOL,                       -- ON, TN, 1W, 2W, 1M, 2M, 3M, 6M, 9M, 1Y
+    tenor_days INT,                     -- calendar days from spot (negative for ON and TN)
+    value_date TIMESTAMP,               -- midnight UTC of the settlement date
+    bid_points DOUBLE, ask_points DOUBLE,   -- in pips
+    spot_ref DOUBLE,                    -- the spot mid the ladder was priced on
+    source SYMBOL                       -- FWD_FEED
+) TIMESTAMP(timestamp) PARTITION BY HOUR DEDUP UPSERT KEYS(timestamp, symbol, tenor);
 ```
 
 (Real DDL also carries the Python PARQUET column encodings.) The generator creates
@@ -84,7 +102,7 @@ quoted `-Dexec.args` tokens, so prefer `none` there.)
 ### Materialized views (`--create_views`, default on)
 
 With `--create_views true` (the default, matching Python) the generator creates the
-**same 11 matviews as the Python generator** — prefix/suffix threaded through every
+**same 11 matviews as the Python generator** (12 with `--forwards`), with prefix/suffix threaded through every
 name, and each view gated on its base pool being enabled (a disabled pool's views are
 skipped, not errored). The cascades and per-view TTL/partitions are byte-faithful to
 the Python DDL:
@@ -102,6 +120,7 @@ the Python DDL:
 | `market_data_ohlc_1d` | `market_data` | EVERY 1h (deferred) | 1d OHLC of `best_bid` + Σ volume |
 | `fx_trades_ohlc_1m` | `fx_trades` | immediate | 1m OHLC of traded `price` + Σ quantity |
 | `fx_trades_ohlc_1d` | the 1m view | EVERY 1h (deferred) | 1d OHLC rolled up from the 1m view |
+| `fx_forward_points_1m` | `fx_forward_points` | immediate | only with `--forwards`: last bid/ask points, `spot_ref`, value date and `tenor_days` per symbol, tenor and minute |
 
 All use `CREATE ... IF NOT EXISTS` (idempotent — to redefine one, drop it first; the
 **first** generator to run fixes the definition, so keep both engines on the same
@@ -308,6 +327,30 @@ state, with the **first and last event pinned exactly to open/close**, so
 `close(second t) == open(second t+1)` holds in the emitted rows — OHLC candles join
 cleanly with no false gaps.
 
+## Precious metals and forwards
+
+Both layers are ports of the Python generator's and produce the same data character;
+the model, conventions and demo queries are documented in the
+[Python README](../README.md#precious-metals) and `../demo_queries.sql`.
+
+- **`--metals true`** appends XAUUSD, XAGUSD, XAUEUR, XPTUSD and XPDUSD to the
+  universe, with the same per-metal pip, spread band (gold 20 to 40 pips), book level
+  spacing (a 40-level gold book spans $4), volumes and trade sizes in troy ounces, and
+  Yahoo front-month futures for the brackets (`GC=F`, `SI=F`, `PL=F`, `PA=F`; XAUEUR is
+  derived as XAUUSD / EURUSD). Metals are appended, so the FX pairs keep their walk
+  seeds and price paths; with the same total EPS each FX pair simply gets a smaller
+  share of the rows.
+- **`--forwards true`** creates `<prefix>fx_forward_points<suffix>` (and its `_1m` view
+  with `--create_views`) and starts one `fw` worker. It replays the deterministic walks
+  of the covered pairs (the majors and EURJPY, plus the metals with `--metals`), so each
+  ladder's spot is the same mid the `core_price` pool publishes at that instant. One
+  ladder per pair every 5 seconds, ten tenors each, from covered interest parity on the
+  same static rate and lease curves as Python, with the same daily planted bad point
+  (EURJPY 3M, or XAUEUR 3M with `--metals`, +6 pips from `--bad_point_utc`, default
+  09:20 UTC, for 20 minutes). The run prints the planted window at the end.
+  In faster-than-life the forwards pool resumes from its own table's last row, like the
+  other pools. The table is not WAL-monitored (it is about 3% of `core_price`).
+
 ## Interchangeability with the Python generator
 
 This generator and the Python `fx_data_generator.py` are **dataset-compatible**: you
@@ -326,14 +369,19 @@ For a genuinely seamless dataset, also align:
   `--orders_min_per_sec/--orders_max_per_sec` (and `--min_levels/--max_levels`), or the
   row density will step at the hand-off even though prices stay continuous.
 - **Continuation seed.** Use `--incremental true` (faster-than-life) on the continuing
-  run: it seeds mid/spread/indicators from the last stored `core_price` row per symbol
+  run (when Python continues a Java backfill, also pass `--start_ts` at the end of the
+  backfill: Python's faster-than-life starts at "now" without it, while this generator
+  starts after the last row): it seeds mid/spread/indicators from the last stored `core_price` row per symbol
   — exactly like the Python `--incremental` — so `open(seam) == close(prev)` holds and
   OHLC candles join cleanly. Real-time never uses incremental on either engine; it
   reseeds from live Yahoo quotes, so a faster-than-life → live transition deliberately
   snaps to the real market (identical behaviour on both).
 - **Same build / flags.** Views are `IF NOT EXISTS` (the first creator fixes the
   definition), and `--enterprise/--short_ttl/--prefix/--suffix` must match across the
-  engines so both address the same tables with the same schema.
+  engines so both address the same tables with the same schema. So must `--metals`
+  and `--forwards`: switching `--metals` at the hand-off changes each FX pair's share
+  of the rows, and the forwards table is only written by an engine run with
+  `--forwards true`.
 
 Because both engines reconstruct `market_data` and `core_price` from a **single**
 `core_price` seed, the order-book `best_bid` can step a few pips at the seam to realign
@@ -386,7 +434,8 @@ depends on the mode:
   / `core`) plus a min/median/avg/max summary at the end.
 - **Continuous mode (no `--run_secs`):** a lightweight `[hb]` heartbeat every 10s
   showing, per enabled table, the average rows/sec over the interval and the
-  accumulated row count, plus a `total` column aggregating all three, e.g.
+  accumulated row count (forward points as `fwd` with `--forwards true`), plus a
+  `total` column aggregating all of them, e.g.
   `[hb] t=20s  trades 25,030/s (500,600)  md 749,900/s (15M)  core 240,100/s (4.8M)  total 1,015,030/s (20.3M)`.
 
 ### Reference data / schema
@@ -400,8 +449,16 @@ depends on the mode:
 | `--short_ttl` / `--enterprise [true\|false]` | off | retention (TTL, or STORAGE POLICY with enterprise on the base tables) |
 | `--create_views [true\|false]` | **true** | build the full Python-parity matview set (11 views) |
 | `--prefix <s>` | `qwp_` | table-name prefix (verbatim); use `none` (or `-`, or `""`) to match the Python names exactly |
-| `--suffix <s>` | none | suffix (verbatim); tables become `<prefix>fx_trades<s>` / `<prefix>market_data<s>` / `<prefix>core_price<s>` |
+| `--suffix <s>` | none | suffix (verbatim); tables become `<prefix>fx_trades<s>` / `<prefix>market_data<s>` / `<prefix>core_price<s>` (and `<prefix>fx_forward_points<s>` with `--forwards true`) |
 | `--lei_pool_size <n>` | 2000 | distinct counterparties |
+
+### Optional layers (parity with the Python generator)
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--metals [true\|false]` | false | add XAUUSD, XAGUSD, XPTUSD, XPDUSD, XAUEUR to the universe |
+| `--forwards [true\|false]` | false | create and fill `<prefix>fx_forward_points<suffix>` (one extra `fw` worker; `_1m` view with `--create_views`) |
+| `--bad_point_utc <HH:MM>` | 09:20 | `--forwards` only: UTC start of the daily 20-minute planted bad point |
 
 ### Accepted but unused / unsupported
 

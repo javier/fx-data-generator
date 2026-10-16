@@ -23,6 +23,29 @@ public final class FxPair {
     /** Liquidity rank: 1 = most liquid, 10 = least. Drives trade-weighting. */
     public final int rank;
 
+    // Market character. FX pairs keep the defaults (the original model exactly); the precious
+    // metals override them, mirroring METAL_PARAMS in the Python generator.
+    /** Multiplier on the per-second mid random walk and shocks, in pips. */
+    public final double move;
+    /** Probability of a shock in a given second. */
+    public final double shockProb;
+    /** Spread walk bounds in whole pips. */
+    public final int spreadMinPips;
+    public final int spreadMaxPips;
+    /** Pips between consecutive order-book levels. */
+    public final int levelPips;
+    /** Scale on the volume ladder (metals: troy ounces). */
+    public final double volScale;
+    /** Scale on the trade size distribution (metals: troy ounces). */
+    public final double sizeScale;
+    /** Yahoo ticker, or null when the bracket is derived (see {@link #derivedNum}). */
+    public final String yahoo;
+    /** Derived bracket: mid = derivedNum / derivedDen (e.g. XAUEUR = XAUUSD / EURUSD), else null. */
+    public final String derivedNum;
+    public final String derivedDen;
+    /** True when this pair overrides the FX defaults. */
+    public final boolean metal;
+
     /** Immutable bracket timeline snapshot (parallel arrays, sorted by effSec ascending). */
     private static final class Brackets {
         final long[] effSec;
@@ -39,16 +62,60 @@ public final class FxPair {
     private volatile Brackets brackets;
 
     public FxPair(String symbol, double low, double high, int precision, double pip, int rank) {
+        this(symbol, low, high, precision, pip, rank, 1.0, 0.010, 1, 8, 1, 1.0, 1.0,
+                symbol + "=X", null, null, false);
+    }
+
+    /** A precious metal: the FX model with its own scales (see FxUniverse.metalPairs). */
+    public static FxPair metal(String symbol, double low, double high, int precision, double pip, int rank,
+                               double move, double shockProb, int spreadMinPips, int spreadMaxPips,
+                               int levelPips, double volScale, double sizeScale,
+                               String yahoo, String derivedNum, String derivedDen) {
+        return new FxPair(symbol, low, high, precision, pip, rank, move, shockProb, spreadMinPips,
+                spreadMaxPips, levelPips, volScale, sizeScale, yahoo, derivedNum, derivedDen, true);
+    }
+
+    private FxPair(String symbol, double low, double high, int precision, double pip, int rank,
+                   double move, double shockProb, int spreadMinPips, int spreadMaxPips, int levelPips,
+                   double volScale, double sizeScale, String yahoo, String derivedNum, String derivedDen,
+                   boolean metal) {
         this.symbol = symbol;
         this.precision = precision;
         this.pip = pip;
         this.rank = rank;
+        this.move = move;
+        this.shockProb = shockProb;
+        this.spreadMinPips = spreadMinPips;
+        this.spreadMaxPips = spreadMaxPips;
+        this.levelPips = levelPips;
+        this.volScale = volScale;
+        this.sizeScale = sizeScale;
+        this.yahoo = yahoo;
+        this.derivedNum = derivedNum;
+        this.derivedDen = derivedDen;
+        this.metal = metal;
         this.brackets = new Brackets(new long[]{Long.MIN_VALUE}, new double[]{low}, new double[]{high});
     }
 
-    /** Yahoo ticker for an FX pair is the symbol with an "=X" suffix, e.g. EURUSD=X. */
+    /**
+     * Yahoo ticker: the symbol with an "=X" suffix for FX (e.g. EURUSD=X); the front-month
+     * future for a metal (the XAUUSD=X style spot tickers do not resolve); null when derived.
+     */
     public String yahooTicker() {
-        return symbol + "=X";
+        return yahoo;
+    }
+
+    /** Price step between book levels: one pip for FX, {@link #levelPips} pips for a metal. */
+    public double tick() {
+        return levelPips * pip;
+    }
+
+    /**
+     * Spread walk step in pips: 1 for FX, about an eighth of the band for a metal. Math.rint
+     * rounds half to even like Python's round(), so gold's 2.5 gives 2 on both engines.
+     */
+    public int spreadStepPips() {
+        return Math.max(1, (int) Math.rint((spreadMaxPips - spreadMinPips) / 8.0));
     }
 
     private static int indexAt(Brackets b, long sec) {

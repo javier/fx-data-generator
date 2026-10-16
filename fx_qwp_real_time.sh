@@ -16,8 +16,14 @@
 #
 set -euo pipefail
 
-# Python from the venv that has the QWP-capable client (editable questdb 4.1.0).
+# Python from the venv that has the QWP-capable client (questdb 5.0.0 or later, for questdb.connect).
 PY="${PY:-python}"
+
+# Optional layers, off by default. Uncomment a line to enable it.
+EXTRA_ARGS=(
+  # --metals true     # adds XAUUSD, XAGUSD, XPTUSD, XPDUSD, XAUEUR; FX pairs get 30/35 of their rows
+  # --forwards true   # adds fx_forward_points; the first run needs --create_views true for its _1m view
+)
 
 "$PY" fx_data_generator.py \
   --protocol qwp \
@@ -40,4 +46,5 @@ PY="${PY:-python}"
   --incremental false \
   --lei_pool_size 2000 \
   --realtime_slice_ms 100 \
-  --suffix ""
+  --suffix "" \
+  ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

@@ -5,7 +5,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -47,19 +49,41 @@ public final class YahooFinance {
     public void refreshBrackets(List<FxPair> pairs, double bracketPct, long effSec) {
         double pct = bracketPct / 100.0;
         System.out.println("[INFO] Refreshing reference data from Yahoo Finance.");
+        Map<String, Double> mids = new HashMap<>();
         for (FxPair pair : pairs) {
+            if (pair.yahooTicker() == null) {
+                continue; // derived below, once its legs are known
+            }
             Double mid = fetchMid(pair.yahooTicker());
             if (mid != null && mid > 0 && !mid.isNaN()) {
-                double low = mid * (1 - pct);
-                double high = mid * (1 + pct);
-                if (effSec == Long.MIN_VALUE) {
-                    pair.resetBracket(low, high);
-                } else {
-                    pair.appendBracket(effSec, low, high);
-                }
+                mids.put(pair.symbol, mid);
+                apply(pair, mid, pct, effSec);
             } else {
                 System.out.printf("[YF] %s: keeping current bracket (fetch failed)%n", pair.symbol);
             }
+        }
+        // Derived brackets (e.g. XAUEUR = XAUUSD / EURUSD) keep the cross consistent with its legs.
+        for (FxPair pair : pairs) {
+            if (pair.yahooTicker() != null) {
+                continue;
+            }
+            Double num = mids.get(pair.derivedNum);
+            Double den = mids.get(pair.derivedDen);
+            if (num != null && den != null) {
+                apply(pair, num / den, pct, effSec);
+            } else {
+                System.out.printf("[YF] %s: keeping current bracket (a leg fetch failed)%n", pair.symbol);
+            }
+        }
+    }
+
+    private static void apply(FxPair pair, double mid, double pct, long effSec) {
+        double low = mid * (1 - pct);
+        double high = mid * (1 + pct);
+        if (effSec == Long.MIN_VALUE) {
+            pair.resetBracket(low, high);
+        } else {
+            pair.appendBracket(effSec, low, high);
         }
     }
 

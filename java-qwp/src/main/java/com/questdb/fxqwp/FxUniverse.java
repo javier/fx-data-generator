@@ -67,6 +67,38 @@ public final class FxUniverse {
     }
 
     /**
+     * The pair universe: the 30 FX pairs, plus the precious metals with {@code --metals}. Metals
+     * are appended, so the FX pairs keep their global indices and therefore their walk seeds:
+     * the FX price paths are the same with --metals on or off; only their share of the EPS falls
+     * (to 30/35 of the rows), as in the Python generator.
+     */
+    public static List<FxPair> universe(boolean metals) {
+        List<FxPair> p = defaultPairs();
+        if (metals) {
+            p.addAll(metalPairs());
+        }
+        return p;
+    }
+
+    /**
+     * Precious metals, identical to {@code METALS_PAIRS} / {@code METAL_PARAMS} in the Python
+     * generator. The metal is the base currency, quoted per troy ounce, so sizes are ounces.
+     * Fallback brackets set on 2026-10-13 from Yahoo front-month futures (GC=F 4180, SI=F 59.5,
+     * PL=F 1672, PA=F 1128) and EURUSD 1.1196; used only when Yahoo is unavailable.
+     */
+    public static List<FxPair> metalPairs() {
+        List<FxPair> p = new ArrayList<>();
+        // (symbol, low, high, precision, pip, rank, move, shockProb, spread min/max pips, level pips,
+        //  vol scale, size scale, yahoo, derived num/den)
+        p.add(FxPair.metal("XAUUSD", 4100.0, 4260.0, 2, 0.01, 2, 10.0, 0.010, 20, 40, 10, 0.01, 0.006, "GC=F", null, null));
+        p.add(FxPair.metal("XAGUSD", 58.0, 61.0, 3, 0.001, 6, 2.6, 0.010, 20, 40, 5, 0.2, 0.1, "SI=F", null, null));
+        p.add(FxPair.metal("XAUEUR", 3660.0, 3810.0, 2, 0.01, 8, 9.0, 0.010, 25, 50, 10, 0.01, 0.006, null, "XAUUSD", "EURUSD"));
+        p.add(FxPair.metal("XPTUSD", 1640.0, 1705.0, 2, 0.01, 9, 6.0, 0.010, 100, 300, 20, 0.005, 0.002, "PL=F", null, null));
+        p.add(FxPair.metal("XPDUSD", 1100.0, 1160.0, 2, 0.01, 10, 6.0, 0.030, 300, 800, 50, 0.003, 0.002, "PA=F", null, null));
+        return p;
+    }
+
+    /**
      * Deterministic fake LEIs (20 alphanumeric chars), matching the Python
      * {@code generate_lei_pool}: "00" prefix + first 18 hex chars of
      * SHA-256("LEI_SEED_%010d"), upper-cased.
@@ -99,10 +131,20 @@ public final class FxUniverse {
      * Matches the Python {@code generate_trade_size_lognormal} defaults.
      */
     public static double tradeSizeLognormal() {
-        double mu = Math.log(500_000.0);
+        return tradeSizeLognormal(1.0);
+    }
+
+    /** Log-normal trade size with the whole distribution scaled (metals: troy ounces). */
+    public static double tradeSizeLognormal(double scale) {
+        double mu = Math.log(500_000.0 * scale);
         double sigma = 1.2;
         double size = Math.exp(mu + sigma * ThreadLocalRandom.current().nextGaussian());
-        return Math.max(100_000.0, Math.min(100_000_000.0, Math.round(size)));
+        return Math.max(100_000.0 * scale, Math.min(100_000_000.0 * scale, Math.round(size)));
+    }
+
+    /** Scale a ladder volume for a metal (FX volumes are returned unchanged). */
+    public static double scaleVolume(long volume, FxPair pair) {
+        return pair.metal ? Math.max(1.0, Math.round(volume * pair.volScale)) : volume;
     }
 
     /** Round a price to the nearest pip and trim float noise to the pair's precision. */
@@ -123,9 +165,12 @@ public final class FxUniverse {
      */
     public static double evolveMid(double prevMid, FxPair pair, double driftPips,
                                    double low, double high, SplittableRandom rng) {
-        double change = rng.nextDouble(-driftPips * pair.pip, driftPips * pair.pip);
-        if (rng.nextDouble() < 0.010) {
-            change += rng.nextDouble(-20 * pair.pip, 20 * pair.pip);
+        // Metals scale the move and the shock to their price level (pair.move is 1 for FX).
+        double drift = driftPips * pair.move;
+        double shock = 20 * pair.move;
+        double change = rng.nextDouble(-drift * pair.pip, drift * pair.pip);
+        if (rng.nextDouble() < pair.shockProb) {
+            change += rng.nextDouble(-shock * pair.pip, shock * pair.pip);
         }
         double newMid = prevMid + change;
         newMid = Math.max(low, Math.min(high, newMid));
@@ -133,16 +178,18 @@ public final class FxUniverse {
     }
 
     /**
-     * Spread random walk in whole pips, mostly flat with rare widening, 1..8 pips.
+     * Spread random walk in whole pips, mostly flat with rare widening, within the pair's band
+     * (1..8 pips for FX; a metal steps by about an eighth of its wider band).
      * Deterministic given the per-symbol {@link SplittableRandom}.
      */
-    public static int evolveSpreadPips(int prevSpreadPips, SplittableRandom rng) {
+    public static int evolveSpreadPips(int prevSpreadPips, FxPair pair, SplittableRandom rng) {
         int[] nudge = {-1, 0, 0, 0, 1};
-        int sp = prevSpreadPips + nudge[rng.nextInt(nudge.length)];
+        int step = pair.spreadStepPips();
+        int sp = prevSpreadPips + nudge[rng.nextInt(nudge.length)] * step;
         if (rng.nextDouble() < 0.0005) {
-            sp += rng.nextInt(3, 11); // 3..10
+            sp += rng.nextInt(3, 11) * step; // 3..10 steps
         }
-        return Math.max(1, Math.min(8, sp));
+        return Math.max(pair.spreadMinPips, Math.min(pair.spreadMaxPips, sp));
     }
 
     /**

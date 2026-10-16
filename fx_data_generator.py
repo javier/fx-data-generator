@@ -11,11 +11,13 @@ from multiprocessing import Event
 import numpy as np
 import pandas as pd
 import datetime
+import questdb
 from questdb import Sender, TimestampNanos
 import psycopg as pg
 import yfinance as yf
 import hashlib
 import uuid
+import contextlib
 
 # QWP/WebSocket caps each encoded message (one flush frame) at ~2 MiB. A flush over
 # that raises "encoded message size ... exceeds maximum configured allowed size" AND
@@ -63,6 +65,80 @@ FX_PAIRS = [
     ("CADJPY", 110.0, 115.0, 3, 0.01, 10)
 ]
 
+# Precious metals, added to the universe with --metals. They trade as FX pairs: the metal is
+# the base currency, quoted per troy ounce, so the generator's base-unit sizes are ounces.
+# Appended after the FX pairs, so the FX pairs keep their positions. With --metals the total
+# EPS is unchanged and spread over 35 pairs, so each FX pair gets 30/35 of its usual rows.
+# Fallback brackets are static, set on 2026-10-13 from Yahoo front-month futures (GC=F 4180,
+# SI=F 59.5, PL=F 1672, PA=F 1128) and EURUSD 1.1196; used only when Yahoo is unavailable.
+METALS_PAIRS = [
+    # (symbol, low, high, precision, pip, rank)
+    ("XAUUSD", 4100.0, 4260.0, 2, 0.01, 2),    # Gold, the metals benchmark
+    ("XAGUSD", 58.0, 61.0, 3, 0.001, 6),       # Silver
+    ("XAUEUR", 3660.0, 3810.0, 2, 0.01, 8),    # Gold in EUR, bracket derived from XAUUSD / EURUSD
+    ("XPTUSD", 1640.0, 1705.0, 2, 0.01, 9),    # Platinum
+    ("XPDUSD", 1100.0, 1160.0, 2, 0.01, 10),   # Palladium, widest spreads and jumpiest
+]
+
+# Per-metal overrides of the FX defaults. FX pairs have no entry and keep the original
+# behaviour exactly (1 to 8 pip spreads, 1 pip per book level, FX ladder and trade sizes).
+#   yahoo:  Yahoo ticker (the XXXUSD=X spot tickers do not resolve, front-month futures do);
+#           None means derived from two other pairs (see YAHOO_DERIVED)
+#   move:   multiplier on the per-second mid random walk and shocks, in pips. Set so the
+#           per-second volatility is about twice the real one, like a lively demo market
+#   shock_prob: probability of a shock in a given second (FX default 0.010)
+#   spread: (min, max) spread in pips
+#   level:  pips between consecutive book levels, so a 40-level gold book spans $4
+#   vol:    scale on the FX volume ladder (base units, here troy ounces)
+#   size:   scale on the FX trade size distribution (median 500k becomes 3,000 oz of gold)
+METAL_PARAMS = {
+    "XAUUSD": dict(yahoo="GC=F", move=10.0, shock_prob=0.010, spread=(20, 40), level=10, vol=0.01, size=0.006),
+    "XAGUSD": dict(yahoo="SI=F", move=2.6, shock_prob=0.010, spread=(20, 40), level=5, vol=0.2, size=0.1),
+    "XAUEUR": dict(yahoo=None, move=9.0, shock_prob=0.010, spread=(25, 50), level=10, vol=0.01, size=0.006),
+    "XPTUSD": dict(yahoo="PL=F", move=6.0, shock_prob=0.010, spread=(100, 300), level=20, vol=0.005, size=0.002),
+    "XPDUSD": dict(yahoo="PA=F", move=6.0, shock_prob=0.030, spread=(300, 800), level=50, vol=0.003, size=0.002),
+}
+
+# Pairs whose Yahoo bracket is derived from two fetched pairs: mid = numerator / denominator.
+YAHOO_DERIVED = {"XAUEUR": ("XAUUSD", "EURUSD")}
+
+
+def pair_universe(metals):
+    return FX_PAIRS + METALS_PAIRS if metals else list(FX_PAIRS)
+
+
+# --- Reproducibility (--seed) and per-stream randomness --- #
+# Without --seed nothing is seeded and behaviour is exactly as before. With it, every process
+# seeds its own streams from (seed, role, ...) so runs are reproducible byte for byte.
+# Metals price evolution draws from its own stream, so the FX pairs' price paths are the same
+# with --metals on or off; forwards draw from their own stream too (see ForwardsModel).
+_SEEDED = False
+_METALS_RNG = random.Random()
+
+
+def _derive_seed(seed, *salt):
+    h = hashlib.sha256(repr((seed,) + salt).encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big")
+
+
+def seed_process(seed, *salt):
+    global _SEEDED
+    if seed is None:
+        return
+    s = _derive_seed(seed, *salt)
+    random.seed(s)
+    np.random.seed(s % (2 ** 32))
+    _METALS_RNG.seed(_derive_seed(seed, "metals", *salt))
+    _SEEDED = True
+
+
+def new_uuid():
+    # uuid4() reads os.urandom and can never be reproduced, so a seeded run draws its UUIDs
+    # from the seeded stream instead (still valid version-4 UUIDs).
+    if _SEEDED:
+        return str(uuid.UUID(int=random.getrandbits(128), version=4))
+    return str(uuid.uuid4())
+
 
 def make_ladder(levels=50, v_min=100_000, v_max=1_000_000_000):
     step = (math.log10(v_max) - math.log10(v_min)) / (levels - 1)
@@ -105,7 +181,7 @@ def generate_trade_size_lognormal(min_size=100_000, median_size=500_000, max_siz
     return int(max(min_size, min(max_size, size)))
 
 
-def generate_order(symbol, best_bid, best_ask, pip, rank, ecn):
+def generate_order(symbol, best_bid, best_ask, pip, rank, ecn, size_scale=None):
     """
     Generate a realistic order with rank-weighted probability.
 
@@ -113,14 +189,15 @@ def generate_order(symbol, best_bid, best_ask, pip, rank, ecn):
         symbol: FX pair symbol
         best_bid: Current best bid price
         best_ask: Current best ask price
-        pip: Pip size for the symbol
+        pip: Price step between book levels (the pip for FX pairs)
         rank: Liquidity rank (1=most liquid, 10=least liquid)
         ecn: ECN/venue where order is placed (LMAX, EBS, Hotspot, Currenex)
+        size_scale: optional scale on the trade size distribution (metals, in ounces)
 
     Returns:
         dict with order_id, symbol, side, quantity, limit_price, passive, ecn
     """
-    order_id = str(uuid.uuid4())
+    order_id = new_uuid()
 
     # Side: 50/50 buy vs sell
     side = random.choice(["buy", "sell"])
@@ -129,7 +206,11 @@ def generate_order(symbol, best_bid, best_ask, pip, rank, ecn):
     passive = random.random() < 0.4
 
     # Quantity: log-normal distribution
-    quantity = generate_trade_size_lognormal()
+    if size_scale is None:
+        quantity = generate_trade_size_lognormal()
+    else:
+        quantity = generate_trade_size_lognormal(100_000 * size_scale, 500_000 * size_scale,
+                                                 100_000_000 * size_scale)
 
     # Limit price depends on passive vs aggressive
     if passive:
@@ -244,10 +325,16 @@ class SortedEmitter:
       per-event arrays), so the per-row numpy copies are gone.
     - Rows are accumulated column-wise so the flush can hand contiguous columns
       straight to pandas without per-row dict churn.
+
+    QWP is different: the sender is a PooledSender from questdb.connect(), which gives
+    multi-host failover and store-and-forward. Pooled dataframe() bypasses
+    store-and-forward, so QWP flushes write rows with row() instead (_send_rows); the
+    pool's auto-flush keeps every frame under the server's frame cap.
     """
 
     def __init__(self, sender, buffer_limit, suffix, no_market_data=False):
         self.sender = sender
+        self.pooled = isinstance(sender, questdb.PooledSender)
         self.buffer_limit = buffer_limit
         self.suffix = suffix
         # When market_data is disabled it no longer drives _flush_md (which used to flush
@@ -264,6 +351,9 @@ class SortedEmitter:
         self._cp_n = 0
         self._tr = {"ts": [], "symbol": [], "ecn": [], "side": [], "counterparty": [],
                     "trade_id": [], "passive": [], "price": [], "quantity": [], "order_id": []}
+        # fx_forward_points (--forwards): one chunk per ladder (all tenors of one pair).
+        self._fw_chunks = []
+        self._fw_n = 0
 
     # --- Market data rows --- #
     def emit_market(self, ts_ns, symbol, bids, asks):
@@ -305,6 +395,13 @@ class SortedEmitter:
         if len(b["ts"]) >= self.buffer_limit:
             self._flush_tr()
 
+    # --- Forward points rows (one ladder per call) --- #
+    def emit_fwd_ladder(self, ts_ns, symbol, tenors, tenor_days, value_date_ns, bid_points, ask_points, spot_ref):
+        self._fw_chunks.append((ts_ns, symbol, tenors, tenor_days, value_date_ns, bid_points, ask_points, spot_ref))
+        self._fw_n += len(tenors)
+        if self._fw_n >= self.buffer_limit:
+            self._flush_fw()
+
     # --- Framed send: never let one flush exceed the QWP frame limit --- #
     def _send_df(self, df, table, symbols, bytes_per_row):
         """Send df to QuestDB in frames that never exceed the QWP ~2 MiB message limit.
@@ -331,6 +428,22 @@ class SortedEmitter:
                 self.sender.flush()
                 staged = 0
 
+    # --- QWP pooled send: one row() per row, through store-and-forward --- #
+    def _send_rows(self, table, ts, symbols, columns):
+        """ts: int64 ns timestamps. symbols / columns: name -> per-row Python values
+        (lists, so numpy scalars are already plain int / float). The pool auto-flushes
+        by rows, time and the server frame cap; the final flush publishes the rest
+        without waiting for the ack."""
+        row = self.sender.row
+        sym_items = list(symbols.items())
+        col_items = list(columns.items())
+        for i, t in enumerate(ts.tolist()):
+            row(table,
+                symbols={k: v[i] for k, v in sym_items},
+                columns={k: v[i] for k, v in col_items},
+                at=TimestampNanos(t))
+        self.sender.flush()
+
     # --- Flush methods --- #
     def _flush_md(self):
         b = self._md
@@ -339,6 +452,17 @@ class SortedEmitter:
         # Order-book rows carry two DOUBLE[][] arrays; per-row size grows with depth,
         # so size the frame budget from the widest book in this batch.
         maxlv = max(a.shape[1] for a in b["bids"])
+        if self.pooled:
+            self._send_rows(table_name("market_data", self.suffix),
+                            np.asarray(b["ts"], dtype=np.int64),
+                            {"symbol": b["symbol"]},
+                            {"bids": b["bids"], "asks": b["asks"],
+                             "best_bid": b["best_bid"], "best_ask": b["best_ask"]})
+            for v in b.values():
+                v.clear()
+            self._flush_cp()
+            self._flush_tr()
+            return
         df = pd.DataFrame({
             "symbol": pd.Categorical(b["symbol"]),
             "bids": b["bids"],
@@ -356,10 +480,28 @@ class SortedEmitter:
         self._flush_tr()
 
     def _flush_cp(self):
+        # Forward points are low volume; ride core_price's flush cadence.
+        self._flush_fw()
         if not self._cp_chunks:
             return
         cols = list(zip(*self._cp_chunks))
         cat = lambda i: cols[i][0] if len(cols[i]) == 1 else np.concatenate(cols[i])
+        if self.pooled:
+            self._send_rows(table_name("core_price", self.suffix),
+                            cat(0).astype(np.int64, copy=False),
+                            {"symbol": cat(1).tolist(), "ecn": cat(2).tolist(),
+                             "reason": cat(3).tolist()},
+                            {"bid_price": cat(4).astype(np.float64, copy=False).tolist(),
+                             "bid_volume": cat(5).astype(np.int64).tolist(),
+                             "ask_price": cat(6).astype(np.float64, copy=False).tolist(),
+                             "ask_volume": cat(7).astype(np.int64).tolist(),
+                             "indicator1": cat(8).astype(np.float64, copy=False).tolist(),
+                             "indicator2": cat(9).astype(np.float64, copy=False).tolist()})
+            self._cp_chunks = []
+            self._cp_n = 0
+            if self.no_market_data:
+                self._flush_tr()
+            return
         df = pd.DataFrame({
             "symbol": pd.Categorical(cat(1)),
             "ecn": pd.Categorical(cat(2)),
@@ -385,6 +527,19 @@ class SortedEmitter:
         b = self._tr
         if not b["ts"]:
             return
+        if self.pooled:
+            self._send_rows(table_name("fx_trades", self.suffix),
+                            np.asarray(b["ts"], dtype=np.int64),
+                            {"symbol": b["symbol"], "ecn": b["ecn"], "side": b["side"],
+                             "counterparty": b["counterparty"]},
+                            {"trade_id": b["trade_id"],
+                             "passive": [bool(x) for x in b["passive"]],
+                             "price": [float(x) for x in b["price"]],
+                             "quantity": [float(x) for x in b["quantity"]],
+                             "order_id": b["order_id"]})
+            for v in b.values():
+                v.clear()
+            return
         df = pd.DataFrame({
             "symbol": pd.Categorical(b["symbol"]),
             "ecn": pd.Categorical(b["ecn"]),
@@ -402,11 +557,62 @@ class SortedEmitter:
         for v in b.values():
             v.clear()
 
+    def _flush_fw(self):
+        if not self._fw_chunks:
+            return
+        n = self._fw_n
+        ts = np.empty(n, dtype=np.int64)
+        symbol = []
+        tenor = []
+        tenor_days = np.empty(n, dtype=np.int32)
+        value_date = np.empty(n, dtype=np.int64)
+        bid = np.empty(n, dtype=np.float64)
+        ask = np.empty(n, dtype=np.float64)
+        spot = np.empty(n, dtype=np.float64)
+        i = 0
+        for ts_ns, sym, tenors, days, vd, bp, ap, sr in self._fw_chunks:
+            k = len(tenors)
+            ts[i:i + k] = ts_ns
+            symbol.extend([sym] * k)
+            tenor.extend(tenors)
+            tenor_days[i:i + k] = days
+            value_date[i:i + k] = vd
+            bid[i:i + k] = bp
+            ask[i:i + k] = ap
+            spot[i:i + k] = sr
+            i += k
+        if self.pooled:
+            self._send_rows(table_name("fx_forward_points", self.suffix), ts,
+                            {"symbol": symbol, "tenor": tenor, "source": ["FWD_FEED"] * n},
+                            {"tenor_days": tenor_days.tolist(),
+                             "value_date": [TimestampNanos(v) for v in value_date.tolist()],
+                             "bid_points": bid.tolist(), "ask_points": ask.tolist(),
+                             "spot_ref": spot.tolist()})
+            self._fw_chunks = []
+            self._fw_n = 0
+            return
+        df = pd.DataFrame({
+            "symbol": pd.Categorical(symbol),
+            "tenor": pd.Categorical(tenor),
+            "tenor_days": tenor_days,
+            "value_date": pd.to_datetime(value_date, unit="ns"),
+            "bid_points": bid,
+            "ask_points": ask,
+            "spot_ref": spot,
+            "source": pd.Categorical(["FWD_FEED"] * n),
+            "ts": pd.to_datetime(ts, unit="ns"),
+        })
+        self._send_df(df, table_name("fx_forward_points", self.suffix),
+                      ["symbol", "tenor", "source"], 96)
+        self._fw_chunks = []
+        self._fw_n = 0
+
     # --- flush all before exit --- #
     def flush_all(self):
         self._flush_md()
         self._flush_cp()
         self._flush_tr()
+        self._flush_fw()
 
 
 def qwp_addr_list(host, default_port=9000):
@@ -424,6 +630,16 @@ def qwp_addr_list(host, default_port=9000):
             continue
         out.append(h if ":" in h else f"{h}:{default_port}")
     return ",".join(out)
+
+def qwp_base_conf(args):
+    """Scheme, addr list, token and TLS shared by every QWP connection (ingest and reads)."""
+    scheme = "wss" if args.qwp_tls else "ws"
+    conf = f"{scheme}::addr={qwp_addr_list(args.host)};"
+    if args.token:
+        conf += f"token={args.token};"
+    if args.qwp_tls:
+        conf += "tls_verify=unsafe_off;"
+    return conf
 
 def pg_host(host):
     """First bare hostname from --host (strip :port and any extra hosts).
@@ -562,6 +778,20 @@ def ensure_tables_exist(args, suffix):
             order_id UUID PARQUET(default, zstd(4))
         ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '1 MONTH', TABLE_ENTERPRISE_POLICY)} DEDUP UPSERT KEYS(timestamp, trade_id);
         """)
+        if getattr(args, "forwards", False):
+            conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name('fx_forward_points', suffix)} (
+                timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+                symbol SYMBOL CAPACITY 15000 PARQUET(rle_dictionary, zstd(4), bloom_filter),
+                tenor SYMBOL PARQUET(rle_dictionary, zstd(4)),
+                tenor_days INT PARQUET(default, zstd(4)),
+                value_date TIMESTAMP PARQUET(delta_binary_packed, zstd(4)),
+                bid_points DOUBLE PARQUET(default, zstd(4)),
+                ask_points DOUBLE PARQUET(default, zstd(4)),
+                spot_ref DOUBLE PARQUET(default, zstd(4)),
+                source SYMBOL PARQUET(rle_dictionary, zstd(4))
+            ) timestamp(timestamp) PARTITION BY HOUR {retention_clause(short_ttl, enterprise, '3 DAYS', TABLE_ENTERPRISE_POLICY)} DEDUP UPSERT KEYS(timestamp, symbol, tenor);
+            """)
 
 def ensure_materialized_views_exist(args, suffix):
     conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
@@ -716,6 +946,21 @@ def ensure_materialized_views_exist(args, suffix):
        ) PARTITION BY MONTH {rc('1 MONTH', 'TO REMOTE 1 month, TO PARQUET 1 month, DROP LOCAL 12 months')};
         """)
 
+        # 2 DAYS rather than core_price_1s's 4 HOURS: the planted bad point (09:20 UTC by
+        # default) must still be in the view for an afternoon demo querying '$today'.
+        if getattr(args, "forwards", False): conn.execute(f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name('fx_forward_points_1m', suffix)} AS (
+            SELECT timestamp, symbol, tenor,
+                last(bid_points) AS bid_points,
+                last(ask_points) AS ask_points,
+                last(spot_ref) AS spot_ref,
+                last(value_date) AS value_date,
+                last(tenor_days) AS tenor_days
+            FROM {table_name('fx_forward_points', suffix)}
+            SAMPLE BY 1m
+        ) PARTITION BY HOUR {rc('2 DAYS', 'TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 12 months')};
+        """)
+
 
 # used only with incremental mode
 def load_initial_state(args, suffix):
@@ -731,11 +976,25 @@ def load_initial_state(args, suffix):
             }
     return state
 
+def complete_initial_state(state, fx_pairs):
+    # Incremental runs start from the latest row per symbol; a pair with no rows yet (e.g. the
+    # first run with --metals) starts from its bracket instead of failing on a missing key.
+    missing = [p for p in fx_pairs if p[0] not in state]
+    if missing:
+        state.update(load_initial_state_from_brackets(missing))
+    for symbol, _low, _high, _precision, pip, _rank in fx_pairs:
+        prm = METAL_PARAMS.get(symbol)
+        if prm is not None:
+            s = state[symbol]
+            s["spread"] = max(prm["spread"][0] * pip, quantize_to_pip(s["ask_price"] - s["bid_price"], pip))
+    return state
+
 def load_initial_state_from_brackets(fx_pairs):
     state = {}
     for symbol, low, high, precision, pip, rank in fx_pairs:
         mid = (low + high) / 2
-        spread = quantize_to_pip(0.0004, pip)
+        prm = METAL_PARAMS.get(symbol)
+        spread = quantize_to_pip(0.0004, pip) if prm is None else prm["spread"][0] * pip
         state[symbol] = {
             "bid_price": quantize_to_pip(mid - spread / 2, pip),
             "ask_price": quantize_to_pip(mid + spread / 2, pip),
@@ -748,9 +1007,14 @@ def load_initial_state_from_brackets(fx_pairs):
 def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
     out = []
     pct = bracket_pct / 100.0
+    mids = {}
     print("[INFO] Refreshing reference data from Yahoo Finance.", flush=True)
     for symbol, _low, _high, precision, pip, rank in fx_pairs_template:
-        ysym = symbol + "=X"
+        prm = METAL_PARAMS.get(symbol)
+        if symbol in YAHOO_DERIVED:
+            out.append(None)  # filled below, once its legs are known
+            continue
+        ysym = symbol + "=X" if prm is None else prm["yahoo"]
         try:
             bars = yf.Ticker(ysym).history(period="1d", interval="1m")
             if not bars.empty:
@@ -763,6 +1027,7 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
                     #print(f"[YF] {symbol}: Got {mid}")
                 low = mid * (1 - pct)
                 high = mid * (1 + pct)
+                mids[symbol] = mid
             else:
                 print(f"[YF] {symbol}: DataFrame EMPTY. Fallback used.", flush=True)
                 raise ValueError("No data from Yahoo")
@@ -771,6 +1036,16 @@ def fetch_fx_pairs_from_yahoo(fx_pairs_template, bracket_pct=1.0):
             high = _high
             print(f"[YF] {symbol}: Fallback to template low/high: {low}, {high}", flush=True)
         out.append((symbol, low, high, precision, pip, rank))
+    for i, (symbol, _low, _high, precision, pip, rank) in enumerate(fx_pairs_template):
+        if out[i] is not None:
+            continue
+        num, den = YAHOO_DERIVED[symbol]
+        if num in mids and den in mids:
+            mid = mids[num] / mids[den]
+            out[i] = (symbol, mid * (1 - pct), mid * (1 + pct), precision, pip, rank)
+        else:
+            out[i] = (symbol, _low, _high, precision, pip, rank)
+            print(f"[YF] {symbol}: Fallback to template low/high: {_low}, {_high}", flush=True)
     return out
 
 def fx_pairs_refresher(shared_fx_pairs, interval=300, bracket_pct=1.0, first_ready_event=None,
@@ -788,17 +1063,17 @@ def quantize_to_pip(price, pip):
     decimals = abs(int(round(np.log10(pip))))
     return round(round(price / pip) * pip, decimals)
 
-def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.9, shock_prob=0.010):
-    change = random.uniform(-drift * pip, drift * pip)
-    if random.random() < shock_prob:
-        change += random.uniform(-20 * pip, 20 * pip)
+def evolve_mid_price(prev_mid, low, high, precision, pip, drift=0.9, shock_prob=0.010, rng=random, shock_pips=20):
+    change = rng.uniform(-drift * pip, drift * pip)
+    if rng.random() < shock_prob:
+        change += rng.uniform(-shock_pips * pip, shock_pips * pip)
     new_mid = prev_mid + change
     return quantize_to_pip(max(low, min(high, new_mid)), pip)
 
-def evolve_indicator(value, drift=0.01, shock_prob=0.01):
-    value += random.uniform(-drift, drift)
-    if random.random() < shock_prob:
-        value += random.uniform(-0.2, 0.2)
+def evolve_indicator(value, drift=0.01, shock_prob=0.01, rng=random):
+    value += rng.uniform(-drift, drift)
+    if rng.random() < shock_prob:
+        value += rng.uniform(-0.2, 0.2)
     return max(0.0, min(1.0, value))
 
 def get_random_volume_for_level(level_idx, ladder):
@@ -823,22 +1098,34 @@ def evolve_state_one_tick(prev_state, fx_pairs, drift=5.0):
     for symbol, low, high, precision, pip, rank in fx_pairs:
         prev_mid = (prev_state[symbol]["bid_price"] + prev_state[symbol]["ask_price"]) / 2
         prev_spread = prev_state[symbol]["spread"]
-        new_mid = evolve_mid_price(prev_mid, low, high, precision, pip, drift=drift)
+        prm = METAL_PARAMS.get(symbol)
+        if prm is None:
+            # FX pairs: the original model, drawing from the global stream.
+            rng = random
+            new_mid = evolve_mid_price(prev_mid, low, high, precision, pip, drift=drift)
+            # Majors: 1 to 8 pips
+            min_pips, max_pips, step = 1, 8, 1
+        else:
+            # Metals draw from their own stream so the FX pairs' paths do not depend on --metals.
+            # Moves, shocks and the spread walk are scaled to each metal's price level in pips.
+            rng = _METALS_RNG
+            new_mid = evolve_mid_price(prev_mid, low, high, precision, pip, drift=drift * prm["move"],
+                                       shock_prob=prm["shock_prob"], rng=rng,
+                                       shock_pips=20 * prm["move"])
+            min_pips, max_pips = prm["spread"]
+            step = max(1, round((max_pips - min_pips) / 8))
 
         # Work in pips to avoid the tiny deltas disappearing on quantize
         spread_pips = int(round(prev_spread / pip))
 
         # Small random walk in pips, mostly flat, sometimes tighter or wider
-        spread_pips += random.choice([-1, 0, 0, 0, 1])
+        spread_pips += rng.choice([-1, 0, 0, 0, 1]) * step
 
         # Rare stress widening
-        if random.random() < 0.0005:  # tweak this probability for more or less frequency
-            spread_pips += random.randint(3, 10)
+        if rng.random() < 0.0005:  # tweak this probability for more or less frequency
+            spread_pips += rng.randint(3, 10) * step
 
         # Keep spreads in a sane range per pair
-        # Majors: 1 to 8 pips
-        min_pips = 1
-        max_pips = 8
         spread_pips = max(min_pips, min(max_pips, spread_pips))
 
         new_spread = spread_pips * pip
@@ -848,10 +1135,295 @@ def evolve_state_one_tick(prev_state, fx_pairs, drift=5.0):
             "bid_price": quantize_to_pip(new_mid - new_spread / 2, pip),
             "ask_price": quantize_to_pip(new_mid + new_spread / 2, pip),
             "spread": new_spread,
-            "indicator1": evolve_indicator(prev_state[symbol]["indicator1"]),
-            "indicator2": evolve_indicator(prev_state[symbol]["indicator2"])
+            "indicator1": evolve_indicator(prev_state[symbol]["indicator1"], rng=rng),
+            "indicator2": evolve_indicator(prev_state[symbol]["indicator2"], rng=rng)
         }
     return next_state
+
+# --- Forwards layer (--forwards) --- #
+# Forward points over spot at standard tenors, from covered interest parity on per-currency
+# short-rate curves (lease-rate curves for the metals), with a slow random walk on top.
+# Points are in pips. ON and TN follow market convention: they hold the points of the short
+# swaps today->tomorrow and tomorrow->spot as quoted, their value_date is today / tomorrow and
+# their tenor_days is negative (days before spot), so the outright for those dates is spot
+# MINUS the cumulative points (see the forwards queries in demo_queries.sql). Every row also
+# carries spot_ref, the generator's own mid the ladder was priced on.
+FWD_TENORS = ["ON", "TN", "1W", "2W", "1M", "2M", "3M", "6M", "9M", "1Y"]
+FWD_CYCLE_NS = 5_000_000_000      # one full ladder per pair every 5 seconds
+FWD_JITTER_NS = 400_000_000       # random delay on top of each pair's fixed phase in the cycle
+DAY_NS = 86_400_000_000_000
+
+# Covered pairs as (symbol, base, quote). EURJPY and XAUEUR are crosses derived from their legs.
+FWD_MAJORS = [("EURUSD", "EUR", "USD"), ("USDJPY", "USD", "JPY"), ("GBPUSD", "GBP", "USD"),
+              ("USDCHF", "USD", "CHF"), ("AUDUSD", "AUD", "USD"), ("USDCAD", "USD", "CAD"),
+              ("NZDUSD", "NZD", "USD"), ("EURJPY", "EUR", "JPY")]
+FWD_METALS = [("XAUUSD", "XAU", "USD"), ("XAGUSD", "XAG", "USD"), ("XPTUSD", "XPT", "USD"),
+              ("XPDUSD", "XPD", "USD"), ("XAUEUR", "XAU", "EUR")]
+# Cross -> (leg1, leg2, op): EURJPY = EURUSD x USDJPY, XAUEUR = XAUUSD / EURUSD, so the
+# triangular consistency check holds by construction (except for the planted bad point).
+FWD_CROSSES = {"EURJPY": ("EURUSD", "USDJPY", "mul"), "XAUEUR": ("XAUUSD", "EURUSD", "div")}
+
+# Half the bid/ask spread in pips per tenor for the majors, widening with tenor; scaled per
+# pair for crosses and metals (metals points are large numbers of pips: gold 3M is ~3,800).
+FWD_HALF_SPREAD_PIPS = np.array([0.03, 0.03, 0.05, 0.08, 0.12, 0.20, 0.25, 0.50, 0.75, 1.00])
+FWD_SPREAD_MULT = {"EURJPY": 1.5, "XAUUSD": 50.0, "XAGUSD": 15.0, "XPTUSD": 100.0,
+                   "XPDUSD": 200.0, "XAUEUR": 60.0}
+
+# Planted feed error: once per simulated day the bad symbol's 3M mid is published this many
+# pips away from what its legs imply, for FWD_BAD_POINT_MINUTES from --bad_point_utc.
+FWD_BAD_POINT_PIPS = 6.0
+FWD_BAD_POINT_TENOR = "3M"
+FWD_BAD_POINT_MINUTES = 20
+
+# Short-rate curves in percent per tenor (ON, TN, 1W, 2W, 1M, 2M, 3M, 6M, 9M, 1Y), set on
+# 2026-10-13. Eyeball them before a demo. Anchors are the policy rates as published by
+# centralbank.watch (as of 2026-10-09) and finobird.com/central-banks (as of 2026-10-12):
+# Fed 3.75-4.00% (mid 3.875), ECB deposit 2.50%, BoE 3.75%, BoJ 1.25%, SNB 0.00%,
+# RBA 4.60%, BoC 2.25%, RBNZ 2.75%. Overnight sits at the policy rate (EUR at the deposit
+# rate less the usual ~8 bp to EUR STR); the term shape follows the stated hike or cut bias.
+# Metals hold lease rates: silver 1M 5.6 to 6.3% and platinum 1M about 12.5% from 2026
+# BullionVault and Kitco reports (both curves inverted after the squeezes); gold in the 0 to 1%
+# band (published 1M gold lease was slightly negative); palladium has no published figure and
+# is an estimate, higher and noisier than gold.
+RATE_CURVES = {
+    "USD": [3.88, 3.88, 3.88, 3.89, 3.90, 3.92, 3.93, 3.95, 3.95, 3.94],
+    "EUR": [2.42, 2.42, 2.43, 2.44, 2.46, 2.49, 2.52, 2.58, 2.62, 2.65],
+    "GBP": [3.73, 3.73, 3.72, 3.71, 3.70, 3.68, 3.66, 3.61, 3.57, 3.54],
+    "JPY": [1.23, 1.23, 1.23, 1.24, 1.25, 1.26, 1.27, 1.30, 1.33, 1.35],
+    "CHF": [-0.05, -0.05, -0.04, -0.04, -0.03, -0.02, -0.01, 0.01, 0.03, 0.05],
+    "AUD": [4.58, 4.58, 4.59, 4.60, 4.61, 4.62, 4.63, 4.66, 4.68, 4.70],
+    "CAD": [2.24, 2.24, 2.24, 2.23, 2.22, 2.21, 2.20, 2.18, 2.16, 2.15],
+    "NZD": [2.73, 2.73, 2.74, 2.75, 2.77, 2.80, 2.83, 2.88, 2.92, 2.95],
+    "XAU": [0.05, 0.05, 0.08, 0.10, 0.15, 0.25, 0.35, 0.55, 0.70, 0.85],
+    "XAG": [6.20, 6.10, 6.00, 5.90, 5.70, 5.20, 4.80, 3.90, 3.30, 2.90],
+    "XPT": [13.00, 13.00, 12.80, 12.60, 12.50, 11.50, 10.50, 8.00, 6.50, 5.50],
+    "XPD": [6.00, 6.00, 5.90, 5.80, 5.60, 5.30, 5.00, 4.60, 4.30, 4.00],
+}
+# Day count basis: Act/365 for GBP, Act/360 for every other currency and for lease rates.
+RATE_DAY_COUNT = {"GBP": 365}
+# Random walk on top of the static curves, in basis points: a parallel shift per currency
+# (daily volatility, mean-reverting over about a week) plus per-tenor noise (stationary
+# standard deviation, mean-reverting over about an hour).
+RATE_SHIFT_DAILY_BP = {"XAU": 2.0, "XAG": 8.0, "XPT": 10.0, "XPD": 15.0}   # others 3.0
+RATE_TENOR_NOISE_BP = {"XAU": 1.0, "XAG": 3.0, "XPT": 5.0, "XPD": 8.0}     # others 0.5
+
+
+def _next_business_day(d):
+    while d.weekday() >= 5:
+        d += datetime.timedelta(days=1)
+    return d
+
+
+def _add_business_days(d, n):
+    for _ in range(n):
+        d = _next_business_day(d + datetime.timedelta(days=1))
+    return d
+
+
+def _last_business_day_of_month(year, month):
+    d = datetime.date(year, month, 1) + datetime.timedelta(days=32)
+    d = d.replace(day=1) - datetime.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def _modified_following(d):
+    f = _next_business_day(d)
+    if f.month != d.month:
+        f = d
+        while f.weekday() >= 5:
+            f -= datetime.timedelta(days=1)
+    return f
+
+
+def _add_months_eom(spot, months):
+    # Whole-month tenors roll from spot; end-of-month rule: a spot on the last business day of
+    # its month maps to the last business day of the target month.
+    y, m = divmod(spot.month - 1 + months, 12)
+    y, m = spot.year + y, m + 1
+    if spot == _last_business_day_of_month(spot.year, spot.month):
+        return _last_business_day_of_month(y, m)
+    last_day = (datetime.date(y, m, 1) + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
+    return _modified_following(datetime.date(y, m, min(spot.day, last_day.day)))
+
+
+def forward_value_dates(today):
+    """Value dates for every tenor on a given UTC trade date (weekday calendar, no holidays).
+
+    Returns (value_date, tenor_days, accrual_days) per tenor in FWD_TENORS order. Spot is T+2
+    business days for every pair (USDCAD is T+1 in the real market; kept at T+2 here). On a
+    weekend the trade date rolls to Monday. tenor_days counts calendar days from spot to the
+    value date, so it is negative for ON (today) and TN (tomorrow). accrual_days is the period
+    the points cover: today->tomorrow for ON, tomorrow->spot for TN, spot->value date otherwise.
+    """
+    td = _next_business_day(today)
+    tom = _add_business_days(td, 1)
+    spot = _add_business_days(td, 2)
+    out = [(td, (td - spot).days, (tom - td).days),
+           (tom, (tom - spot).days, (spot - tom).days)]
+    for weeks in (1, 2):
+        vd = _modified_following(spot + datetime.timedelta(days=7 * weeks))
+        out.append((vd, (vd - spot).days, (vd - spot).days))
+    for months in (1, 2, 3, 6, 9, 12):
+        vd = _add_months_eom(spot, months)
+        out.append((vd, (vd - spot).days, (vd - spot).days))
+    return out
+
+
+class ForwardsModel:
+    """Forward point ladders for the covered pairs, emitted on a fixed 5-second cadence.
+
+    Each pair has a fixed phase in the cycle plus a random jitter, so pairs do not emit together.
+    The rate curves step once per cycle. All randomness comes from the rng passed in (its own
+    stream, never the global one), so spot data is identical with --forwards on or off. The
+    model is used the same way in both modes: faster-than-life calls emissions() per chunk in
+    the parent and hands the plan to one worker; real-time calls it every second in the worker.
+    """
+
+    def __init__(self, metals, rng, start_ns, bad_point_ns_of_day):
+        self.pairs = FWD_MAJORS + (FWD_METALS if metals else [])
+        self.symbols = [p[0] for p in self.pairs]
+        self.legs = {s: (b, q) for s, b, q in self.pairs}
+        self.ccys = sorted({c for _, b, q in self.pairs for c in (b, q)})
+        self.rng = rng
+        self.base = {c: np.asarray(RATE_CURVES[c], dtype=np.float64) for c in self.ccys}
+        self.shift = {c: 0.0 for c in self.ccys}
+        self.noise = {c: np.zeros(len(FWD_TENORS)) for c in self.ccys}
+        cycles_per_day = DAY_NS // FWD_CYCLE_NS
+        self.shift_theta = 1.0 / (7 * cycles_per_day)
+        self.noise_theta = 1.0 / (3600 * 1_000_000_000 // FWD_CYCLE_NS)
+        self.shift_sigma = {c: RATE_SHIFT_DAILY_BP.get(c, 3.0) / math.sqrt(cycles_per_day) for c in self.ccys}
+        self.noise_sigma = {c: RATE_TENOR_NOISE_BP.get(c, 0.5) * math.sqrt(2 * self.noise_theta) for c in self.ccys}
+        # Phases leave room for the jitter so every ladder of a cycle stays inside its 5-second
+        # slot. Cycles tile the minute, so the 1-minute view's last ladder per pair always comes
+        # from the same cycle (same rate step) for every pair; otherwise a cross and its legs
+        # could be a rate step apart, which on XAUEUR 1Y is about 2 pips of false gap.
+        n = len(self.symbols)
+        self.phase = {s: k * (FWD_CYCLE_NS - FWD_JITTER_NS) // n for k, s in enumerate(self.symbols)}
+        self.cycle = -(-start_ns // FWD_CYCLE_NS)   # first cycle starting at or after start_ns
+        self.pending = []
+        self.bad_symbol = "XAUEUR" if metals else "EURJPY"
+        self.bad_tenor_idx = FWD_TENORS.index(FWD_BAD_POINT_TENOR)
+        self.bad_from = bad_point_ns_of_day
+        self.bad_to = bad_point_ns_of_day + FWD_BAD_POINT_MINUTES * 60 * 1_000_000_000
+        self._dates = {}
+
+    def _step_rates(self):
+        g = self.rng.gauss
+        for c in self.ccys:
+            self.shift[c] = self.shift[c] * (1 - self.shift_theta) + self.shift_sigma[c] * g(0.0, 1.0)
+            eps = np.array([g(0.0, 1.0) for _ in FWD_TENORS])
+            self.noise[c] = self.noise[c] * (1 - self.noise_theta) + self.noise_sigma[c] * eps
+
+    def rates(self, ccy):
+        # Percent per tenor: static curve plus the walk (kept in basis points).
+        return self.base[ccy] + (self.shift[ccy] + self.noise[ccy]) / 100.0
+
+    def _dates_for(self, day_idx):
+        d = self._dates.get(day_idx)
+        if d is None:
+            if len(self._dates) > 8:
+                self._dates.clear()
+            today = datetime.date(1970, 1, 1) + datetime.timedelta(days=int(day_idx))
+            vds = forward_value_dates(today)
+            epoch = datetime.date(1970, 1, 1)
+            d = (np.array([(v - epoch).days * DAY_NS for v, _, _ in vds], dtype=np.int64),
+                 np.array([t for _, t, _ in vds], dtype=np.int32),
+                 np.array([a for _, _, a in vds], dtype=np.float64))
+            self._dates[day_idx] = d
+        return d
+
+    def _factor(self, symbol, accrual_days):
+        base, quote = self.legs[symbol]
+        rb = self.rates(base) / 100.0
+        rq = self.rates(quote) / 100.0
+        return ((1 + rq * accrual_days / RATE_DAY_COUNT.get(quote, 360))
+                / (1 + rb * accrual_days / RATE_DAY_COUNT.get(base, 360)))
+
+    def premium(self, symbol, accrual_days):
+        """Forward premium F/S - 1 per tenor (for ON and TN, over their own short period)."""
+        cross = FWD_CROSSES.get(symbol)
+        if cross is None:
+            return self._factor(symbol, accrual_days) - 1
+        leg1, leg2, op = cross
+        f1 = self._factor(leg1, accrual_days)
+        f2 = self._factor(leg2, accrual_days)
+        return (f1 * f2 if op == "mul" else f1 / f2) - 1
+
+    def is_bad(self, symbol, ts):
+        if symbol != self.bad_symbol:
+            return False
+        tod = ts % DAY_NS
+        # A window starting late in the day wraps past midnight.
+        return self.bad_from <= tod < self.bad_to or tod < self.bad_to - DAY_NS
+
+    def emissions(self, t0, t1):
+        """Ladders due in [t0, t1), sorted by timestamp, as
+        (ts, symbol, premium[10], value_date_ns[10], tenor_days[10], bad).
+
+        Cycles are processed whole and in order, so the result does not depend on how the
+        caller slices time. Ladders before t0 (e.g. after a real-time stall) are dropped, but
+        their cycles still step the rate walk."""
+        while self.cycle * FWD_CYCLE_NS < t1:
+            c0 = self.cycle * FWD_CYCLE_NS
+            self._step_rates()
+            for s in self.symbols:
+                ts = c0 + self.phase[s] + int(self.rng.random() * FWD_JITTER_NS)
+                vd, tdays, accrual = self._dates_for(ts // DAY_NS)
+                self.pending.append((ts, s, self.premium(s, accrual), vd, tdays, self.is_bad(s, ts)))
+            self.cycle += 1
+        self.pending.sort(key=lambda e: e[0])
+        due = [e for e in self.pending if e[0] < t1]
+        self.pending = [e for e in self.pending if e[0] >= t1]
+        return [e for e in due if e[0] >= t0]
+
+
+def emit_forward_ladder(emitter, emission, spot_mid, pip):
+    """Turn one planned ladder into fx_forward_points rows at the given spot mid.
+
+    spot_ref is the mid the ladder was priced on (rounded to 1/100 pip), as forward feeds publish
+    a reference spot. Points scale with spot, so a consistency check across pairs must convert
+    points to forward premium (points x pip / spot_ref) on this spot, not on a spot sampled at
+    another instant: for gold, a minute of spot drift moves 1Y points by several pips."""
+    ts, symbol, prem, vd, tdays, bad = emission
+    spot_mid = round(spot_mid, abs(int(round(math.log10(pip)))) + 2)
+    mid = spot_mid * prem / pip
+    if bad:
+        mid = mid.copy()
+        mid[FWD_TENORS.index(FWD_BAD_POINT_TENOR)] += FWD_BAD_POINT_PIPS
+    half = FWD_HALF_SPREAD_PIPS * FWD_SPREAD_MULT.get(symbol, 1.0)
+    emitter.emit_fwd_ladder(ts, symbol, FWD_TENORS, tdays, vd,
+                            np.round(mid - half, 2), np.round(mid + half, 2), spot_mid)
+
+
+def report_bad_points(bad_ts, symbol):
+    """Print the planted bad point's timestamps per day, ready to paste as DECLARE values."""
+    if not bad_ts:
+        print(f"[FORWARDS] No planted bad point in this run ({symbol} {FWD_BAD_POINT_TENOR} window not covered).",
+              flush=True)
+        return
+    by_day = {}
+    for ts in sorted(bad_ts):
+        by_day.setdefault(ts // DAY_NS, []).append(ts)
+    for day, tss in sorted(by_day.items()):
+        print(f"[FORWARDS] Planted bad point {symbol} {FWD_BAD_POINT_TENOR} (+{FWD_BAD_POINT_PIPS:g} pips) "
+              f"on {ns_to_iso(day * DAY_NS)[:10]}: {len(tss)} ladders, "
+              f"@bad_point_from := '{ns_to_iso(tss[0])}', @bad_point_to := '{ns_to_iso(tss[-1])}'",
+              flush=True)
+
+
+def parse_bad_point_utc(s):
+    try:
+        hh, mm = s.split(":")
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            raise ValueError
+    except ValueError:
+        print(f"ERROR: --bad_point_utc must be HH:MM in UTC, got {s!r}.")
+        sys.exit(1)
+    return (hh * 60 + mm) * 60 * 1_000_000_000
+
 
 def precompute_open_close_state(total_seconds, fx_pairs, state_template):
     open_per_second = []
@@ -929,6 +1501,10 @@ def generate_events_for_second(
 
     level_pips = np.arange(max_levels, dtype=np.float64)
 
+    def scale_vols(vols, prm):
+        # Metals: the same ladder draws, rescaled to troy ounces (FX rows are untouched).
+        return np.maximum(1.0, np.round(vols * prm["vol"]))
+
     def interp_open_close(symbol, n):
         # Interpolated best bid/ask per event ordinal, first/last pinned exactly
         # to the open/close state (the OHLC continuity guarantee).
@@ -945,11 +1521,11 @@ def generate_events_for_second(
         ask[-1] = c["ask_price"]
         return bid, ask
 
-    def price_grids(bid_vec, ask_vec, pip):
+    def price_grids(bid_vec, ask_vec, pip, prm=None):
         # Level i price = best -/+ i pips, quantized exactly like quantize_to_pip():
-        # round(round(p / pip) * pip, decimals).
+        # round(round(p / pip) * pip, decimals). Metals space levels prm["level"] pips apart.
         decimals = abs(int(round(math.log10(pip))))
-        steps = level_pips * pip
+        steps = level_pips * pip if prm is None else level_pips * (prm["level"] * pip)
         pb = np.round(np.round((bid_vec[:, None] - steps) / pip) * pip, decimals)
         pa = np.round(np.round((ask_vec[:, None] + steps) / pip) * pip, decimals)
         return pb, pa
@@ -967,19 +1543,26 @@ def generate_events_for_second(
             idx = np.flatnonzero(sym_idx_market == k)
             if idx.size == 0:
                 continue
+            prm = METAL_PARAMS.get(symbol)
             bid_vec, ask_vec = interp_open_close(symbol, idx.size)
-            pb, pa = price_grids(bid_vec, ask_vec, pip)
+            pb, pa = price_grids(bid_vec, ask_vec, pip, prm)
+            if prm is None:
+                bvol_rows, avol_rows = md_bid_vols, md_ask_vols   # indexed by event e
+            else:
+                bvol_rows = scale_vols(md_bid_vols[idx], prm)    # indexed by ordinal j
+                avol_rows = scale_vols(md_ask_vols[idx], prm)
             for j, e in enumerate(idx):
                 row_ts = int(row_ts_market[e])
                 if end_ns is not None and row_ts >= end_ns:
                     continue
+                r = e if prm is None else j
                 lv = levels_market[e]
                 bids = np.empty((2, lv))
                 bids[0] = pb[j, :lv]
-                bids[1] = md_bid_vols[e, :lv]
+                bids[1] = bvol_rows[r, :lv]
                 asks = np.empty((2, lv))
                 asks[0] = pa[j, :lv]
-                asks[1] = md_ask_vols[e, :lv]
+                asks[1] = avol_rows[r, :lv]
                 emitter.emit_market(row_ts, symbol, bids, asks)
 
     # --- Generate core_price events (FEWER - BBO snapshots with metadata) ---
@@ -990,7 +1573,7 @@ def generate_events_for_second(
     # dict per core event (which dominated generation at high core EPS).
     ecn_arr = np.asarray(ecn_pool)
     reason_arr = np.asarray(reason_pool)
-    symbol_books = []  # (symbol, pb, pa, bid_vols, ask_vols, levels, ts, ecn, pip, rank, n)
+    symbol_books = []  # (symbol, pb, pa, bid_vols, ask_vols, levels, ts, ecn, tick, rank, n, size_scale)
     if core_count > 0:
         offsets_core = np.sort(np.random.randint(0, window_ns, core_count, dtype=np.int64))
         sym_idx_core = np.random.randint(0, n_pairs, core_count)
@@ -1012,8 +1595,9 @@ def generate_events_for_second(
             ind2_open = float(round(o_state["indicator2"], 3))
             ind1_close = float(round(c_state["indicator1"], 3))
             ind2_close = float(round(c_state["indicator2"], 3))
+            prm = METAL_PARAMS.get(symbol)
             bid_vec, ask_vec = interp_open_close(symbol, n_events)
-            pb, pa = price_grids(bid_vec, ask_vec, pip)
+            pb, pa = price_grids(bid_vec, ask_vec, pip, prm)
 
             # Indicators use the open state for every event except the last, which
             # uses the close state (first event = open, last event = close), exactly
@@ -1028,6 +1612,9 @@ def generate_events_for_second(
             reason_sym = reason_arr[reason_idx[idx]]
             bvols = core_bid_vols[idx]
             avols = core_ask_vols[idx]
+            if prm is not None:
+                bvols = scale_vols(bvols, prm)
+                avols = scale_vols(avols, prm)
             lvls = levels_core[idx]
 
             # In faster-than-life the time window can end mid-second; drop events at
@@ -1053,8 +1640,11 @@ def generate_events_for_second(
 
             # Book kept as (prices, volumes) row views into the grids, so a sampled
             # trade executes against exactly the book whose level 0 was published.
+            # Metals trade on their own level spacing and in ounces.
+            tick = pip if prm is None else prm["level"] * pip
             symbol_books.append((symbol, pb, pa, bvols, avols, lvls, ts_sym,
-                                 ecn_sym, pip, rank, n_events))
+                                 ecn_sym, tick, rank, n_events,
+                                 None if prm is None else prm["size"]))
 
     # --- Generate trades from core_price events ---
     # Weight orders by liquidity rank (lower rank = more liquid = higher weight).
@@ -1071,7 +1661,7 @@ def generate_events_for_second(
 
         selected_events = []
         for bk in chosen_books:
-            symbol, pb, pa, bvols, avols, lvls, ts_sym, ecn_sym, pip, rank, n_events = bk
+            symbol, pb, pa, bvols, avols, lvls, ts_sym, ecn_sym, pip, rank, n_events, size_scale = bk
             p = random.randrange(n_events)
             selected_events.append({
                 "timestamp": int(ts_sym[p]),
@@ -1082,6 +1672,7 @@ def generate_events_for_second(
                 "levels": int(lvls[p]),
                 "pip": pip,
                 "rank": rank,
+                "size_scale": size_scale,
             })
 
         for cp_event in selected_events:
@@ -1100,7 +1691,8 @@ def generate_events_for_second(
                 float(cp_event["asks"][0][0]),
                 cp_event["pip"],
                 cp_event["rank"],
-                cp_event["ecn"]
+                cp_event["ecn"],
+                cp_event["size_scale"]
             )
 
             # Execute order
@@ -1125,7 +1717,7 @@ def generate_events_for_second(
                     trade_ts,
                     cp_event["symbol"],
                     cp_event["ecn"],
-                    str(uuid.uuid4()),
+                    new_uuid(),
                     trade["side"],
                     trade["passive"],
                     trade["price"],
@@ -1187,9 +1779,11 @@ def ingest_worker(
     pause_event,
     global_sec_idx_offset, # only meaningful in faster-than-life
     lei_pool,
-    shutdown_event=None
+    shutdown_event=None,
+    fwd_plan=None  # faster-than-life + --forwards: this chunk's ladders (worker 0 only)
 ):
     _ignore_sigint()
+    seed_process(args.seed, "worker", args.mode, start_ns, process_idx)
     buffer_limit = compute_buffer_limit(args)
 
     auto_flush_interval = buffer_limit * 2  # safety net in the ILP client
@@ -1197,25 +1791,27 @@ def ingest_worker(
     if args.protocol == "http":
         conf = f"http::addr={args.host}:9000;auto_flush_interval={auto_flush_interval};" if not args.token else f"https::addr={args.host}:9000;token={args.token};tls_verify=unsafe_off;auto_flush_interval={auto_flush_interval};"
     elif args.protocol == "qwp":
-        # QWP/WebSocket. Same Sender.from_conf() + dataframe() API as ILP; only the conf
-        # differs. QWP has its own versioning, so protocol_version is NOT set (it errors on
-        # QWP). Each worker gets a unique sender_id + store-and-forward dir so un-acked frames
-        # survive reconnects/failover without colliding between processes.
-        scheme = "wss" if args.qwp_tls else "ws"
+        # QWP/WebSocket through questdb.connect(): the pool fails over across the addr list
+        # to the new primary and replays store-and-forward frames on its own. A standalone
+        # Sender drives one connection and stops on a replica ("role mismatch"). QWP has its
+        # own versioning, so protocol_version is NOT set (it errors on QWP). Each worker gets
+        # a unique sender_id + store-and-forward dir so un-acked frames survive reconnects
+        # and failover without colliding between processes. Pool auto-flush stays on (its
+        # defaults), so frames never exceed the server's frame cap.
         sender_id = f"fx-{process_idx}"
         sf_dir = os.path.join(args.store_forward_dir, sender_id)
         os.makedirs(sf_dir, exist_ok=True)
-        # --host may be a comma-separated host:port list for multi-host HA failover.
-        parts = [f"{scheme}::addr={qwp_addr_list(args.host)};", "auto_flush=off;"]
-        if args.token:
-            parts.append(f"token={args.token};")
-        if args.qwp_tls:
-            parts.append("tls_verify=unsafe_off;")
+        parts = [qwp_base_conf(args)]
         parts.append(f"sender_id={sender_id};")
         parts.append(f"sf_dir={sf_dir};")
         parts.append("reconnect_max_duration_millis=300000;")
         parts.append("reconnect_initial_backoff_millis=100;")
         parts.append("reconnect_max_backoff_millis=5000;")
+        # Published-but-unacked frame window (default 128). The real-time loop publishes
+        # several small frames per slice, so during a primary outage 128 fills in seconds
+        # and flush fails with "timed out waiting for local queue capacity" after 30 s.
+        # 4096 rode out a 4-minute outage at the live demo rates with no lost seconds.
+        parts.append("max_in_flight=4096;")
         if args.durable_ack:
             parts.append("request_durable_ack=on;")
         conf = "".join(parts)
@@ -1231,7 +1827,31 @@ def ingest_worker(
     # <-- NEW: Track last close per symbol for continuity
     last_close_per_symbol = {}
 
-    with Sender.from_conf(conf) as sender:
+    # Forwards: spot for a ladder is the generator's own mid for the pair at that instant,
+    # interpolated on the second's open->close line like every other event.
+    pip_by_symbol = {p[0]: p[4] for p in list(fx_pairs)}
+
+    def spot_mid_at(o_state, c_state, symbol, f):
+        o = o_state[symbol]
+        c = c_state[symbol]
+        om = (o["bid_price"] + o["ask_price"]) / 2
+        cm = (c["bid_price"] + c["ask_price"]) / 2
+        return om + min(1.0, max(0.0, f)) * (cm - om)
+
+    fwd_i = 0
+    fwd_model = None
+    fwd_bad_ts = []
+    if getattr(args, "forwards", False) and args.mode == "real-time":
+        fwd_rng = random.Random(None if args.seed is None else _derive_seed(args.seed, "forwards", "real-time"))
+        fwd_model = ForwardsModel(args.metals, fwd_rng, time.time_ns(), parse_bad_point_utc(args.bad_point_utc))
+        fwd_cursor = None
+
+    with contextlib.ExitStack() as stack:
+        if args.protocol == "qwp":
+            db = stack.enter_context(questdb.connect(conf))
+            sender = stack.enter_context(db.sender())
+        else:
+            sender = stack.enter_context(Sender.from_conf(conf))
         emitter = SortedEmitter(sender, buffer_limit=buffer_limit, suffix=args.suffix,
                                 no_market_data=args.no_market_data)
         wall_start = None  # for real-time alignment
@@ -1255,6 +1875,16 @@ def ingest_worker(
                     end_ns, args.suffix, False,
                     orders_total, lei_pool
                 )
+                # Forward ladders planned for this second (only the worker given a plan).
+                if fwd_plan:
+                    sec_end = ts + 1_000_000_000
+                    while fwd_i < len(fwd_plan) and fwd_plan[fwd_i][0] < sec_end:
+                        em = fwd_plan[fwd_i]
+                        fwd_i += 1
+                        if em[0] < ts or (end_ns is not None and em[0] >= end_ns):
+                            continue
+                        mid = spot_mid_at(open_state, close_state, em[1], (em[0] - ts) / 1e9)
+                        emit_forward_ladder(emitter, em, mid, pip_by_symbol[em[1]])
                 # Stop budget counts core_price events when market_data is disabled.
                 sent += core_total if args.no_market_data else market_total
 
@@ -1298,6 +1928,20 @@ def ingest_worker(
                 # Evolve for close (to be used as interpolation target)
                 close_state = evolve_state_one_tick(current_state, fx_pairs_snapshot, 7.0)
 
+                # Forward ladders due in this second. Rows carry the same +2s lead as the spot
+                # rows (see generate_events_for_second). After a stall (WAL pause, hiccup) the
+                # missed ladders are skipped rather than back-filled behind live spot.
+                if fwd_model is not None:
+                    sec_ts = time.time_ns() + 2_000_000_000
+                    if fwd_cursor is None or fwd_cursor < sec_ts - 10_000_000_000:
+                        fwd_cursor = sec_ts
+                    for em in fwd_model.emissions(fwd_cursor, sec_ts + 1_000_000_000):
+                        mid = spot_mid_at(open_state, close_state, em[1], (em[0] - sec_ts) / 1e9)
+                        emit_forward_ladder(emitter, em, mid, pip_by_symbol[em[1]])
+                        if em[5]:
+                            fwd_bad_ts.append(em[0])
+                    fwd_cursor = max(fwd_cursor, sec_ts + 1_000_000_000)
+
                 for s in range(n_slices):
                     # Sub-window open/close land on the same open->close line, so the price
                     # trajectory and second-boundary continuity are identical to the unsliced case.
@@ -1335,13 +1979,16 @@ def ingest_worker(
                 sec_idx += 1
             emitter.flush_all()
 
-        # QWP/WebSocket: drain outstanding store-and-forward frames (wait for acks)
-        # before the sender closes, so a clean exit does not lose buffered rows.
+        # QWP/WebSocket: publish the rest and wait for the server acks before the lease
+        # and pool close, so a clean exit does not lose buffered rows.
         if args.protocol == "qwp":
             emitter.flush_all()
-            sender.close_drain()
+            sender.flush(wait=True)
 
     # ... main event loop ends here ...
+
+    if fwd_model is not None:
+        report_bad_points(fwd_bad_ts, fwd_model.bad_symbol)
 
     # Print reason for exit
     if _shutting_down(shutdown_event):
@@ -1360,16 +2007,34 @@ def wal_monitor(args, pause_event, threshold, suffix='', interval=5, shutdown_ev
     _ignore_sigint()
     import time
     import psycopg as pg
-    conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
     last_logged_paused = False
 
     # Watch the busiest table for WAL lag: market_data normally, core_price when it is disabled.
     mon_table = table_name('core_price' if getattr(args, "no_market_data", False) else 'market_data', suffix)
+    sql = f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'"
     print(f"[WAL MONITOR] Watching {mon_table} with lag threshold {threshold}")
-    with pg.connect(conn_str, autocommit=True) as conn:
+    with contextlib.ExitStack() as stack:
+        if args.protocol == "qwp":
+            # QWP reads go through the pool across the whole --host list. target=primary
+            # keeps them on the node that is ingesting; through a failover each query
+            # retries until a new primary answers, within the same 5-minute budget as
+            # ingest reconnects (attempts set high so the time budget is the real limit).
+            db = stack.enter_context(questdb.connect(
+                qwp_base_conf(args) + "target=primary;"
+                "failover_max_duration_ms=300000;failover_max_attempts=1000;"))
+
+            def fetch_row():
+                df = db.query(sql).to_pandas()
+                return (int(df.iat[0, 0]), int(df.iat[0, 1])) if len(df) else None
+        else:
+            conn_str = f"user={args.user} password={args.password} host={pg_host(args.host)} port={args.pg_port} dbname=qdb"
+            conn = stack.enter_context(pg.connect(conn_str, autocommit=True))
+
+            def fetch_row():
+                return conn.execute(sql).fetchone()
+
         while not _shutting_down(shutdown_event):
-            cur = conn.execute(f"SELECT sequencerTxn, writerTxn FROM wal_tables() WHERE name = '{mon_table}'")
-            row = cur.fetchone()
+            row = fetch_row()
             if row:
                 seq, wrt = row
                 lag = seq - wrt
@@ -1422,7 +2087,7 @@ def main():
     parser.add_argument("--token_x", default=None)
     parser.add_argument("--token_y", default=None)
     parser.add_argument("--ilp_user", default="admin")
-    parser.add_argument("--protocol", choices=["http", "tcp", "qwp"], default="http")
+    parser.add_argument("--protocol", choices=["http", "tcp", "qwp"], default="qwp")
     parser.add_argument("--qwp_tls", type=lambda x: str(x).lower() == 'true', default=False,
                         help="QWP only: use wss (TLS) instead of ws, with tls_verify=unsafe_off")
     parser.add_argument("--durable_ack", type=lambda x: str(x).lower() == 'true', default=False,
@@ -1469,9 +2134,24 @@ def main():
     parser.add_argument("--lei_pool_size", type=int, default=2000)
     parser.add_argument("--chunk_seconds", type=int, default=900,
                         help="Max seconds to precompute at once in faster-than-life mode (default: 900 = 15 min)")
+    parser.add_argument("--metals", type=lambda x: str(x).lower() == 'true', default=False,
+                        help="Add the precious metals pairs XAUUSD, XAGUSD, XPTUSD, XPDUSD and XAUEUR to the "
+                             "universe. Total EPS is unchanged, so each FX pair gets 30/35 of its usual rows.")
+    parser.add_argument("--forwards", type=lambda x: str(x).lower() == 'true', default=False,
+                        help="Create and fill fx_forward_points (+ fx_forward_points_1m with --create_views): "
+                             "forward point ladders for the majors and EURJPY, plus the metals with --metals.")
+    parser.add_argument("--bad_point_utc", type=str, default="09:20",
+                        help="--forwards only: UTC start (HH:MM) of the daily 20-minute planted bad point "
+                             "(EURJPY 3M, or XAUEUR 3M with --metals) for the triangular consistency demo.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed every random stream so faster-than-life runs are reproducible byte for "
+                             "byte (Yahoo brackets aside). Default: unseeded, as before.")
 
     args = parser.parse_args()
     suffix = args.suffix
+    if args.forwards:
+        parse_bad_point_utc(args.bad_point_utc)   # validate early
+    seed_process(args.seed, "parent", args.mode)
 
     # Token file wins over inline --token (keeps the token off the command line).
     if args.token_file:
@@ -1586,12 +2266,13 @@ def main():
     shutdown_event = mp.Event()
     _install_parent_sigint(shutdown_event)
     refresher_proc = None
+    universe = pair_universe(args.metals)
     if args.mode == "real-time":
         # Real-time uses a shared Manager list updated by Yahoo refresher
-        fx_pairs = manager.list(FX_PAIRS)
+        fx_pairs = manager.list(universe)
     else:
         # Faster-than-life uses a plain list (no Manager, no refresher)
-        fx_pairs = list(FX_PAIRS)
+        fx_pairs = list(universe)
 
     # Generate LEI pool for counterparties (deterministic and reusable)
     lei_pool = generate_lei_pool(args.lei_pool_size)
@@ -1603,7 +2284,7 @@ def main():
             print(f"[ERROR] Incremental load not allowed in real-time, as real-time syncs from yahoo finance.")
             exit(1)
         else:
-            state = load_initial_state(args, suffix)
+            state = complete_initial_state(load_initial_state(args, suffix), fx_pairs)
     else:
         if args.mode == "real-time":
             first_ready_event = mp.Event()
@@ -1619,7 +2300,7 @@ def main():
             # Initial state is built from the initial brackets
             state = load_initial_state_from_brackets(list(fx_pairs))
         else:
-            fx_pairs = fetch_fx_pairs_from_yahoo(FX_PAIRS, bracket_pct=1.0)
+            fx_pairs = fetch_fx_pairs_from_yahoo(universe, bracket_pct=1.0)
             state = load_initial_state_from_brackets(fx_pairs)
 
     pause_event = Event()
@@ -1679,6 +2360,15 @@ def main():
         carry_forward_state = state  # Initial state for first chunk
         chunk_start_ns = start_ns
 
+        # Forwards: the parent owns the model so the rate walk and cadence run continuously
+        # across chunks; each chunk's ladders go to worker 0 only (every worker covers every
+        # second with a share of the spot events, so one emitter avoids duplicate ladders).
+        fwd_model = None
+        fwd_bad_ts = []
+        if args.forwards:
+            fwd_rng = random.Random(None if args.seed is None else _derive_seed(args.seed, "forwards", args.mode))
+            fwd_model = ForwardsModel(args.metals, fwd_rng, start_ns, parse_bad_point_utc(args.bad_point_utc))
+
         for chunk_idx in range(num_chunks):
             chunk_start_sec = chunk_idx * chunk_size
             chunk_end_sec = min((chunk_idx + 1) * chunk_size, total_seconds)
@@ -1716,6 +2406,11 @@ def main():
             chunk_end_ns = chunk_start_ns + chunk_seconds * 1_000_000_000
             effective_end_ns = min(chunk_end_ns, end_ns) if end_ns else chunk_end_ns
 
+            fwd_plan = None
+            if fwd_model is not None:
+                fwd_plan = fwd_model.emissions(chunk_start_ns, effective_end_ns)
+                fwd_bad_ts.extend(em[0] for em in fwd_plan if em[5])
+
             # Spawn workers for this chunk
             pool = []
             for process_idx in range(args.processes):
@@ -1735,7 +2430,8 @@ def main():
                         global_sec_offsets[process_idx],
                         lei_pool,
                         shutdown_event
-                    )
+                    ),
+                    kwargs={'fwd_plan': fwd_plan if process_idx == 0 else None}
                 )
                 p.start()
                 pool.append(p)
@@ -1756,6 +2452,9 @@ def main():
             chunk_start_ns = chunk_end_ns
 
             print(f"[CHUNK {chunk_idx + 1}/{num_chunks}] Completed.")
+
+        if fwd_model is not None:
+            report_bad_points(fwd_bad_ts, fwd_model.bad_symbol)
     elif args.mode == "real-time":
         p = mp.Process(
             target=ingest_worker,

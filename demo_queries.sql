@@ -398,6 +398,220 @@ ORDER BY t.symbol, horizon_sec;
 
 
 --------------------------------------------
+-- forwards and swaps (run the generator with --forwards true, and --metals true for XAUUSD)
+--------------------------------------------
+-- Points are in pips. ON and TN hold the short swaps today->tomorrow and tomorrow->spot as
+-- quoted, with value dates before spot (negative tenor_days), so their outrights are spot MINUS
+-- the cumulative points, with bid and ask sides swapped. spot_ref is the spot each ladder was
+-- priced on.
+
+-- 1. Forward curve now: the whole curve in one query, outrights consistent with the spot the desk sees.
+DECLARE
+  @symbol := 'XAUUSD',
+  @pip := CASE WHEN @symbol LIKE '%JPY' THEN 0.01 WHEN @symbol = 'XAGUSD' THEN 0.001
+               WHEN @symbol LIKE 'X%' THEN 0.01 ELSE 0.0001 END,
+  @dp := CASE WHEN @symbol LIKE '%JPY' OR @symbol LIKE 'X%' THEN 4 WHEN @symbol = 'XAGUSD' THEN 5 ELSE 6 END
+WITH
+  spot AS (
+    SELECT bid_price, ask_price FROM core_price
+    WHERE symbol = @symbol
+    LATEST ON timestamp PARTITION BY symbol
+  ),
+  curve AS (
+    SELECT tenor, tenor_days, value_date, bid_points, ask_points FROM fx_forward_points
+    WHERE symbol = @symbol
+    LATEST ON timestamp PARTITION BY tenor
+  ),
+  pre_spot AS (
+    SELECT tenor, tenor_days, value_date, bid_points, ask_points,
+      sum(CASE WHEN tenor_days < 0 THEN bid_points END)
+        OVER (ORDER BY tenor_days DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_bid,
+      sum(CASE WHEN tenor_days < 0 THEN ask_points END)
+        OVER (ORDER BY tenor_days DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_ask
+    FROM curve
+  )
+SELECT tenor, tenor_days, value_date, bid_points, ask_points,
+  bid_price AS spot_bid, ask_price AS spot_ask,
+  round(CASE WHEN tenor_days < 0 THEN bid_price - cum_ask * @pip ELSE bid_price + bid_points * @pip END, @dp) AS outright_bid,
+  round(CASE WHEN tenor_days < 0 THEN ask_price - cum_bid * @pip ELSE ask_price + ask_points * @pip END, @dp) AS outright_ask
+FROM pre_spot CROSS JOIN spot
+ORDER BY tenor_days;
+
+-- 2. Forward curve as of T: any instant, same query.
+DECLARE
+  @symbol := 'XAUUSD',
+  @asof := dateadd('h', -1, now()),
+  @pip := CASE WHEN @symbol LIKE '%JPY' THEN 0.01 WHEN @symbol = 'XAGUSD' THEN 0.001
+               WHEN @symbol LIKE 'X%' THEN 0.01 ELSE 0.0001 END,
+  @dp := CASE WHEN @symbol LIKE '%JPY' OR @symbol LIKE 'X%' THEN 4 WHEN @symbol = 'XAGUSD' THEN 5 ELSE 6 END
+WITH
+  spot AS (
+    SELECT bid_price, ask_price FROM core_price
+    WHERE symbol = @symbol AND timestamp <= @asof
+    LATEST ON timestamp PARTITION BY symbol
+  ),
+  curve AS (
+    SELECT tenor, tenor_days, value_date, bid_points, ask_points FROM fx_forward_points
+    WHERE symbol = @symbol AND timestamp <= @asof
+    LATEST ON timestamp PARTITION BY tenor
+  ),
+  pre_spot AS (
+    SELECT tenor, tenor_days, value_date, bid_points, ask_points,
+      sum(CASE WHEN tenor_days < 0 THEN bid_points END)
+        OVER (ORDER BY tenor_days DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_bid,
+      sum(CASE WHEN tenor_days < 0 THEN ask_points END)
+        OVER (ORDER BY tenor_days DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_ask
+    FROM curve
+  )
+SELECT tenor, tenor_days, value_date, bid_points, ask_points,
+  bid_price AS spot_bid, ask_price AS spot_ask,
+  round(CASE WHEN tenor_days < 0 THEN bid_price - cum_ask * @pip ELSE bid_price + bid_points * @pip END, @dp) AS outright_bid,
+  round(CASE WHEN tenor_days < 0 THEN ask_price - cum_bid * @pip ELSE ask_price + ask_points * @pip END, @dp) AS outright_ask
+FROM pre_spot CROSS JOIN spot
+ORDER BY tenor_days;
+
+-- 3. Implied carry and lease rate: what the forward says the metal costs to borrow.
+-- Backs out the base-currency rate per tenor from the points and the quote-currency rate
+-- (for a metal pair, the lease rate). Quote rates are the generator's static curves
+-- (RATE_CURVES, set 2026-10-13); the live curves walk a few basis points around them.
+DECLARE
+  @symbol := 'XAUUSD',
+  @base := left(@symbol, 3),
+  @quote := right(@symbol, 3),
+  @pip := CASE WHEN @symbol LIKE '%JPY' THEN 0.01 WHEN @symbol = 'XAGUSD' THEN 0.001
+               WHEN @symbol LIKE 'X%' THEN 0.01 ELSE 0.0001 END,
+  @base_basis := CASE WHEN @base = 'GBP' THEN 365.0 ELSE 360.0 END,
+  @quote_basis := CASE WHEN @quote = 'GBP' THEN 365.0 ELSE 360.0 END
+WITH
+  quote_curve AS (
+    SELECT tenor, CASE @quote WHEN 'USD' THEN usd WHEN 'EUR' THEN eur WHEN 'JPY' THEN jpy
+                              WHEN 'CHF' THEN chf WHEN 'CAD' THEN cad END AS quote_rate
+    FROM (
+                SELECT 'ON' tenor, 3.88 usd, 2.42 eur, 1.23 jpy, -0.05 chf, 2.24 cad FROM long_sequence(1)
+      UNION ALL SELECT 'TN', 3.88, 2.42, 1.23, -0.05, 2.24 FROM long_sequence(1)
+      UNION ALL SELECT '1W', 3.88, 2.43, 1.23, -0.04, 2.24 FROM long_sequence(1)
+      UNION ALL SELECT '2W', 3.89, 2.44, 1.24, -0.04, 2.23 FROM long_sequence(1)
+      UNION ALL SELECT '1M', 3.90, 2.46, 1.25, -0.03, 2.22 FROM long_sequence(1)
+      UNION ALL SELECT '2M', 3.92, 2.49, 1.26, -0.02, 2.21 FROM long_sequence(1)
+      UNION ALL SELECT '3M', 3.93, 2.52, 1.27, -0.01, 2.20 FROM long_sequence(1)
+      UNION ALL SELECT '6M', 3.95, 2.58, 1.30, 0.01, 2.18 FROM long_sequence(1)
+      UNION ALL SELECT '9M', 3.95, 2.62, 1.33, 0.03, 2.16 FROM long_sequence(1)
+      UNION ALL SELECT '1Y', 3.94, 2.65, 1.35, 0.05, 2.15 FROM long_sequence(1)
+    )
+  ),
+  curve AS (
+    SELECT tenor, tenor_days, (bid_points + ask_points) / 2 AS mid_points, spot_ref FROM fx_forward_points
+    WHERE symbol = @symbol
+    LATEST ON timestamp PARTITION BY tenor
+  ),
+  -- Days each quote covers: spot to value date, or the short swap's own period for ON and TN.
+  accrual AS (
+    SELECT tenor, tenor_days, mid_points, spot_ref,
+      CASE WHEN tenor_days < 0
+           THEN least(lead(tenor_days) OVER (ORDER BY tenor_days), 0) - tenor_days
+           ELSE tenor_days END AS days
+    FROM curve
+  )
+SELECT a.tenor, a.tenor_days, a.mid_points, q.quote_rate,
+  round(((1 + q.quote_rate / 100 * a.days / @quote_basis)
+          / (1 + a.mid_points * @pip / a.spot_ref) - 1) * @base_basis / a.days * 100, 3) AS implied_base_rate
+FROM accrual a
+JOIN quote_curve q ON q.tenor = a.tenor
+ORDER BY a.tenor_days;
+
+-- 4. Swap points: a swap is two tenors subtracted; nothing to store.
+-- The desk buys near and sells far on the bid: bid swap = far bid - near ask, ask swap =
+-- far ask - near bid. The implied swap rate is the annualised forward premium of the period.
+-- For tenors from 1W out; ON and TN sit before spot.
+DECLARE
+  @symbol := 'XAUUSD',
+  @near := '1M',
+  @far := '3M',
+  @pip := CASE WHEN @symbol LIKE '%JPY' THEN 0.01 WHEN @symbol = 'XAGUSD' THEN 0.001
+               WHEN @symbol LIKE 'X%' THEN 0.01 ELSE 0.0001 END
+WITH
+  curve AS (
+    SELECT tenor, tenor_days, bid_points, ask_points, spot_ref FROM fx_forward_points
+    WHERE symbol = @symbol AND tenor IN (@near, @far)
+    LATEST ON timestamp PARTITION BY tenor
+  ),
+  near_leg AS (SELECT * FROM curve WHERE tenor = @near),
+  far_leg AS (SELECT * FROM curve WHERE tenor = @far)
+SELECT n.tenor AS near_tenor, f.tenor AS far_tenor, f.tenor_days - n.tenor_days AS swap_days,
+  round(f.bid_points - n.ask_points, 2) AS bid_swap,
+  round(f.ask_points - n.bid_points, 2) AS ask_swap,
+  round(((f.bid_points + f.ask_points) - (n.bid_points + n.ask_points)) / 2 * @pip / f.spot_ref
+        * 360 / (f.tenor_days - n.tenor_days) * 100, 3) AS implied_swap_rate
+FROM near_leg n CROSS JOIN far_leg f;
+
+-- 5. Triangular consistency: a bad point in one feed is caught by the other two.
+-- For every minute and tenor, the EURJPY points implied by EURUSD and USDJPY (and the XAUEUR
+-- points implied by XAUUSD and EURUSD) against the published points, compared in forward
+-- premium terms on each ladder's own spot_ref so spot moves do not leak into the check.
+-- Returns one row per offending window. The generator plants one a day: EURJPY 3M, or XAUEUR
+-- 3M with --metals, 6 pips off from 09:20 to 09:40 UTC (--bad_point_utc). Only finished minutes
+-- are compared: within a 5-second cycle EURUSD publishes before the gold pairs, so in the minute
+-- still being written live a cross and its legs can be a rate step apart.
+DECLARE
+  @range := '$today',
+  @tolerance_pips := 1.0
+WITH
+  prem AS (
+    SELECT timestamp, tenor,
+      max(CASE WHEN symbol = 'EURUSD' THEN (bid_points + ask_points) / 2 * 0.0001 / spot_ref END) AS eurusd,
+      max(CASE WHEN symbol = 'USDJPY' THEN (bid_points + ask_points) / 2 * 0.01 / spot_ref END) AS usdjpy,
+      max(CASE WHEN symbol = 'XAUUSD' THEN (bid_points + ask_points) / 2 * 0.01 / spot_ref END) AS xauusd,
+      max(CASE WHEN symbol = 'EURJPY' THEN (bid_points + ask_points) / 2 END) AS eurjpy_points,
+      max(CASE WHEN symbol = 'EURJPY' THEN spot_ref END) AS eurjpy_spot,
+      max(CASE WHEN symbol = 'XAUEUR' THEN (bid_points + ask_points) / 2 END) AS xaueur_points,
+      max(CASE WHEN symbol = 'XAUEUR' THEN spot_ref END) AS xaueur_spot
+    FROM fx_forward_points_1m
+    WHERE timestamp IN @range AND timestamp < timestamp_floor('m', now())
+      AND symbol IN ('EURUSD', 'USDJPY', 'EURJPY', 'XAUUSD', 'XAUEUR')
+    GROUP BY timestamp, tenor
+  ),
+  gaps AS (
+    SELECT timestamp, tenor, 'EURJPY' AS cross_pair, eurjpy_points AS published,
+      eurjpy_spot * ((1 + eurusd) * (1 + usdjpy) - 1) / 0.01 AS implied
+    FROM prem WHERE eurjpy_points IS NOT NULL
+    UNION ALL
+    SELECT timestamp, tenor, 'XAUEUR', xaueur_points,
+      xaueur_spot * ((1 + xauusd) / (1 + eurusd) - 1) / 0.01
+    FROM prem WHERE xaueur_points IS NOT NULL
+  ),
+  flagged AS (
+    SELECT timestamp, timestamp_floor('d', timestamp) AS day, cross_pair, tenor, published - implied AS gap
+    FROM gaps
+    WHERE abs(published - implied) > @tolerance_pips
+  )
+SELECT day, cross_pair, tenor, min(timestamp) AS window_from, dateadd('m', 1, max(timestamp)) AS window_to,
+  count() AS minutes, round(avg(gap), 2) AS avg_gap_pips, round(max(abs(gap)), 2) AS max_gap_pips
+FROM flagged
+GROUP BY day, cross_pair, tenor
+ORDER BY day, cross_pair, tenor;
+
+-- 6. Points history versus spot: one tenor over the day, the forward next to the spot it rides on.
+DECLARE
+  @symbol := 'XAUUSD',
+  @tenor := '3M',
+  @range := '$today'
+WITH
+  points AS (
+    SELECT timestamp, (bid_points + ask_points) / 2 AS mid_points FROM fx_forward_points_1m
+    WHERE symbol = @symbol AND tenor = @tenor AND timestamp IN @range
+  ),
+  spot AS (
+    SELECT timestamp, last(close_mid) AS spot_mid FROM core_price_1s
+    WHERE symbol = @symbol AND timestamp IN @range
+    SAMPLE BY 1m
+  )
+SELECT p.timestamp, p.mid_points, s.spot_mid
+FROM points p
+ASOF JOIN spot s;
+
+
+
+--------------------------------------------
 -- demo end --
 --------------------------------------------------
 

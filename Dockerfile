@@ -27,7 +27,7 @@ ENV MARKET_DATA_MAX_EPS=2500
 ENV CORE_MIN_EPS=700
 ENV CORE_MAX_EPS=1000
 ENV TOTAL_MARKET_DATA_EVENTS=25_000_000
-ENV PROTOCOL=tcp
+ENV PROTOCOL=qwp
 ENV HOST=host.docker.internal
 ENV PG_USER=admin
 ENV PG_PASSWORD=quest
@@ -40,5 +40,12 @@ ENV YAHOO_REFRESH_SECS=30
 ENV ORDERS_MIN_PER_SEC=5
 ENV ORDERS_MAX_PER_SEC=30
 ENV LEI_POOL_SIZE=2000
+# Optional layers, off by default. FORWARDS=true also creates fx_forward_points_1m
+# (views are created by default).
+ENV METALS=false
+ENV FORWARDS=false
+
+# The generator drains and exits cleanly on SIGINT (Ctrl+C); make docker stop send it.
+STOPSIGNAL SIGINT
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
