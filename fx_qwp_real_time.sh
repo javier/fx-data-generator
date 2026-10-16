@@ -16,7 +16,7 @@
 #
 set -euo pipefail
 
-# Python from the venv that has the QWP-capable client (editable questdb 4.1.0).
+# Python from the venv that has the QWP-capable client (questdb 5.0.0 or later, for questdb.connect).
 PY="${PY:-python}"
 
 # Optional layers, off by default. Uncomment a line to enable it.
