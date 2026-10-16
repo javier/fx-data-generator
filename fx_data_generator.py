@@ -2087,7 +2087,7 @@ def main():
     parser.add_argument("--token_x", default=None)
     parser.add_argument("--token_y", default=None)
     parser.add_argument("--ilp_user", default="admin")
-    parser.add_argument("--protocol", choices=["http", "tcp", "qwp"], default="http")
+    parser.add_argument("--protocol", choices=["http", "tcp", "qwp"], default="qwp")
     parser.add_argument("--qwp_tls", type=lambda x: str(x).lower() == 'true', default=False,
                         help="QWP only: use wss (TLS) instead of ws, with tls_verify=unsafe_off")
     parser.add_argument("--durable_ack", type=lambda x: str(x).lower() == 'true', default=False,

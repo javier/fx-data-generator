@@ -24,4 +24,6 @@ exec python fx_data_generator.py \
   --orders_min_per_sec "${ORDERS_MIN_PER_SEC}" \
   --orders_max_per_sec "${ORDERS_MAX_PER_SEC}" \
   --lei_pool_size "${LEI_POOL_SIZE}" \
+  --metals "${METALS}" \
+  --forwards "${FORWARDS}" \
   "$@"
